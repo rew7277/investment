@@ -192,11 +192,21 @@ def run_full_scan():
         STATE["regime"] = {"score": reg_s, "label": reg_label, "flags": reg_f, "vix": vix}
         log.info(f"  → Regime: {reg_label} | VIX: {vix:.1f} | FII: ₹{fii.get('fii_net',0)/1e7:.0f}Cr | PCR: {oc.get('pcr',1)}")
 
+        # Regime gate: only hard-block on extreme fear (VIX > 30).
+        # In a normal bear market, we still scan — just require higher conviction.
+        # regime_ok=True always; bear markets add +2 to the score threshold.
+        bear_market   = (reg_label.startswith("BEAR"))
+        extreme_fear  = (vix > 30)
+        regime_ok     = not extreme_fear          # only block when VIX > 30
+        bear_premium  = 2 if bear_market else 0   # require 2 extra points in bear
+
         # ─────────────────────────────────────────────────────
         # STEP 5: Get available capital from Kite
         # KITE API: kite.margins(segment="equity")
         # ─────────────────────────────────────────────────────
         available_cap = kl.get_available_capital()
+        if available_cap <= 0:
+            available_cap = CFG["CAPITAL"]
         log_kite_call("margins('equity')", f"₹{available_cap:,.0f} available")
         log.info(f"  STEP 5 — Available capital: ₹{available_cap:,.0f}")
 
@@ -231,7 +241,7 @@ def run_full_scan():
                 # Score all engines including SMC
                 tech_s,  tech_f  = TechnicalEngine.score(row)
                 brk_s,   brk_f   = BreakoutScanner.score(df, row, nifty_df, quote)
-                fund_d           = FundamentalEngine.get(sym)
+                fund_d = FundamentalEngine.get(sym, df, row, nifty_df, nse)
                 inst_s,  inst_f  = InstitutionalEngine.score(nse, sym, fii, oc, vix)
                 smc_d            = SMCEngine.compute(df)
                 full             = build_score(tech_s, tech_f, brk_s, brk_f,
@@ -273,7 +283,8 @@ def run_full_scan():
                 }
 
                 # ── Entry: BUY ────────────────────────────────
-                if (full["total"] >= CFG["SCORE_BUY"]
+                buy_threshold = CFG["SCORE_BUY"] + bear_premium
+                if (full["total"] >= buy_threshold
                         and sym not in STATE["positions"]
                         and open_count < CFG["MAX_OPEN_TRADES"]
                         and regime_ok):
@@ -345,13 +356,27 @@ def run_full_scan():
         STATE["signals"]   = sorted(signals, key=lambda x: x["score"], reverse=True)
         STATE["last_scan"] = str(datetime.now())
 
+        buys       = [s for s in signals if s["action"] == "BUY"]
+        strong_buy = [s for s in signals if s["score"] >= CFG["SCORE_STRONG_BUY"]]
+        buy_grade  = [s for s in signals if s["score"] >= CFG["SCORE_BUY"]]
+        watch      = [s for s in signals if s["score"] >= CFG["SCORE_WATCHLIST"]]
+        top5       = [(s["symbol"], s["score"]) for s in signals[:5]]
+
         log.info(f"\n  ✅ SCAN COMPLETE")
         log.info(f"     Stocks scanned:   {len(quote_data)}")
         log.info(f"     Deep analysed:    {len(candidates)}")
         log.info(f"     Gap-ups found:    {len(gap_alerts)}")
         log.info(f"     Signals scored:   {len(signals)}")
-        log.info(f"     Buys triggered:   {sum(1 for s in signals if s['action']=='BUY')}")
+        log.info(f"     Strong Buy (≥{CFG['SCORE_STRONG_BUY']}): {len(strong_buy)}")
+        log.info(f"     Buy grade  (≥{CFG['SCORE_BUY']}): {len(buy_grade)}")
+        log.info(f"     Watchlist  (≥{CFG['SCORE_WATCHLIST']}): {len(watch)}")
+        log.info(f"     Buys triggered:   {len(buys)}")
         log.info(f"     Open positions:   {list(STATE['positions'].keys()) or 'None'}")
+        log.info(f"     Bear premium:     +{bear_premium} pts (VIX={vix:.1f}, regime={reg_label})")
+        log.info(f"     Extreme fear:     {'YES — all buys blocked' if extreme_fear else 'No'}")
+        log.info(f"     Available cap:    ₹{available_cap:,.0f}")
+        if top5:
+            log.info(f"     Top 5 scores:     {top5}")
 
     except Exception as e:
         err = f"Scan failed: {e}"
@@ -418,6 +443,111 @@ def gap_alerts():
 def kite_calls():
     """Shows every Kite API method called — for transparency."""
     return jsonify(STATE["kite_calls"])
+
+
+@app.route("/api/signals/buy")
+def signals_buy():
+    """Returns only BUY / STRONG BUY signals — the actionable list."""
+    min_score = int(request.args.get("min_score", CFG["SCORE_BUY"]))
+    sigs = [s for s in STATE["signals"] if s.get("score", 0) >= min_score]
+    return jsonify({
+        "count":        len(sigs),
+        "min_score":    min_score,
+        "bear_market":  STATE["regime"].get("label", ""),
+        "signals":      sigs[:50],
+    })
+
+
+@app.route("/api/fno-signals")
+def fno_signals():
+    """
+    Derives simple F&O option trade ideas from the top equity signals.
+    Uses the scored equity signals + ATR to suggest ATM/OTM strikes.
+    For proper F&O execution use algotrade_pro_enhanced.py locally.
+    """
+    if not STATE["signals"]:
+        return jsonify({"error": "No scan data yet — run a full scan first."})
+
+    # Load NFO instrument list for lot sizes
+    nfo_lots = {}
+    try:
+        nfo_path = os.path.join(os.path.dirname(__file__), "_nfo_instruments.json")
+        if os.path.exists(nfo_path):
+            with open(nfo_path) as f:
+                nfo_data = json.load(f)
+            for item in nfo_data:
+                sym = item.get("tradingsymbol","").replace("-EQ","").split("-")[0]
+                if item.get("instrument_type") == "FUT":
+                    nfo_lots[sym] = item.get("lot_size", 1)
+    except Exception:
+        pass
+
+    KNOWN_LOTS = {  # fallback lot sizes for major F&O stocks
+        "NIFTY":256, "BANKNIFTY":30, "FINNIFTY":40,
+        "RELIANCE":250, "TCS":150, "INFY":300, "HDFCBANK":550,
+        "ICICIBANK":700, "SBIN":1500, "TATAMOTORS":1425,
+        "WIPRO":1500, "BAJFINANCE":125, "LT":175,
+    }
+
+    results = []
+    seen    = set()
+    for sig in STATE["signals"]:
+        sym   = sig["symbol"]
+        score = sig.get("score", 0)
+        if score < CFG["SCORE_WATCHLIST"]:
+            break                           # sorted by score; rest are worse
+        if sym in seen or len(results) >= 15:
+            break
+        seen.add(sym)
+
+        ltp = sig.get("ltp", 0)
+        atr = sig.get("atr", ltp * 0.02)   # fallback 2% ATR
+        sl  = sig.get("sl",  ltp - 1.5 * atr)
+        tp  = sig.get("tp",  ltp + 3.5 * atr)
+
+        direction = "CALL" if sig.get("signal_class") in ("buy","strong-buy") else "PUT"
+
+        # ATM strike: round to nearest 50 for most stocks, 100 for > ₹5000
+        step = 100 if ltp > 5000 else 50 if ltp > 1000 else 10
+        atm  = round(ltp / step) * step
+
+        lot  = nfo_lots.get(sym) or KNOWN_LOTS.get(sym) or 500
+
+        # Premium estimate: ~2×ATR for ATM option (very rough Black-Scholes proxy)
+        premium_est = round(2.0 * atr, 1)
+        sl_opt      = round(premium_est * 0.40, 1)   # SL at 40% of premium
+        tp_opt      = round(premium_est * 2.20, 1)   # TP at 2.2× premium
+        rr          = round(tp_opt / sl_opt, 1) if sl_opt else 0
+
+        results.append({
+            "symbol":        sym,
+            "equity_score":  score,
+            "equity_signal": sig.get("signal",""),
+            "ltp":           ltp,
+            "direction":     direction,
+            "strike":        atm,
+            "option_type":   direction,
+            "premium_est":   premium_est,
+            "lot_size":      lot,
+            "sl_option":     sl_opt,
+            "tp_option":     tp_opt,
+            "rr":            rr,
+            "equity_sl":     sl,
+            "equity_tp":     tp,
+            "smc_bos":       sig.get("smc_bos", False),
+            "smc_ob":        sig.get("smc_ob"),
+            "note":          (
+                "⚠️ Use algotrade_pro_enhanced.py for real-time option chain data. "
+                "This is an indicative idea based on equity analysis."
+            ),
+        })
+
+    return jsonify({
+        "count":   len(results),
+        "signals": results,
+        "regime":  STATE["regime"].get("label",""),
+        "vix":     STATE["vix"],
+    })
 
 
 @app.route("/health")
@@ -1037,7 +1167,7 @@ tr.selected td { background: rgba(0,229,255,.06); }
   </div>
 
   <div class="panel panel-accent-purple">
-    <div class="ph"><span class="ph-l">Scoring Engine — Max 22 Points</span></div>
+    <div class="ph"><span class="ph-l">Scoring Engine — Max 27 Points</span></div>
     <div class="engine-chips">
       <span class="chip chip-cyan">TECHNICAL ×5</span>
       <span class="chip chip-green">BREAKOUT ×5</span>
@@ -1047,8 +1177,8 @@ tr.selected td { background: rgba(0,229,255,.06); }
       <span class="chip" style="background:rgba(0,229,255,.07);color:#00ffcc;border:1px solid rgba(0,255,204,.25)">SMC ×5</span>
     </div>
     <div class="score-legend">
-      <span class="sl-item g">●&nbsp;20+ STRONG BUY</span>
-      <span class="sl-item c">●&nbsp;13+ BUY</span>
+      <span class="sl-item g">●&nbsp;18+ STRONG BUY</span>
+      <span class="sl-item c">●&nbsp;12+ BUY</span>
       <span class="sl-item a">●&nbsp;8+ WATCHLIST</span>
       <span class="sl-item d">●&nbsp;&lt;8 AVOID</span>
     </div>
@@ -1059,10 +1189,34 @@ tr.selected td { background: rgba(0,229,255,.06); }
 <div>
 <div class="tabs">
   <div class="tab active" onclick="showTab('signals')">SIGNALS</div>
+  <div class="tab" onclick="showTab('fno')">F&amp;O IDEAS</div>
   <div class="tab" onclick="showTab('gaps')">GAP ALERTS</div>
   <div class="tab" onclick="showTab('positions')">POSITIONS</div>
   <div class="tab" onclick="showTab('trades')">TRADE LOG</div>
   <div class="tab" onclick="showTab('kite')">KITE API LOG</div>
+</div>
+
+<!-- F&O IDEAS TAB -->
+<div id="tab-fno" style="display:none">
+<div class="panel">
+  <div class="ph">
+    <span class="ph-l">F&amp;O Option Ideas <span style="font-size:9px;color:var(--muted)">(derived from equity signals · indicative only)</span></span>
+    <span class="ph-r" id="fno-ct">—</span>
+  </div>
+  <div style="font-size:9px;color:var(--amber);padding:.4rem .6rem;background:rgba(255,170,0,.05);border-radius:4px;margin-bottom:.5rem">
+    ⚠️ Premium estimates are ATR-based approximations. Always verify on Zerodha option chain before trading.
+  </div>
+  <div class="tbl-wrap">
+  <table id="fno-table">
+    <thead><tr>
+      <th>SYMBOL</th><th>SCORE</th><th>SIGNAL</th><th>LTP</th>
+      <th>TYPE</th><th>STRIKE</th><th>PREM~</th>
+      <th class="r">SL</th><th class="g">TP</th><th>R:R</th><th>LOT</th><th>SMC</th>
+    </tr></thead>
+    <tbody id="fno-body"><tr><td colspan="12" class="no-data">Run a scan first</td></tr></tbody>
+  </table>
+  </div>
+</div>
 </div>
 
 <!-- SIGNALS -->
@@ -1141,15 +1295,47 @@ tr.selected td { background: rgba(0,229,255,.06); }
 
 <script>
 let allSigs = []; let selSym = null;
-const TABS = ['signals','gaps','positions','trades','kite'];
+const TABS = ['signals','fno','gaps','positions','trades','kite'];
 
 function showTab(t) {
   TABS.forEach(x => {
-    document.getElementById('tab-'+x).style.display = x===t?'':'none';
+    const el = document.getElementById('tab-'+x);
+    if (el) el.style.display = x===t?'':'none';
   });
   document.querySelectorAll('.tab').forEach((el,i) => {
     if(TABS[i]===t) el.classList.add('active'); else el.classList.remove('active');
   });
+  if (t==='fno') loadFno();
+}
+
+async function loadFno() {
+  try {
+    const r = await (await fetch('/api/fno-signals')).json();
+    if (r.error) { document.getElementById('fno-body').innerHTML=`<tr><td colspan="12" class="no-data">${r.error}</td></tr>`; return; }
+    document.getElementById('fno-ct').textContent = r.count + ' ideas | VIX ' + (r.vix||0).toFixed(1);
+    const sigs = r.signals||[];
+    if (!sigs.length) { document.getElementById('fno-body').innerHTML='<tr><td colspan="12" class="no-data">No signals above threshold</td></tr>'; return; }
+    document.getElementById('fno-body').innerHTML = sigs.map(s => {
+      const isBull = s.direction==='CALL';
+      const sigCls = s.equity_signal.includes('STRONG')?'sig-strong-buy':s.equity_signal.includes('BUY')?'sig-buy':'sig-watch';
+      const smcTxt = [s.smc_bos&&'BOS', s.smc_ob&&'OB'].filter(Boolean).join(' ') || '-';
+      const dirColor = isBull ? 'var(--green)' : 'var(--red)';
+      return '<tr>'
+        +'<td><strong>'+s.symbol+'</strong></td>'
+        +'<td style="font-family:var(--jet)">'+s.equity_score+'/27</td>'
+        +'<td><span class="'+sigCls+' sig-label" style="font-size:8px">'+s.equity_signal.split(' ')[0]+'</span></td>'
+        +'<td style="font-family:var(--jet)">&#8377;'+s.ltp.toLocaleString('en-IN')+'</td>'
+        +'<td><b style="color:'+dirColor+'">'+s.direction+'</b></td>'
+        +'<td style="font-family:var(--jet)">'+s.strike+'</td>'
+        +'<td style="font-family:var(--jet);color:var(--amber)">~&#8377;'+s.premium_est+'</td>'
+        +'<td class="r" style="font-family:var(--jet)">&#8377;'+s.sl_option+'</td>'
+        +'<td class="g" style="font-family:var(--jet)">&#8377;'+s.tp_option+'</td>'
+        +'<td style="color:'+(s.rr>=2?'var(--green)':'var(--amber)')+'">'+s.rr+'x</td>'
+        +'<td>'+s.lot_size+'</td>'
+        +'<td style="font-size:8px;color:var(--cyan)">'+smcTxt+'</td>'
+        +'</tr>';
+    }).join('');
+  } catch(e) { document.getElementById('fno-body').innerHTML='<tr><td colspan="12" class="no-data">Error: '+e.message+'</td></tr>'; }
 }
 
 async function fetchState() {
