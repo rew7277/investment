@@ -15,8 +15,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from engine import (
     CFG, KiteLayer, UniverseManager, NSEClient,
     TechnicalEngine, FundamentalEngine, BreakoutScanner,
-    InstitutionalEngine, MarketRegime, RiskManager, build_score,
-    save_token, load_token
+    InstitutionalEngine, MarketRegime, RiskManager, SMCEngine,
+    build_score, save_token, load_token
 )
 
 try:
@@ -51,11 +51,11 @@ STATE = {
     "kite_calls":    [],
     "errors":        [],
     "auth": {
-        "status":    "unknown",   # "ok" | "missing" | "invalid"
-        "user_name": None,
-        "user_id":   None,
+        "status":      "unknown",
+        "user_name":   None,
+        "user_id":     None,
         "token_saved": None,
-        "login_url": None,
+        "login_url":   None,
     }
 }
 
@@ -66,8 +66,7 @@ STATE = {
 def build_login_url() -> str:
     try:
         from kiteconnect import KiteConnect
-        kite = KiteConnect(api_key=CFG["KITE_API_KEY"])
-        return kite.login_url()
+        return KiteConnect(api_key=CFG["KITE_API_KEY"]).login_url()
     except Exception:
         return f"https://kite.zerodha.com/connect/login?v=3&api_key={CFG['KITE_API_KEY']}"
 
@@ -124,7 +123,6 @@ def run_full_scan():
         # ── INIT KITE ─────────────────────────────────────────
         if kl is None:
             kl = init_kite()
-        # Reset universe if kl was just created (new session)
         if universe is None:
             universe = UniverseManager(kl)
 
@@ -159,10 +157,11 @@ def run_full_scan():
         STATE["universe_size"] = len(quote_data)
 
         # Capture all gap-up alerts (even if not in deep scan)
+        # Capture all gap-up alerts (use candidates which have live gap_pct)
         gap_alerts = sorted(
-            [{"symbol": sym, "gap_pct": q["gap_pct"],
-              "ltp": q["ltp"], "volume": q["volume"]}
-             for sym, q in quote_data.items() if q.get("gap_pct", 0) >= CFG["GAP_UP_MIN_PCT"]],
+            [{"symbol": c["symbol"], "gap_pct": c["gap_pct"],
+              "ltp": c["ltp"], "volume": c["volume"]}
+             for c in candidates if c.get("gap_pct", 0) >= CFG["GAP_UP_MIN_PCT"]],
             key=lambda x: x["gap_pct"], reverse=True
         )
         STATE["gap_alerts"] = gap_alerts[:30]
@@ -225,13 +224,15 @@ def run_full_scan():
 
                 row = df.iloc[-1]
 
-                # Score all 5 engines
+                # Score all engines including SMC
                 tech_s,  tech_f  = TechnicalEngine.score(row)
                 brk_s,   brk_f   = BreakoutScanner.score(df, row, nifty_df, quote)
                 fund_d           = FundamentalEngine.get(sym)
                 inst_s,  inst_f  = InstitutionalEngine.score(nse, sym, fii, oc, vix)
+                smc_d            = SMCEngine.compute(df)
                 full             = build_score(tech_s, tech_f, brk_s, brk_f,
-                                               fund_d, inst_s, inst_f, reg_s, reg_f)
+                                               fund_d, inst_s, inst_f, reg_s, reg_f,
+                                               smc_d)
 
                 entry = cand["ltp"] * (1 + CFG["SLIPPAGE_PCT"])
                 sl, tp = RiskManager.sl_tp(entry, float(row["atr"]))
@@ -250,7 +251,7 @@ def run_full_scan():
                     "tp":           tp,
                     "qty":          qty,
                     "score":        full["total"],
-                    "max_score":    full["max"],
+                    "max_score":    full["max"],   # 27
                     "signal":       full["signal"],
                     "signal_class": full["signal_class"],
                     "breakdown":    full["breakdown"],
@@ -259,6 +260,12 @@ def run_full_scan():
                     "pe":           fund_d.get("pe"),
                     "roe":          fund_d.get("roe"),
                     "mcap_cr":      fund_d.get("mcap_cr"),
+                    # SMC fields for display
+                    "smc_ob":       smc_d.get("ob"),
+                    "smc_fvg":      smc_d.get("fvg"),
+                    "smc_bos":      smc_d.get("bos", False),
+                    "smc_choch":    smc_d.get("choch", False),
+                    "smc_sweep":    smc_d.get("sweep", False),
                 }
 
                 # ── Entry: BUY ────────────────────────────────
@@ -418,12 +425,12 @@ def health():
 
 
 # ═════════════════════════════════════════════════════════════
-# KITE AUTH ROUTES
+# KITE AUTH ROUTES — zero-touch daily login
 # ═════════════════════════════════════════════════════════════
 
 @app.route("/kite-login")
 def kite_login():
-    """Redirect to Zerodha login. Visit this every morning."""
+    """Visit this every morning to re-authenticate with Zerodha."""
     url = build_login_url()
     log.info(f"  [Auth] Redirecting to Zerodha: {url}")
     return redirect(url)
@@ -431,43 +438,32 @@ def kite_login():
 
 @app.route("/callback")
 def kite_callback():
-    """
-    Zerodha redirects here after login with ?request_token=...
-    Exchanges it for access_token, saves it, reinitialises Kite.
-    """
+    """Zerodha redirects here with ?request_token= after login."""
     global kl, universe
-
     request_token = request.args.get("request_token")
     status        = request.args.get("status", "")
-
     if status != "success" or not request_token:
         err = request.args.get("message", "Login cancelled or failed.")
         log.error(f"  [Auth] Callback error: {err}")
-        return _auth_page("❌ Login Failed", err, success=False), 400
-
+        return _auth_page("❌ Login Failed", err, False), 400
     try:
         from kiteconnect import KiteConnect
         kite_tmp     = KiteConnect(api_key=CFG["KITE_API_KEY"])
-        session      = kite_tmp.generate_session(request_token,
-                                                  api_secret=CFG["KITE_API_SECRET"])
+        session      = kite_tmp.generate_session(request_token, api_secret=CFG["KITE_API_SECRET"])
         access_token = session["access_token"]
-
         save_token(access_token)
         STATE["auth"]["token_saved"] = datetime.now().isoformat()
-
-        # Force full reinit — new token, new KiteLayer, fresh universe
         kl       = init_kite(access_token)
-        universe = None   # will be rebuilt on next scan with the new kl
-
+        universe = None  # force rebuild with new session
         log.info(f"  [Auth] ✅ Session active for {STATE['auth']['user_name']}")
         return _auth_page(
             f"✅ Logged in as {STATE['auth']['user_name']}",
-            "Token saved. Scanner is ready. You can close this tab and press FULL SCAN.",
-            success=True
+            "Token saved. Scanner is ready — press FULL SCAN on the dashboard.",
+            True
         )
     except Exception as e:
         log.error(f"  [Auth] Token exchange failed: {e}")
-        return _auth_page("❌ Token Exchange Failed", str(e), success=False), 500
+        return _auth_page("❌ Token Exchange Failed", str(e), False), 500
 
 
 @app.route("/api/auth-status")
@@ -478,8 +474,7 @@ def auth_status():
 def _auth_page(title: str, message: str, success: bool) -> str:
     colour = "#00ff9d" if success else "#ff2d55"
     return f"""<!DOCTYPE html>
-<html><head><meta charset="UTF-8">
-<title>Kite Auth — Institutional Trader</title>
+<html><head><meta charset="UTF-8"><title>Kite Auth</title>
 <style>
   body{{background:#010408;color:#cdd9e5;font-family:'JetBrains Mono',monospace;
         display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}}
@@ -490,7 +485,6 @@ def _auth_page(title: str, message: str, success: bool) -> str:
   a{{display:inline-block;margin-top:1.5rem;padding:.6rem 1.4rem;
      background:#0e2040;border:1px solid #00e5ff;color:#00e5ff;
      border-radius:6px;text-decoration:none;font-size:.8rem}}
-  a:hover{{background:#00e5ff;color:#010408}}
 </style></head>
 <body><div class="card">
   <h2>{title}</h2><p>{message}</p>
@@ -518,16 +512,13 @@ def start_scheduler():
 
 
 def probe_existing_token():
-    """
-    Silently validate any saved token on startup.
-    Does NOT crash if missing/invalid — user visits /kite-login.
-    """
+    """Validate saved token silently on startup. Doesn't crash if missing."""
     global kl
     STATE["auth"]["login_url"] = build_login_url()
     token = CFG["ACCESS_TOKEN"]
     if not token:
         STATE["auth"]["status"] = "missing"
-        log.warning("  [Auth] ⚠️  No token found — visit /kite-login to authenticate")
+        log.warning("  [Auth] ⚠️  No token — visit /kite-login to authenticate")
         return
     try:
         kl = init_kite(token)
@@ -538,10 +529,9 @@ def probe_existing_token():
 
 # ── Runs under both gunicorn and `python app.py` ─────────────
 log.info("🚀 Institutional Trader Pro — Full NSE Edition")
-log.info(f"   Mode:    {'PAPER' if CFG['PAPER_TRADE'] else '⚠ LIVE'}")
+log.info(f"   Mode: {'PAPER' if CFG['PAPER_TRADE'] else '⚠ LIVE'} | SMC Engine: ON")
 probe_existing_token()
 start_scheduler()
-
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
@@ -1050,12 +1040,13 @@ tr.selected td { background: rgba(0,229,255,.06); }
       <span class="chip chip-purple">FUNDAMENTAL ×5</span>
       <span class="chip chip-amber">INSTITUTIONAL ×5</span>
       <span class="chip chip-red">REGIME ×2</span>
+      <span class="chip" style="background:rgba(0,229,255,.07);color:#00ffcc;border:1px solid rgba(0,255,204,.25)">SMC ×5</span>
     </div>
     <div class="score-legend">
-      <span class="sl-item g">●&nbsp;16+ STRONG BUY</span>
-      <span class="sl-item c">●&nbsp;11+ BUY</span>
-      <span class="sl-item a">●&nbsp;7+ WATCHLIST</span>
-      <span class="sl-item d">●&nbsp;&lt;7 AVOID</span>
+      <span class="sl-item g">●&nbsp;20+ STRONG BUY</span>
+      <span class="sl-item c">●&nbsp;13+ BUY</span>
+      <span class="sl-item a">●&nbsp;8+ WATCHLIST</span>
+      <span class="sl-item d">●&nbsp;&lt;8 AVOID</span>
     </div>
   </div>
 </div>
@@ -1083,7 +1074,8 @@ tr.selected td { background: rgba(0,229,255,.06); }
         <th style="color:var(--green)">BRK</th>
         <th style="color:var(--purple)">FUND</th>
         <th style="color:var(--amber)">INST</th>
-        <th>SCORE / 22</th><th>SIGNAL</th><th>SL / TP</th><th>ACTION</th>
+        <th style="color:#00ffcc">SMC</th>
+        <th>SCORE/27</th><th>SIGNAL</th><th>SL / TP</th><th>ACTION</th>
       </tr></thead>
       <tbody id="sig-body"><tr><td colspan="11" class="no-data">▶ Press FULL SCAN to load NSE signals</td></tr></tbody>
     </table>
@@ -1225,16 +1217,16 @@ function render(d) {
   renderKiteLog(d.kite_calls);
   renderTicker(d.signals, d.gap_alerts);
 
-  // auth badge
+  // Auth badge
   const auth = d.auth || {};
   const authOk  = document.getElementById('auth-ok');
   const authBtn = document.getElementById('auth-btn');
   if (auth.status === 'ok') {
-    authOk.style.display = 'inline-block';
-    authOk.title = `${auth.user_name} (${auth.user_id})`;
+    authOk.style.display  = 'inline-block';
+    authOk.title          = `${auth.user_name} (${auth.user_id})`;
     authBtn.style.display = 'none';
   } else {
-    authOk.style.display = 'none';
+    authOk.style.display  = 'none';
     authBtn.style.display = 'inline-block';
   }
 
@@ -1254,18 +1246,28 @@ function renderSignals(sigs) {
     const bd  = s.breakdown || {};
     const ts  = bd.technical?.score||0, bs=bd.breakout?.score||0;
     const fs  = bd.fundamental?.score||0, is=bd.institutional?.score||0;
+    const ss  = bd.smc?.score||0;
     const gp  = s.gap_pct||0;
     const cls = s.signal_class||'avoid';
     const sigCls = cls==='strong-buy'?'sig-sb':cls==='buy'?'sig-b':cls==='watch'?'sig-w':'sig-av';
     const actCls = s.action==='BUY'?'act-buy':s.action.startsWith('SELL')?'act-sell':'act-hold';
     const isSel  = s.symbol===selSym;
 
-    const pips = Array.from({length:22},(_,i)=>{
+    const pips = Array.from({length:27},(_,i)=>{
       const on = i < s.score;
-      const hi = on && s.score >= 16;
-      const lo = on && s.score < 11;
+      const hi = on && s.score >= 20;
+      const lo = on && s.score < 13;
       return `<div class="pip ${on?(hi?'lit hi':lo?'lit lo':'lit'):''}"></div>`;
     }).join('');
+
+    // SMC badge
+    const smcTags = [];
+    if (s.smc_bos)   smcTags.push('<span style="color:#00ffcc;font-size:8px">BOS</span>');
+    if (s.smc_choch) smcTags.push('<span style="color:#00e5ff;font-size:8px">CHoCH</span>');
+    if (s.smc_sweep) smcTags.push('<span style="color:#ffaa00;font-size:8px">SWP</span>');
+    if (s.smc_ob)    smcTags.push('<span style="color:#b060ff;font-size:8px">OB</span>');
+    if (s.smc_fvg)   smcTags.push('<span style="color:#ff2d55;font-size:8px">FVG</span>');
+    const smcCell = smcTags.length ? smcTags.join(' ') : `<span style="color:var(--muted);font-size:8px">${ss}/5</span>`;
 
     return `<tr class="${isSel?'selected':''}" onclick="selectSym('${s.symbol}')">
       <td class="sym-cell"><strong>${s.symbol}</strong></td>
@@ -1275,10 +1277,11 @@ function renderSignals(sigs) {
       <td style="color:var(--green)">${bs}/5</td>
       <td style="color:var(--purple)">${fs}/5</td>
       <td style="color:var(--amber)">${is}/5</td>
+      <td>${smcCell}</td>
       <td>
         <div class="score-bar-wrap">
           <div class="score-pips">${pips}</div>
-          <span class="score-num">${s.score}/22</span>
+          <span class="score-num">${s.score}/27</span>
         </div>
       </td>
       <td><span class="${sigCls} sig-label">${s.signal}</span></td>
@@ -1308,6 +1311,7 @@ function showBreakdown(s) {
     {k:'fundamental',   l:'Fundamental',    c:'var(--purple)', fc:'#b060ff'},
     {k:'institutional', l:'Institutional',  c:'var(--amber)',  fc:'#ffaa00'},
     {k:'regime',        l:'Regime',         c:'var(--red)',    fc:'#ff2d55'},
+    {k:'smc',           l:'SMC',            c:'#00ffcc',       fc:'#00ffcc'},
   ];
   const meta = s.pe ? `<div style="font-size:9px;color:var(--muted);font-family:var(--raj);padding:.2rem 0 .7rem;border-bottom:1px solid var(--border);margin-bottom:.6rem">
     PE: ${s.pe||'—'} &nbsp;|&nbsp; ROE: ${s.roe||'—'}% &nbsp;|&nbsp; MCap: ₹${((s.mcap_cr||0)).toLocaleString('en-IN')}Cr

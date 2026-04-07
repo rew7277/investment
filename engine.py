@@ -27,12 +27,11 @@ import numpy as np
 log = logging.getLogger("ENGINE")
 
 # ─────────────────────────────────────────────────────────────
-# TOKEN STORE  — persists access token across restarts
+# TOKEN STORE
 # ─────────────────────────────────────────────────────────────
 TOKEN_FILE = "/tmp/kite_token.json"
 
 def save_token(access_token: str):
-    """Persist access token to disk + update live CFG."""
     try:
         with open(TOKEN_FILE, "w") as f:
             json.dump({"access_token": access_token,
@@ -40,27 +39,24 @@ def save_token(access_token: str):
         CFG["ACCESS_TOKEN"] = access_token
         log.info(f"  [Auth] ✅ Token saved to {TOKEN_FILE}")
     except Exception as e:
-        log.warning(f"  [Auth] Could not save token file: {e}")
+        log.warning(f"  [Auth] Could not save token: {e}")
         CFG["ACCESS_TOKEN"] = access_token
 
 def load_token() -> str:
-    """Load token: env var takes priority, then saved file, then empty."""
     env_token = os.environ.get("KITE_ACCESS_TOKEN", "")
     if env_token:
-        log.info("  [Auth] Token loaded from KITE_ACCESS_TOKEN env var")
         return env_token
     try:
         with open(TOKEN_FILE) as f:
             data = json.load(f)
         token = data.get("access_token", "")
-        saved = data.get("saved_at", "unknown")
         if token:
-            log.info(f"  [Auth] Token loaded from file (saved: {saved})")
+            log.info(f"  [Auth] Token loaded from file (saved: {data.get('saved_at','?')})")
             return token
     except FileNotFoundError:
         pass
     except Exception as e:
-        log.warning(f"  [Auth] Could not read token file: {e}")
+        log.warning(f"  [Auth] Token file read error: {e}")
     return ""
 
 # ─────────────────────────────────────────────────────────────
@@ -167,11 +163,10 @@ class KiteLayer:
         # Keep only regular equity (EQ segment), not BE/SM/etc.
         df = df[df["segment"] == "NSE"]
         df = df[df["instrument_type"] == "EQ"]
-        df = df[["instrument_token", "tradingsymbol", "name",
-                 "tick_size", "lot_size"]]
+        df = df[["instrument_token", "tradingsymbol", "name", "tick_size", "lot_size"]]
         df.columns = ["token", "symbol", "name", "tick", "lot"]
-        # NOTE: last_price from instruments() is always 0 (it's a master list,
-        # not live data). Price filtering is done AFTER we fetch live quotes.
+        # NOTE: last_price in instrument master is always 0 — do NOT filter by price here.
+        # Price filtering happens in filter_for_deep_scan using live quote LTP.
         df = df.reset_index(drop=True)
 
         log.info(f"  [Kite] → {len(df)} EQ instruments loaded")
@@ -442,7 +437,7 @@ class UniverseManager:
             volume     = q.get("volume", 0)
             open_p     = q.get("open", 0)
 
-            # Apply price filter HERE using live LTP (instruments master has last_price=0)
+            # Price filter uses LIVE LTP from quotes (instrument master has last_price=0)
             if not prev_close or ltp < CFG["MIN_PRICE"]:
                 continue
 
@@ -902,9 +897,14 @@ class MarketRegime:
     def check(nifty_df: pd.DataFrame, vix: float) -> Tuple[int, List[str], bool, str]:
         score = 0; flags = []
         try:
-            ema200   = nifty_df["close"].ewm(span=200, adjust=False).mean()
+            if nifty_df is None or len(nifty_df) < 5:
+                log.warning("  [Regime] NIFTY data insufficient — using neutral regime")
+                return 1, ["⚠️ NIFTY data unavailable (market may be closed)"], True, "NEUTRAL ⚪"
+
+            ema200   = nifty_df["close"].ewm(span=min(200, len(nifty_df)), adjust=False).mean()
             last     = float(nifty_df["close"].iloc[-1])
             ema_val  = float(ema200.iloc[-1])
+
             if last > ema_val:
                 score += 1; flags.append(f"✅ NIFTY {last:.0f} > 200EMA {ema_val:.0f}")
             else:
@@ -915,12 +915,12 @@ class MarketRegime:
             else:
                 flags.append(f"❌ VIX {vix:.1f} high volatility")
 
-            bullish = (score == 2)
+            bullish = (score >= 1)
             label   = "BULL 🟢" if last > ema_val else "BEAR 🔴"
         except Exception as e:
-            log.warning(f"Regime: {e}")
-            bullish = True; label = "UNKNOWN ⚪"
-            flags.append("⚠️ Regime data error")
+            log.warning(f"  [Regime] Error: {e}")
+            bullish = True; label = "NEUTRAL ⚪"
+            flags.append(f"⚠️ Regime check error: {str(e)[:50]}")
         return score, flags, bullish, label
 
 
@@ -974,19 +974,177 @@ class RiskManager:
 
 
 # ═════════════════════════════════════════════════════════════
-# ███  MASTER SCORING  ████████████████████████████████████████
+# ███  SMC ENGINE — Smart Money Concepts  █████████████████████
+# ─────────────────────────────────────────────────────────────
+# Identifies institutional footprints:
+#   S1. Bullish Order Block (OB) — last bearish candle before
+#       a strong upward impulse. Price returning to OB = entry.
+#   S2. Break of Structure (BOS) — price breaks above prior
+#       swing high, confirming bullish market structure shift.
+#   S3. Fair Value Gap (FVG) / Imbalance — 3-candle pattern
+#       where candle[i-2].high < candle[i].low (bullish gap).
+#       Price tends to return and fill the gap.
+#   S4. Liquidity Sweep — price briefly dips below a swing low
+#       then reverses up strongly (stop-hunt by smart money).
+#   S5. Bullish CHoCH — Change of Character: first higher high
+#       after a series of lower highs (structural reversal).
 # ═════════════════════════════════════════════════════════════
+class SMCEngine:
+
+    @staticmethod
+    def compute(df: pd.DataFrame) -> dict:
+        """
+        Run all SMC detections on OHLCV dataframe.
+        Returns a dict with scores + flags + raw data for display.
+        """
+        if df is None or len(df) < 20:
+            return {"score": 0, "max": 5, "flags": ["⚠️ Insufficient data for SMC"],
+                    "ob": None, "fvg": None, "bos": False, "choch": False, "sweep": False}
+
+        close = df["close"].values
+        high  = df["high"].values
+        low   = df["low"].values
+        op    = df["open"].values
+        n     = len(df)
+
+        score = 0
+        flags = []
+        results = {"ob": None, "fvg": None, "bos": False, "choch": False, "sweep": False}
+
+        # ── S1: Bullish Order Block ────────────────────────────
+        # Find last bearish candle (close < open) followed by a
+        # strong up-move of ≥1% within 3 candles.
+        ob_found = False
+        for i in range(n - 4, max(n - 30, 2), -1):
+            bearish = close[i] < op[i]
+            if not bearish:
+                continue
+            # Check if next 1-3 candles have a strong bullish impulse
+            future_high = max(high[i+1:i+4]) if i + 4 <= n else max(high[i+1:])
+            impulse_pct = (future_high - close[i]) / close[i] * 100
+            if impulse_pct >= 1.0:
+                # Check if current price is near/inside the OB (within 3%)
+                ltp = close[-1]
+                ob_high = op[i]    # top of bearish candle body
+                ob_low  = close[i] # bottom
+                near_ob = ob_low * 0.97 <= ltp <= ob_high * 1.05
+                ob_found = True
+                results["ob"] = {
+                    "ob_high": round(float(ob_high), 2),
+                    "ob_low":  round(float(ob_low),  2),
+                    "near":    near_ob,
+                    "impulse": round(impulse_pct, 1),
+                }
+                if near_ob:
+                    score += 1
+                    flags.append(f"✅ SMC: Price at Bullish OB ({ob_low:.1f}–{ob_high:.1f})")
+                else:
+                    flags.append(f"⚠️ SMC: OB exists ({ob_low:.1f}–{ob_high:.1f}), price not yet retesting")
+                break
+        if not ob_found:
+            flags.append("❌ SMC: No bullish Order Block found")
+
+        # ── S2: Break of Structure (BOS) ──────────────────────
+        # Last 20 candles: find prior swing high (local max),
+        # then check if price has broken above it.
+        try:
+            lookback = min(20, n - 1)
+            window   = high[-(lookback+1):-1]
+            swing_high = float(np.max(window))
+            current    = float(close[-1])
+            if current > swing_high:
+                score += 1
+                results["bos"] = True
+                flags.append(f"✅ SMC: BOS — price {current:.1f} above swing high {swing_high:.1f}")
+            else:
+                flags.append(f"❌ SMC: No BOS — price {current:.1f} below swing {swing_high:.1f}")
+        except Exception:
+            flags.append("⚠️ SMC: BOS check N/A")
+
+        # ── S3: Fair Value Gap (FVG) ──────────────────────────
+        # Bullish FVG: candle[i-2].high < candle[i].low
+        # Scan last 15 candles for an unfilled bullish FVG.
+        fvg_found = False
+        for i in range(n - 1, max(n - 15, 2), -1):
+            fvg_high = float(low[i])        # bottom of current candle
+            fvg_low  = float(high[i - 2])   # top of candle 2 back
+            if fvg_low < fvg_high:          # gap exists
+                ltp    = float(close[-1])
+                filled = ltp <= fvg_high    # price has entered FVG
+                fvg_found = True
+                results["fvg"] = {
+                    "fvg_low":  round(fvg_low,  2),
+                    "fvg_high": round(fvg_high, 2),
+                    "filled":   filled,
+                }
+                if filled:
+                    score += 1
+                    flags.append(f"✅ SMC: Price in Bullish FVG ({fvg_low:.1f}–{fvg_high:.1f})")
+                else:
+                    flags.append(f"⚠️ SMC: FVG at {fvg_low:.1f}–{fvg_high:.1f} (not yet filled)")
+                break
+        if not fvg_found:
+            flags.append("❌ SMC: No recent Fair Value Gap")
+
+        # ── S4: Liquidity Sweep (stop hunt) ───────────────────
+        # Price dips below a swing low then closes back above it
+        # within 1-3 candles → smart money swept retail stops.
+        try:
+            lkb      = min(15, n - 3)
+            lows_win = low[-(lkb+2):-2]
+            swing_lo = float(np.min(lows_win))
+            # Last 2 candles: did price wick below swing_lo then close above?
+            swept   = float(low[-2]) < swing_lo and float(close[-1]) > swing_lo
+            swept_1 = float(low[-1]) < swing_lo and float(close[-1]) > swing_lo
+            if swept or swept_1:
+                score += 1
+                results["sweep"] = True
+                flags.append(f"✅ SMC: Liquidity sweep below {swing_lo:.1f} — reversal signal")
+            else:
+                flags.append(f"❌ SMC: No liquidity sweep detected")
+        except Exception:
+            flags.append("⚠️ SMC: Sweep check N/A")
+
+        # ── S5: Change of Character (CHoCH) ───────────────────
+        # After ≥2 lower highs, price makes a higher high →
+        # first sign of bullish structural reversal.
+        try:
+            swing_highs = []
+            for i in range(2, min(20, n - 1)):
+                if high[-(i+1)] > high[-i] and high[-(i+1)] > high[-(i+2)]:
+                    swing_highs.append(float(high[-(i+1)]))
+            if len(swing_highs) >= 2:
+                lower_highs = all(swing_highs[j] > swing_highs[j+1]
+                                  for j in range(len(swing_highs)-1))
+                if lower_highs and float(high[-1]) > swing_highs[0]:
+                    score += 1
+                    results["choch"] = True
+                    flags.append("✅ SMC: CHoCH — first higher high after lower highs")
+                else:
+                    flags.append("❌ SMC: No CHoCH — structure not reversed")
+            else:
+                flags.append("⚠️ SMC: Insufficient swing data for CHoCH")
+        except Exception:
+            flags.append("⚠️ SMC: CHoCH check N/A")
+
+        return {"score": score, "max": 5, "flags": flags, **results}
+
+
+
 def build_score(tech_s, tech_f, brk_s, brk_f,
-                fund_d, inst_s, inst_f, reg_s, reg_f) -> dict:
+                fund_d, inst_s, inst_f, reg_s, reg_f,
+                smc_d=None) -> dict:
     fund_s = fund_d.get("score", 0)
     fund_f = fund_d.get("flags", [])
-    total  = tech_s + brk_s + fund_s + inst_s + reg_s
-    MAX    = 22
+    smc_s  = (smc_d or {}).get("score", 0)
+    smc_f  = (smc_d or {}).get("flags", [])
+    total  = tech_s + brk_s + fund_s + inst_s + reg_s + smc_s
+    MAX    = 27   # 5 tech + 5 breakout + 5 fundamental + 5 institutional + 2 regime + 5 SMC
 
-    if   total >= CFG["SCORE_STRONG_BUY"]: sig, cls = "STRONG BUY 🔥", "strong-buy"
-    elif total >= CFG["SCORE_BUY"]:        sig, cls = "BUY ✅",         "buy"
-    elif total >= CFG["SCORE_WATCHLIST"]:  sig, cls = "WATCHLIST 👀",   "watch"
-    else:                                   sig, cls = "AVOID ❌",       "avoid"
+    if   total >= 20: sig, cls = "STRONG BUY 🔥", "strong-buy"
+    elif total >= 13: sig, cls = "BUY ✅",         "buy"
+    elif total >= 8:  sig, cls = "WATCHLIST 👀",   "watch"
+    else:             sig, cls = "AVOID ❌",        "avoid"
 
     return {
         "total": total, "max": MAX, "signal": sig, "signal_class": cls,
@@ -996,5 +1154,6 @@ def build_score(tech_s, tech_f, brk_s, brk_f,
             "fundamental":   {"score": fund_s, "max": 5, "flags": fund_f},
             "institutional": {"score": inst_s, "max": 5, "flags": inst_f},
             "regime":        {"score": reg_s,  "max": 2, "flags": reg_f},
+            "smc":           {"score": smc_s,  "max": 5, "flags": smc_f},
         }
     }
