@@ -464,8 +464,8 @@ class NSEClient:
                 dii_sell = float(row.get("dii_sellValue", row.get("diiSellValue", 0)) or 0)
                 res["fii_net"]     = fii_buy - fii_sell
                 res["dii_net"]     = dii_buy - dii_sell
-                res["fii_bullish"] = res["fii_net"] > 0
-                res["dii_bullish"] = res["dii_net"] > 0
+                res["fii_bullish"] = bool(res["fii_net"] > 0)
+                res["dii_bullish"] = bool(res["dii_net"] > 0)
         except Exception as e:
             log.warning(f"  [NSE] FII parse: {e}")
         return res
@@ -952,7 +952,7 @@ class FibonacciEngine:
         # ── Fib-1: Price in Golden Zone ───────────────────────
         # Tolerance = 1% of total range on each side
         tol = rng * 0.01
-        in_golden = (golden_zone_low - tol) <= ltp <= (golden_zone_high + tol)
+        in_golden = bool((golden_zone_low - tol) <= ltp <= (golden_zone_high + tol))
 
         if in_golden:
             score += 1

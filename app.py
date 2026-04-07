@@ -9,6 +9,28 @@
 import os, json, logging, threading, math
 from datetime import datetime, timedelta
 from flask import Flask, jsonify, render_template_string, redirect, request
+import numpy as np
+
+
+def _np_sanitize(obj):
+    """Recursively convert numpy scalars/arrays to native Python types.
+
+    Flask's jsonify cannot serialise numpy.bool_, numpy.int64, numpy.float64,
+    etc.  This helper walks the entire state dict before it hits json.dumps.
+    """
+    if isinstance(obj, dict):
+        return {k: _np_sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_np_sanitize(v) for v in obj]
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return obj
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -206,7 +228,8 @@ def run_full_scan():
         # KITE API: kite.margins(segment="equity")
         # ─────────────────────────────────────────────────────
         available_cap = kl.get_available_capital()
-        if available_cap <= 0:
+        if available_cap < 1000:          # paper accounts often return ~0 or tiny float
+            log.warning(f"  [Capital] Kite returned ₹{available_cap:.2f} — using CFG fallback ₹{CFG['CAPITAL']:,}")
             available_cap = CFG["CAPITAL"]
         log_kite_call("margins('equity')", f"₹{available_cap:,.0f} available")
         log.info(f"  STEP 5 — Available capital: ₹{available_cap:,.0f}")
@@ -311,7 +334,7 @@ def run_full_scan():
                         and regime_ok):
 
                     if CFG["PAPER_TRADE"]:
-                        log.info(f"  📝 PAPER BUY {sym} | {full['signal']} | Score {full['total']}/27 | Qty {qty}")
+                        log.info(f"  📝 PAPER BUY {sym} | {full['signal']} | Score {full['total']}/{full['max']} | Qty {qty}")
                     else:
                         # KITE API: kite.place_order(...)
                         order_id = kl.place_order(sym, "NSE", "BUY", qty)
@@ -421,7 +444,7 @@ def api_state():
     pnl   = sum(t["pnl"] for t in tl)
     wins  = [t for t in tl if t["pnl"] > 0]
     wr    = round(len(wins)/len(tl)*100, 1) if tl else 0
-    return jsonify({
+    return jsonify(_np_sanitize({
         "signals":       STATE["signals"][:100],    # top 100 by score
         "positions":     STATE["positions"],
         "trade_log":     tl[-30:],
@@ -444,7 +467,7 @@ def api_state():
             "win_rate":       wr,
         },
         "auth": STATE["auth"],
-    })
+    }))
 
 
 @app.route("/api/scan", methods=["POST"])
