@@ -7,17 +7,16 @@
 """
 
 import os, json, logging, threading, math
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from flask import Flask, jsonify, render_template_string, redirect, request
-import numpy as np
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from engine import (
     CFG, KiteLayer, UniverseManager, NSEClient,
     TechnicalEngine, FundamentalEngine, BreakoutScanner,
-    InstitutionalEngine, MarketRegime, RiskManager, SMCEngine,
+    InstitutionalEngine, MarketRegime, RiskManager,
+    SMCEngine, FibonacciEngine,
     build_score, save_token, load_token
 )
 
@@ -217,62 +216,52 @@ def run_full_scan():
         # KITE API: kite.historical_data(token, ...) per stock
         # ─────────────────────────────────────────────────────
         log.info(f"  STEP 6 — Deep analysis on {len(candidates)} stocks...")
-
-        # ── Pre-fetch block deals ONCE (avoids 500 HTTP calls, same endpoint returns all) ──
-        log.info("  → Pre-fetching block deals (1 call for all stocks)...")
-        block_deals_cache = nse._get("block-deal")
-
-        # ── Worker function — runs in thread pool ──────────────
-        def analyse_one(cand):
-            sym   = cand["symbol"]
-            token = cand["token"]
-            if not token:
-                return None
-            try:
-                df = kl.get_ohlcv(token, days=300)
-                if df.empty or len(df) < 60:
-                    return None
-                df = TechnicalEngine.compute(df)
-                if df.empty:
-                    return None
-
-                row    = df.iloc[-1]
-                tech_s, tech_f = TechnicalEngine.score(row)
-                brk_s,  brk_f  = BreakoutScanner.score(df, row, nifty_df, cand)
-                fund_d          = FundamentalEngine.get(sym, df, row, nifty_df, nse)
-                inst_s, inst_f  = InstitutionalEngine.score(
-                    nse, sym, fii, oc, vix, block_deals_cache)
-                smc_d           = SMCEngine.compute(df)
-                full            = build_score(tech_s, tech_f, brk_s, brk_f,
-                                              fund_d, inst_s, inst_f, reg_s, reg_f, smc_d)
-
-                entry  = cand["ltp"] * (1 + CFG["SLIPPAGE_PCT"])
-                sl, tp = RiskManager.sl_tp(entry, float(row["atr"]))
-                qty    = RiskManager.position_size(entry, sl, available_cap)
-
-                return (cand, row, full, entry, sl, tp, qty, fund_d, smc_d)
-            except Exception as e:
-                STATE["errors"].append({"time": str(datetime.now()), "msg": f"{sym}: {str(e)[:80]}"})
-                return None
-
-        # ── Parallel execution ──────────────────────────────────
         signals    = []
         open_count = len(STATE["positions"])
-        done       = 0
 
-        with ThreadPoolExecutor(max_workers=10) as pool:
-            futures = {pool.submit(analyse_one, cand): cand for cand in candidates}
-            for fut in as_completed(futures):
-                done += 1
-                if done % 50 == 0:
-                    log.info(f"  → Progress: {done}/{len(candidates)} stocks analysed")
-                result = fut.result()
-                if result is None:
+        for i, cand in enumerate(candidates, 1):
+            sym   = cand["symbol"]
+            token = cand["token"]
+            quote = cand
+
+            if not token:
+                continue
+
+            try:
+                # KITE API: kite.historical_data(token, from_dt, to_dt, interval)
+                df = kl.get_ohlcv(token, days=300)
+                if df.empty or len(df) < 60:
                     continue
+                df = TechnicalEngine.compute(df)
+                if df.empty:
+                    continue
+                log_kite_call("historical_data", f"{sym} — {len(df)} candles")
 
-                cand, row, full, entry, sl, tp, qty, fund_d, smc_d = result
-                sym = cand["symbol"]
-                log_kite_call("historical_data", f"{sym} — parallel")
+                row = df.iloc[-1]
+
+                # Score all engines including SMC and Fibonacci
+                tech_s,  tech_f  = TechnicalEngine.score(row)
+                brk_s,   brk_f   = BreakoutScanner.score(df, row, nifty_df, quote)
+                fund_d           = FundamentalEngine.compute(df, row, nifty_df)
+                inst_s,  inst_f  = InstitutionalEngine.score(nse, sym, fii, oc, vix)
+                smc_d            = SMCEngine.compute(df)
+                fib_d            = FibonacciEngine.compute(df)
+                full             = build_score(tech_s, tech_f, brk_s, brk_f,
+                                               fund_d, inst_s, inst_f, reg_s, reg_f,
+                                               smc_d, fib_d)
+
+                entry  = cand["ltp"] * (1 + CFG["SLIPPAGE_PCT"])
+                sl, tp = RiskManager.sl_tp(entry, float(row["atr"]), fib_d)
+                qty    = RiskManager.position_size(entry, sl, available_cap)
+
+                # Label whether TP is Fib-based or ATR-based for display
+                tp_source = (
+                    "FIB 1.618"
+                    if fib_d.get("score", 0) >= 2
+                       and fib_d.get("fib_tp_1618")
+                       and fib_d["fib_tp_1618"] > entry * 1.02
+                    else "ATR×3.5"
+                )
 
                 sig = {
                     "symbol":       sym,
@@ -285,9 +274,10 @@ def run_full_scan():
                     "atr":          round(float(row.get("atr", 0)), 2),
                     "sl":           sl,
                     "tp":           tp,
+                    "tp_source":    tp_source,
                     "qty":          qty,
                     "score":        full["total"],
-                    "max_score":    full["max"],
+                    "max_score":    full["max"],   # 30
                     "signal":       full["signal"],
                     "signal_class": full["signal_class"],
                     "breakdown":    full["breakdown"],
@@ -296,12 +286,21 @@ def run_full_scan():
                     "pe":           fund_d.get("pe"),
                     "roe":          fund_d.get("roe"),
                     "mcap_cr":      fund_d.get("mcap_cr"),
-                    # Cast to Python bool — prevents numpy bool_ JSON crash
+                    # SMC fields for display
                     "smc_ob":       smc_d.get("ob"),
                     "smc_fvg":      smc_d.get("fvg"),
-                    "smc_bos":      bool(smc_d.get("bos", False)),
-                    "smc_choch":    bool(smc_d.get("choch", False)),
-                    "smc_sweep":    bool(smc_d.get("sweep", False)),
+                    "smc_bos":      smc_d.get("bos", False),
+                    "smc_choch":    smc_d.get("choch", False),
+                    "smc_sweep":    smc_d.get("sweep", False),
+                    # Fibonacci fields for display
+                    "fib_score":        fib_d.get("score", 0),
+                    "fib_golden_high":  fib_d.get("golden_zone_high"),
+                    "fib_golden_low":   fib_d.get("golden_zone_low"),
+                    "fib_tp_1618":      fib_d.get("fib_tp_1618"),
+                    "fib_swing_high":   fib_d.get("swing_high"),
+                    "fib_swing_low":    fib_d.get("swing_low"),
+                    "fib_in_golden":    fib_d.get("price_in_golden", False),
+                    "fib_at_key":       fib_d.get("fib_at_key_level", False),
                 }
 
                 # ── Entry: BUY ────────────────────────────────
@@ -325,7 +324,7 @@ def run_full_scan():
                     STATE["positions"][sym] = {
                         "entry": entry, "sl": sl, "tp": tp, "qty": qty,
                         "score": full["total"], "date": str(datetime.now()),
-                        "token": cand["token"], "trailing": False,
+                        "token": token, "trailing": False,
                     }
                     open_count += 1
                     sig["action"] = "BUY"
@@ -357,6 +356,13 @@ def run_full_scan():
                         sig["action"] = f"SELL ({reason})"
 
                 signals.append(sig)
+
+                if i % 50 == 0:
+                    log.info(f"  → Progress: {i}/{len(candidates)} stocks analysed")
+
+            except Exception as e:
+                STATE["errors"].append({"time": str(datetime.now()), "msg": f"{sym}: {str(e)[:80]}"})
+
         # ─────────────────────────────────────────────────────
         # STEP 7: Sync positions with Kite
         # KITE API: kite.positions() + kite.orders()
@@ -409,30 +415,13 @@ def dashboard():
     return render_template_string(DASHBOARD_HTML)
 
 
-def _sanitize(obj):
-    """Recursively convert numpy types to JSON-safe Python types."""
-    if isinstance(obj, dict):
-        return {k: _sanitize(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_sanitize(v) for v in obj]
-    if isinstance(obj, np.bool_):
-        return bool(obj)
-    if isinstance(obj, np.integer):
-        return int(obj)
-    if isinstance(obj, np.floating):
-        return float(obj)
-    if isinstance(obj, float) and (np.isnan(obj) or np.isinf(obj)):
-        return None
-    return obj
-
-
 @app.route("/api/state")
 def api_state():
     tl    = STATE["trade_log"]
     pnl   = sum(t["pnl"] for t in tl)
     wins  = [t for t in tl if t["pnl"] > 0]
     wr    = round(len(wins)/len(tl)*100, 1) if tl else 0
-    return jsonify(_sanitize({
+    return jsonify({
         "signals":       STATE["signals"][:100],    # top 100 by score
         "positions":     STATE["positions"],
         "trade_log":     tl[-30:],
@@ -455,7 +444,7 @@ def api_state():
             "win_rate":       wr,
         },
         "auth": STATE["auth"],
-    }))
+    })
 
 
 @app.route("/api/scan", methods=["POST"])
@@ -694,8 +683,8 @@ def probe_existing_token():
 
 
 # ── Runs under both gunicorn and `python app.py` ─────────────
-log.info("🚀 Institutional Trader Pro — Full NSE Edition")
-log.info(f"   Mode: {'PAPER' if CFG['PAPER_TRADE'] else '⚠ LIVE'} | SMC Engine: ON")
+log.info(f"🚀 Institutional Trader Pro — Full NSE Edition")
+log.info(f"   Mode: {'PAPER' if CFG['PAPER_TRADE'] else '⚠ LIVE'} | SMC Engine: ON | Fibonacci Engine: ON | Yahoo Finance: REMOVED")
 probe_existing_token()
 start_scheduler()
 
@@ -1199,7 +1188,7 @@ tr.selected td { background: rgba(0,229,255,.06); }
   </div>
 
   <div class="panel panel-accent-purple">
-    <div class="ph"><span class="ph-l">Scoring Engine — Max 27 Points</span></div>
+    <div class="ph"><span class="ph-l">Scoring Engine — Max 30 Points</span></div>
     <div class="engine-chips">
       <span class="chip chip-cyan">TECHNICAL ×5</span>
       <span class="chip chip-green">BREAKOUT ×5</span>
@@ -1207,12 +1196,13 @@ tr.selected td { background: rgba(0,229,255,.06); }
       <span class="chip chip-amber">INSTITUTIONAL ×5</span>
       <span class="chip chip-red">REGIME ×2</span>
       <span class="chip" style="background:rgba(0,229,255,.07);color:#00ffcc;border:1px solid rgba(0,255,204,.25)">SMC ×5</span>
+      <span class="chip" style="background:rgba(255,170,0,.07);color:#ffd700;border:1px solid rgba(255,215,0,.3)">FIBONACCI ×3</span>
     </div>
     <div class="score-legend">
-      <span class="sl-item g">●&nbsp;18+ STRONG BUY</span>
-      <span class="sl-item c">●&nbsp;12+ BUY</span>
-      <span class="sl-item a">●&nbsp;8+ WATCHLIST</span>
-      <span class="sl-item d">●&nbsp;&lt;8 AVOID</span>
+      <span class="sl-item g">●&nbsp;20+ STRONG BUY</span>
+      <span class="sl-item c">●&nbsp;13+ BUY</span>
+      <span class="sl-item a">●&nbsp;9+ WATCHLIST</span>
+      <span class="sl-item d">●&nbsp;&lt;9 AVOID</span>
     </div>
   </div>
 </div>
@@ -1265,9 +1255,10 @@ tr.selected td { background: rgba(0,229,255,.06); }
         <th style="color:var(--purple)">FUND</th>
         <th style="color:var(--amber)">INST</th>
         <th style="color:#00ffcc">SMC</th>
-        <th>SCORE/27</th><th>SIGNAL</th><th>SL / TP</th><th>ACTION</th>
+        <th style="color:#ffd700">FIB</th>
+        <th>SCORE/30</th><th>SIGNAL</th><th>SL / TP</th><th>ACTION</th>
       </tr></thead>
-      <tbody id="sig-body"><tr><td colspan="11" class="no-data">▶ Press FULL SCAN to load NSE signals</td></tr></tbody>
+      <tbody id="sig-body"><tr><td colspan="13" class="no-data">▶ Press FULL SCAN to load NSE signals</td></tr></tbody>
     </table>
     </div>
   </div>
@@ -1475,10 +1466,10 @@ function renderSignals(sigs) {
     const actCls = s.action==='BUY'?'act-buy':s.action.startsWith('SELL')?'act-sell':'act-hold';
     const isSel  = s.symbol===selSym;
 
-    const pips = Array.from({length:27},(_,i)=>{
+    const pips = Array.from({length:30},(_,i)=>{
       const on = i < s.score;
-      const hi = on && s.score >= 20;
-      const lo = on && s.score < 13;
+      const hi = on && s.score >= 22;
+      const lo = on && s.score < 14;
       return `<div class="pip ${on?(hi?'lit hi':lo?'lit lo':'lit'):''}"></div>`;
     }).join('');
 
@@ -1491,6 +1482,16 @@ function renderSignals(sigs) {
     if (s.smc_fvg)   smcTags.push('<span style="color:#ff2d55;font-size:8px">FVG</span>');
     const smcCell = smcTags.length ? smcTags.join(' ') : `<span style="color:var(--muted);font-size:8px">${ss}/5</span>`;
 
+    // Fibonacci badge
+    const fs2 = (s.breakdown?.fibonacci?.score ?? s.fib_score ?? 0);
+    const fibColor = fs2 >= 3 ? '#ffd700' : fs2 >= 2 ? '#daa520' : 'var(--muted)';
+    const fibLabel = s.fib_in_golden ? '★GZ' : s.fib_at_key ? '◆KEY' : `${fs2}/3`;
+    const fibCell = `<span style="color:${fibColor};font-size:9px;font-weight:700">${fibLabel}</span>`;
+
+    const tpSrc = s.tp_source === 'FIB 1.618'
+      ? `<span style="color:#ffd700;font-size:7px">FIB</span>`
+      : `<span style="color:var(--muted);font-size:7px">ATR</span>`;
+
     return `<tr class="${isSel?'selected':''}" onclick="selectSym('${s.symbol}')">
       <td class="sym-cell"><strong>${s.symbol}</strong></td>
       <td style="font-family:var(--jet)">₹${s.ltp.toLocaleString('en-IN')}</td>
@@ -1500,15 +1501,16 @@ function renderSignals(sigs) {
       <td style="color:var(--purple)">${fs}/5</td>
       <td style="color:var(--amber)">${is}/5</td>
       <td>${smcCell}</td>
+      <td>${fibCell}</td>
       <td>
         <div class="score-bar-wrap">
           <div class="score-pips">${pips}</div>
-          <span class="score-num">${s.score}/27</span>
+          <span class="score-num">${s.score}/30</span>
         </div>
       </td>
       <td><span class="${sigCls} sig-label">${s.signal}</span></td>
       <td style="font-family:var(--jet);font-size:9px">
-        <span class="r">₹${s.sl}</span> <span class="d">/</span> <span class="g">₹${s.tp}</span>
+        <span class="r">₹${s.sl}</span> <span class="d">/</span> <span class="g">₹${s.tp}</span>${tpSrc}
       </td>
       <td><span class="${actCls}">${s.action}</span></td>
     </tr>`;
@@ -1534,11 +1536,32 @@ function showBreakdown(s) {
     {k:'institutional', l:'Institutional',  c:'var(--amber)',  fc:'#ffaa00'},
     {k:'regime',        l:'Regime',         c:'var(--red)',    fc:'#ff2d55'},
     {k:'smc',           l:'SMC',            c:'#00ffcc',       fc:'#00ffcc'},
+    {k:'fibonacci',     l:'Fibonacci',      c:'#ffd700',       fc:'#ffd700'},
   ];
   const meta = s.pe ? `<div style="font-size:9px;color:var(--muted);font-family:var(--raj);padding:.2rem 0 .7rem;border-bottom:1px solid var(--border);margin-bottom:.6rem">
     PE: ${s.pe||'—'} &nbsp;|&nbsp; ROE: ${s.roe||'—'}% &nbsp;|&nbsp; MCap: ₹${((s.mcap_cr||0)).toLocaleString('en-IN')}Cr
   </div>` : '';
-  let html = meta;
+
+  // Fibonacci zone display
+  let fibZone = '';
+  if (s.fib_golden_high || s.fib_swing_high) {
+    const inGz = s.fib_in_golden ? '⭐ IN GOLDEN ZONE' : '—';
+    const gz   = s.fib_golden_high ? `₹${s.fib_golden_low}–₹${s.fib_golden_high}` : '—';
+    const tp16 = s.fib_tp_1618 ? `₹${s.fib_tp_1618}` : '—';
+    const tpSrc = s.tp_source || 'ATR×3.5';
+    fibZone = `<div style="background:rgba(255,215,0,.04);border:1px solid rgba(255,215,0,.15);border-radius:3px;padding:.55rem .7rem;margin-bottom:.8rem;font-family:var(--raj);font-size:9px">
+      <div style="color:#ffd700;font-weight:700;letter-spacing:.12em;margin-bottom:.4rem">FIBONACCI LEVELS</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:.25rem .8rem;color:var(--muted)">
+        <span>Swing High</span><span style="color:var(--text);font-family:var(--jet)">₹${s.fib_swing_high||'—'}</span>
+        <span>Swing Low</span><span style="color:var(--text);font-family:var(--jet)">₹${s.fib_swing_low||'—'}</span>
+        <span>Golden Zone</span><span style="color:#ffd700;font-family:var(--jet)">${gz}</span>
+        <span>Zone status</span><span style="color:${s.fib_in_golden?'#ffd700':'var(--muted)'};">${inGz}</span>
+        <span>1.618 ext (TP)</span><span style="color:var(--green);font-family:var(--jet)">${tp16}</span>
+        <span>TP source</span><span style="color:${tpSrc==='FIB 1.618'?'#ffd700':'var(--steel)'}">${tpSrc}</span>
+      </div>
+    </div>`;
+  }
+  let html = meta + fibZone;
   engs.forEach(e => {
     const en  = bd[e.k]||{score:0,max:5,flags:[]};
     const pct = (en.score/en.max)*100;
@@ -1585,7 +1608,7 @@ function renderPositions(pos) {
     <td class="r" style="font-family:var(--jet)">₹${p.sl.toFixed(2)}</td>
     <td class="g" style="font-family:var(--jet)">₹${p.tp.toFixed(2)}</td>
     <td>${p.qty}</td>
-    <td><span style="font-family:var(--orb);font-size:9px;color:var(--cyan)">${p.score}/27</span></td>
+    <td><span style="font-family:var(--orb);font-size:9px;color:var(--cyan)">${p.score}/30</span></td>
     <td><span style="font-family:var(--raj);font-size:9px;font-weight:700;color:${p.trailing?'var(--amber)':'var(--muted)'}">${p.trailing?'TRAILING':'FIXED'}</span></td>
   </tr>`).join('');
 }
