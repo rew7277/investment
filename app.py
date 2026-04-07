@@ -50,13 +50,12 @@ STATE = {
     "scanning":      False,
     "kite_calls":    [],
     "errors":        [],
-    # ── Auth state (updated on login) ──────────────────────────
     "auth": {
-        "status":      "unknown",   # "ok" | "missing" | "invalid"
-        "user_name":   None,
-        "user_id":     None,
-        "token_saved": None,        # ISO timestamp when token was last saved
-        "login_url":   None,        # filled at startup
+        "status":    "unknown",   # "ok" | "missing" | "invalid"
+        "user_name": None,
+        "user_id":   None,
+        "token_saved": None,
+        "login_url": None,
     }
 }
 
@@ -65,34 +64,23 @@ STATE = {
 # KITE SESSION SETUP
 # ═════════════════════════════════════════════════════════════
 def build_login_url() -> str:
-    """Generate the Kite login URL pointing back to this app's /callback."""
     try:
         from kiteconnect import KiteConnect
         kite = KiteConnect(api_key=CFG["KITE_API_KEY"])
         return kite.login_url()
     except Exception:
-        api_key = CFG["KITE_API_KEY"]
-        return f"https://kite.zerodha.com/connect/login?v=3&api_key={api_key}"
+        return f"https://kite.zerodha.com/connect/login?v=3&api_key={CFG['KITE_API_KEY']}"
 
 
 def init_kite(access_token: str = None) -> KiteLayer:
-    """
-    Creates KiteConnect instance and wraps in KiteLayer.
-    Optionally accepts a fresh access_token (used by /callback).
-    """
     if not KITE_OK:
         raise RuntimeError("kiteconnect not installed")
-
     token = access_token or CFG["ACCESS_TOKEN"]
     if not token:
         STATE["auth"]["status"] = "missing"
-        raise RuntimeError(
-            "No access token. Visit /kite-login to authenticate with Zerodha."
-        )
-
+        raise RuntimeError("No access token. Visit /kite-login to authenticate.")
     kite = KiteConnect(api_key=CFG["KITE_API_KEY"])
     kite.set_access_token(token)
-
     try:
         profile = kite.profile()
         STATE["auth"].update({
@@ -104,7 +92,6 @@ def init_kite(access_token: str = None) -> KiteLayer:
     except Exception as e:
         STATE["auth"]["status"] = "invalid"
         raise RuntimeError(f"Kite auth failed: {e}")
-
     return KiteLayer(kite)
 
 
@@ -137,6 +124,7 @@ def run_full_scan():
         # ── INIT KITE ─────────────────────────────────────────
         if kl is None:
             kl = init_kite()
+        # Reset universe if kl was just created (new session)
         if universe is None:
             universe = UniverseManager(kl)
 
@@ -430,26 +418,22 @@ def health():
 
 
 # ═════════════════════════════════════════════════════════════
-# KITE AUTH ROUTES  — zero-touch daily login flow
+# KITE AUTH ROUTES
 # ═════════════════════════════════════════════════════════════
 
 @app.route("/kite-login")
 def kite_login():
-    """
-    Step 1: Redirect user to Zerodha login.
-    After login Zerodha redirects to /callback with ?request_token=...
-    Just open  https://your-app.railway.app/kite-login  each morning.
-    """
+    """Redirect to Zerodha login. Visit this every morning."""
     url = build_login_url()
-    log.info(f"  [Auth] Redirecting to Zerodha login: {url}")
+    log.info(f"  [Auth] Redirecting to Zerodha: {url}")
     return redirect(url)
 
 
 @app.route("/callback")
 def kite_callback():
     """
-    Step 2: Zerodha redirects here with ?request_token=...
-    We exchange it for an access_token, save it, and reinitialise Kite.
+    Zerodha redirects here after login with ?request_token=...
+    Exchanges it for access_token, saves it, reinitialises Kite.
     """
     global kl, universe
 
@@ -463,27 +447,24 @@ def kite_callback():
 
     try:
         from kiteconnect import KiteConnect
-        kite_tmp = KiteConnect(api_key=CFG["KITE_API_KEY"])
-        session  = kite_tmp.generate_session(request_token,
-                                              api_secret=CFG["KITE_API_SECRET"])
+        kite_tmp     = KiteConnect(api_key=CFG["KITE_API_KEY"])
+        session      = kite_tmp.generate_session(request_token,
+                                                  api_secret=CFG["KITE_API_SECRET"])
         access_token = session["access_token"]
 
-        # Persist token (survives process restarts within same deploy)
         save_token(access_token)
         STATE["auth"]["token_saved"] = datetime.now().isoformat()
 
-        # Re-initialise the live Kite session
+        # Force full reinit — new token, new KiteLayer, fresh universe
         kl       = init_kite(access_token)
-        universe = None   # force universe reload with new session
+        universe = None   # will be rebuilt on next scan with the new kl
 
-        log.info(f"  [Auth] ✅ New session active for {STATE['auth']['user_name']}")
+        log.info(f"  [Auth] ✅ Session active for {STATE['auth']['user_name']}")
         return _auth_page(
             f"✅ Logged in as {STATE['auth']['user_name']}",
-            "Token saved. The scanner will use this token automatically. "
-            "You can close this tab.",
+            "Token saved. Scanner is ready. You can close this tab and press FULL SCAN.",
             success=True
         )
-
     except Exception as e:
         log.error(f"  [Auth] Token exchange failed: {e}")
         return _auth_page("❌ Token Exchange Failed", str(e), success=False), 500
@@ -512,8 +493,7 @@ def _auth_page(title: str, message: str, success: bool) -> str:
   a:hover{{background:#00e5ff;color:#010408}}
 </style></head>
 <body><div class="card">
-  <h2>{title}</h2>
-  <p>{message}</p>
+  <h2>{title}</h2><p>{message}</p>
   <a href="/">← Back to Dashboard</a>
 </div></body></html>"""
 
@@ -539,38 +519,31 @@ def start_scheduler():
 
 def probe_existing_token():
     """
-    On startup: if a token exists (env or saved file), validate it silently.
-    Sets STATE["auth"] so the dashboard shows the correct status immediately.
-    Does NOT crash the app if token is missing/invalid — user just needs to
-    visit /kite-login.
+    Silently validate any saved token on startup.
+    Does NOT crash if missing/invalid — user visits /kite-login.
     """
     global kl
+    STATE["auth"]["login_url"] = build_login_url()
     token = CFG["ACCESS_TOKEN"]
-    login_url = build_login_url()
-    STATE["auth"]["login_url"] = login_url
-
     if not token:
         STATE["auth"]["status"] = "missing"
-        log.warning("  [Auth] ⚠️  No access token found.")
-        log.warning(f"  [Auth]    Open  /kite-login  to authenticate.")
+        log.warning("  [Auth] ⚠️  No token found — visit /kite-login to authenticate")
         return
-
     try:
         kl = init_kite(token)
-        log.info("  [Auth] ✅ Existing token is valid — ready to scan.")
+        log.info("  [Auth] ✅ Token valid — ready to scan")
     except Exception as e:
-        log.warning(f"  [Auth] Existing token invalid: {e}")
-        log.warning(f"  [Auth] Open  /kite-login  to get a fresh token.")
+        log.warning(f"  [Auth] Token invalid ({e}) — visit /kite-login")
 
 
-# Runs under both `python app.py` and gunicorn
+# ── Runs under both gunicorn and `python app.py` ─────────────
+log.info("🚀 Institutional Trader Pro — Full NSE Edition")
+log.info(f"   Mode:    {'PAPER' if CFG['PAPER_TRADE'] else '⚠ LIVE'}")
 probe_existing_token()
 start_scheduler()
 
+
 if __name__ == "__main__":
-    log.info("🚀 Institutional Trader Pro — Full NSE Edition")
-    log.info(f"   Mode:    {'PAPER' if CFG['PAPER_TRADE'] else '⚠ LIVE'}")
-    log.info(f"   Capital: ₹{CFG['CAPITAL']:,}")
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
 DASHBOARD_HTML = r"""<!DOCTYPE html>
@@ -1252,7 +1225,7 @@ function render(d) {
   renderKiteLog(d.kite_calls);
   renderTicker(d.signals, d.gap_alerts);
 
-  // auth status badge
+  // auth badge
   const auth = d.auth || {};
   const authOk  = document.getElementById('auth-ok');
   const authBtn = document.getElementById('auth-btn');
@@ -1263,7 +1236,6 @@ function render(d) {
   } else {
     authOk.style.display = 'none';
     authBtn.style.display = 'inline-block';
-    authBtn.title = auth.status === 'missing' ? 'No token — click to login' : 'Token invalid — click to re-login';
   }
 
   if(selSym) {

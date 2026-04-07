@@ -28,10 +28,8 @@ log = logging.getLogger("ENGINE")
 
 # ─────────────────────────────────────────────────────────────
 # TOKEN STORE  — persists access token across restarts
-# Railway has an ephemeral filesystem, so we store in /tmp
-# (survives the session) and also keep it in memory via CFG.
 # ─────────────────────────────────────────────────────────────
-TOKEN_FILE = os.path.join(os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "/tmp"), "kite_token.json")
+TOKEN_FILE = "/tmp/kite_token.json"
 
 def save_token(access_token: str):
     """Persist access token to disk + update live CFG."""
@@ -43,16 +41,14 @@ def save_token(access_token: str):
         log.info(f"  [Auth] ✅ Token saved to {TOKEN_FILE}")
     except Exception as e:
         log.warning(f"  [Auth] Could not save token file: {e}")
-        CFG["ACCESS_TOKEN"] = access_token  # still update in memory
+        CFG["ACCESS_TOKEN"] = access_token
 
 def load_token() -> str:
-    """Load token: env var takes priority, then file, then empty."""
-    # 1. Explicit env var always wins
+    """Load token: env var takes priority, then saved file, then empty."""
     env_token = os.environ.get("KITE_ACCESS_TOKEN", "")
     if env_token:
         log.info("  [Auth] Token loaded from KITE_ACCESS_TOKEN env var")
         return env_token
-    # 2. Previously saved file
     try:
         with open(TOKEN_FILE) as f:
             data = json.load(f)
@@ -74,7 +70,7 @@ CFG = {
     # ── Kite credentials ──────────────────────────────────────
     "KITE_API_KEY":    os.environ.get("KITE_API_KEY",    ""),
     "KITE_API_SECRET": os.environ.get("KITE_API_SECRET", ""),
-    "ACCESS_TOKEN":    load_token(),   # loaded from env or saved file
+    "ACCESS_TOKEN":    load_token(),   # env var → saved file → empty
 
     # ── Universe filters ─────────────────────────────────────
     # We pull ALL NSE EQ stocks from Kite and filter down
@@ -172,9 +168,10 @@ class KiteLayer:
         df = df[df["segment"] == "NSE"]
         df = df[df["instrument_type"] == "EQ"]
         df = df[["instrument_token", "tradingsymbol", "name",
-                 "last_price", "tick_size", "lot_size"]]
-        df.columns = ["token", "symbol", "name", "ltp", "tick", "lot"]
-        df = df[df["ltp"] >= CFG["MIN_PRICE"]]
+                 "tick_size", "lot_size"]]
+        df.columns = ["token", "symbol", "name", "tick", "lot"]
+        # NOTE: last_price from instruments() is always 0 (it's a master list,
+        # not live data). Price filtering is done AFTER we fetch live quotes.
         df = df.reset_index(drop=True)
 
         log.info(f"  [Kite] → {len(df)} EQ instruments loaded")
@@ -445,6 +442,7 @@ class UniverseManager:
             volume     = q.get("volume", 0)
             open_p     = q.get("open", 0)
 
+            # Apply price filter HERE using live LTP (instruments master has last_price=0)
             if not prev_close or ltp < CFG["MIN_PRICE"]:
                 continue
 
