@@ -174,9 +174,13 @@ def run_full_scan():
         # NSE API:  India VIX, FII/DII flows
         # ─────────────────────────────────────────────────────
         log.info("  STEP 4 — Macro regime check...")
-        nifty_df = kl.get_ohlcv(CFG["NIFTY_TOKEN"], days=300)
-        nifty_df = TechnicalEngine.compute(nifty_df)
-        log_kite_call("historical_data", f"NIFTY 50 — {len(nifty_df)} candles")
+        nifty_raw = kl.get_ohlcv(CFG["NIFTY_TOKEN"], days=400)   # 400 cal days ≈ 280 trading days
+        nifty_df  = TechnicalEngine.compute(nifty_raw)
+        # Fallback: if compute() stripped all rows (unlikely after fix), use raw
+        if nifty_df.empty and not nifty_raw.empty:
+            log.warning("  [Regime] TechnicalEngine returned empty — using raw NIFTY data for regime check")
+            nifty_df = nifty_raw
+        log_kite_call("historical_data", f"NIFTY 50 — {len(nifty_raw)} candles")
 
         vix = nse.get_india_vix()
         fii = nse.get_fii_dii()
@@ -275,7 +279,7 @@ def run_full_scan():
                         and regime_ok):
 
                     if CFG["PAPER_TRADE"]:
-                        log.info(f"  📝 PAPER BUY {sym} | {full['signal']} | Score {full['total']}/22 | Qty {qty}")
+                        log.info(f"  📝 PAPER BUY {sym} | {full['signal']} | Score {full['total']}/27 | Qty {qty}")
                     else:
                         # KITE API: kite.place_order(...)
                         order_id = kl.place_order(sym, "NSE", "BUY", qty)
@@ -1363,7 +1367,7 @@ function renderPositions(pos) {
     <td class="r" style="font-family:var(--jet)">₹${p.sl.toFixed(2)}</td>
     <td class="g" style="font-family:var(--jet)">₹${p.tp.toFixed(2)}</td>
     <td>${p.qty}</td>
-    <td><span style="font-family:var(--orb);font-size:9px;color:var(--cyan)">${p.score}/22</span></td>
+    <td><span style="font-family:var(--orb);font-size:9px;color:var(--cyan)">${p.score}/27</span></td>
     <td><span style="font-family:var(--raj);font-size:9px;font-weight:700;color:${p.trailing?'var(--amber)':'var(--muted)'}">${p.trailing?'TRAILING':'FIXED'}</span></td>
   </tr>`).join('');
 }
@@ -1402,7 +1406,7 @@ function renderTicker(sigs, gaps) {
   );
   (sigs||[]).slice(0,15).forEach(s=>{
     const cls = s.signal_class==='strong-buy'?'g':s.signal_class==='buy'?'c':s.signal_class==='watch'?'a':'d';
-    items.push(`<span class="tk-sym">${s.symbol}</span><span class="tk-val ${cls}">${s.signal} ${s.score}/22</span><span class="tk-sep">·</span>`);
+    items.push(`<span class="tk-sym">${s.symbol}</span><span class="tk-val ${cls}">${s.signal} ${s.score}/27</span><span class="tk-sep">·</span>`);
   });
   if(!items.length) return;
   const full = [...items,...items].join(' ');

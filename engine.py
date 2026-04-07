@@ -515,10 +515,16 @@ class NSEClient:
         data = self._get("fiidiiTradeReact")
         res  = {"fii_net": 0.0, "dii_net": 0.0, "fii_bullish": False, "dii_bullish": False}
         try:
-            if isinstance(data, list) and data:
-                row = data[0]
-                res["fii_net"]     = float(row.get("buyValue", 0)) - float(row.get("sellValue", 0))
-                res["dii_net"]     = float(row.get("dii_buyValue", 0)) - float(row.get("dii_sellValue", 0))
+            # API sometimes returns bare list, sometimes {"data": [...]}
+            rows = data if isinstance(data, list) else (data.get("data") or [])
+            if rows:
+                row = rows[0]
+                fii_buy  = float(row.get("buyValue",      row.get("fiiBuyValue",  0)) or 0)
+                fii_sell = float(row.get("sellValue",     row.get("fiiSellValue", 0)) or 0)
+                dii_buy  = float(row.get("dii_buyValue",  row.get("diiBuyValue",  0)) or 0)
+                dii_sell = float(row.get("dii_sellValue", row.get("diiSellValue", 0)) or 0)
+                res["fii_net"]     = fii_buy - fii_sell
+                res["dii_net"]     = dii_buy - dii_sell
                 res["fii_bullish"] = res["fii_net"] > 0
                 res["dii_bullish"] = res["dii_net"] > 0
         except Exception as e:
@@ -565,8 +571,9 @@ class NSEClient:
         try:
             if data and "data" in data:
                 for idx in data["data"]:
-                    if idx.get("index") == "India VIX":
-                        return float(idx["last"])
+                    name = (idx.get("index") or idx.get("indexSymbol") or "").upper()
+                    if "VIX" in name:
+                        return float(idx.get("last") or idx.get("lastPrice") or 15.0)
         except Exception:
             pass
         return 15.0
@@ -594,7 +601,7 @@ class TechnicalEngine:
 
     @staticmethod
     def compute(df: pd.DataFrame) -> pd.DataFrame:
-        if len(df) < 60:
+        if len(df) < 30:
             return pd.DataFrame()
         df = df.copy()
         close, high, low, vol = df["close"], df["high"], df["low"], df["volume"]
@@ -648,8 +655,10 @@ class TechnicalEngine:
         df["macd_sig"]  = df["macd"].ewm(span=9, adjust=False).mean()
         df["macd_bull"] = df["macd"] > df["macd_sig"]
 
-        df["high_52w"]    = high.rolling(252).max()
-        df["at_52w_high"] = close >= df["high_52w"].shift(1)
+        # Use dynamic window so we never produce all-NaN when data < 252 trading days
+        _52w_window       = min(252, len(df))
+        df["high_52w"]    = high.rolling(_52w_window).max()
+        df["at_52w_high"] = close >= df["high_52w"].shift(1).fillna(high)
 
         op = df["open"]
         body_sz   = (close - op).abs()
@@ -663,7 +672,11 @@ class TechnicalEngine:
         df["cross_up"]   = (df["ema_fast"] > df["ema_slow"]) & (df["ema_fast"].shift() <= df["ema_slow"].shift())
         df["cross_down"] = (df["ema_fast"] < df["ema_slow"]) & (df["ema_fast"].shift() >= df["ema_slow"].shift())
 
-        return df.dropna()
+        # Only drop rows where CORE indicators are NaN; optional cols (high_52w, at_52w_high)
+        # use dynamic windows so they won't NaN-out everything, but just in case:
+        _core = ["ema_fast", "ema_slow", "ema_trend", "rsi", "atr",
+                 "adx", "macd", "macd_sig", "supertrend", "vol_ma"]
+        return df.dropna(subset=_core).reset_index(drop=True)
 
     @staticmethod
     def score(row: pd.Series) -> Tuple[int, List[str]]:
@@ -897,7 +910,7 @@ class MarketRegime:
     def check(nifty_df: pd.DataFrame, vix: float) -> Tuple[int, List[str], bool, str]:
         score = 0; flags = []
         try:
-            if nifty_df is None or len(nifty_df) < 5:
+            if nifty_df is None or len(nifty_df) < 3:
                 log.warning("  [Regime] NIFTY data insufficient — using neutral regime")
                 return 1, ["⚠️ NIFTY data unavailable (market may be closed)"], True, "NEUTRAL ⚪"
 
@@ -1141,10 +1154,10 @@ def build_score(tech_s, tech_f, brk_s, brk_f,
     total  = tech_s + brk_s + fund_s + inst_s + reg_s + smc_s
     MAX    = 27   # 5 tech + 5 breakout + 5 fundamental + 5 institutional + 2 regime + 5 SMC
 
-    if   total >= 20: sig, cls = "STRONG BUY 🔥", "strong-buy"
-    elif total >= 13: sig, cls = "BUY ✅",         "buy"
-    elif total >= 8:  sig, cls = "WATCHLIST 👀",   "watch"
-    else:             sig, cls = "AVOID ❌",        "avoid"
+    if   total >= CFG.get("SCORE_STRONG_BUY", 16): sig, cls = "STRONG BUY 🔥", "strong-buy"
+    elif total >= CFG.get("SCORE_BUY",        11): sig, cls = "BUY ✅",         "buy"
+    elif total >= CFG.get("SCORE_WATCHLIST",    7): sig, cls = "WATCHLIST 👀",   "watch"
+    else:                                            sig, cls = "AVOID ❌",        "avoid"
 
     return {
         "total": total, "max": MAX, "signal": sig, "signal_class": cls,
