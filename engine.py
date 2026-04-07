@@ -924,7 +924,8 @@ class InstitutionalEngine:
 
     @staticmethod
     def score(nse: NSEClient, symbol: str,
-              fii_data: dict, oc_data: dict, vix: float) -> Tuple[int, List[str]]:
+              fii_data: dict, oc_data: dict, vix: float,
+              block_deals_cache: dict = None) -> Tuple[int, List[str]]:
         score = 0; flags = []
 
         # I1: FII flow
@@ -957,8 +958,12 @@ class InstitutionalEngine:
         else:
             flags.append(f"❌ VIX {vix:.1f} high fear")
 
-        # I5: Block deal
-        bd = nse.get_block_deals(symbol)
+        # I5: Block deal — use pre-fetched cache if provided (avoids 500 HTTP calls per scan)
+        bd_raw = block_deals_cache if block_deals_cache is not None else nse._get("block-deal")
+        buys   = [d for d in bd_raw.get("data", [])
+                  if d.get("symbol", "").upper() == symbol.upper()
+                  and d.get("buySell", "").upper() == "BUY"]
+        bd = {"block_buy": len(buys) > 0, "deals": buys[:3]}
         if bd["block_buy"]:
             score += 1; flags.append("✅ Block deal buying detected")
         else:

@@ -7,8 +7,10 @@
 """
 
 import os, json, logging, threading, math
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from flask import Flask, jsonify, render_template_string, redirect, request
+import numpy as np
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -215,42 +217,62 @@ def run_full_scan():
         # KITE API: kite.historical_data(token, ...) per stock
         # ─────────────────────────────────────────────────────
         log.info(f"  STEP 6 — Deep analysis on {len(candidates)} stocks...")
-        signals    = []
-        open_count = len(STATE["positions"])
 
-        for i, cand in enumerate(candidates, 1):
+        # ── Pre-fetch block deals ONCE (avoids 500 HTTP calls, same endpoint returns all) ──
+        log.info("  → Pre-fetching block deals (1 call for all stocks)...")
+        block_deals_cache = nse._get("block-deal")
+
+        # ── Worker function — runs in thread pool ──────────────
+        def analyse_one(cand):
             sym   = cand["symbol"]
             token = cand["token"]
-            quote = cand
-
             if not token:
-                continue
-
+                return None
             try:
-                # KITE API: kite.historical_data(token, from_dt, to_dt, interval)
                 df = kl.get_ohlcv(token, days=300)
                 if df.empty or len(df) < 60:
-                    continue
+                    return None
                 df = TechnicalEngine.compute(df)
                 if df.empty:
-                    continue
-                log_kite_call("historical_data", f"{sym} — {len(df)} candles")
+                    return None
 
-                row = df.iloc[-1]
+                row    = df.iloc[-1]
+                tech_s, tech_f = TechnicalEngine.score(row)
+                brk_s,  brk_f  = BreakoutScanner.score(df, row, nifty_df, cand)
+                fund_d          = FundamentalEngine.get(sym, df, row, nifty_df, nse)
+                inst_s, inst_f  = InstitutionalEngine.score(
+                    nse, sym, fii, oc, vix, block_deals_cache)
+                smc_d           = SMCEngine.compute(df)
+                full            = build_score(tech_s, tech_f, brk_s, brk_f,
+                                              fund_d, inst_s, inst_f, reg_s, reg_f, smc_d)
 
-                # Score all engines including SMC
-                tech_s,  tech_f  = TechnicalEngine.score(row)
-                brk_s,   brk_f   = BreakoutScanner.score(df, row, nifty_df, quote)
-                fund_d = FundamentalEngine.get(sym, df, row, nifty_df, nse)
-                inst_s,  inst_f  = InstitutionalEngine.score(nse, sym, fii, oc, vix)
-                smc_d            = SMCEngine.compute(df)
-                full             = build_score(tech_s, tech_f, brk_s, brk_f,
-                                               fund_d, inst_s, inst_f, reg_s, reg_f,
-                                               smc_d)
-
-                entry = cand["ltp"] * (1 + CFG["SLIPPAGE_PCT"])
+                entry  = cand["ltp"] * (1 + CFG["SLIPPAGE_PCT"])
                 sl, tp = RiskManager.sl_tp(entry, float(row["atr"]))
                 qty    = RiskManager.position_size(entry, sl, available_cap)
+
+                return (cand, row, full, entry, sl, tp, qty, fund_d, smc_d)
+            except Exception as e:
+                STATE["errors"].append({"time": str(datetime.now()), "msg": f"{sym}: {str(e)[:80]}"})
+                return None
+
+        # ── Parallel execution ──────────────────────────────────
+        signals    = []
+        open_count = len(STATE["positions"])
+        done       = 0
+
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            futures = {pool.submit(analyse_one, cand): cand for cand in candidates}
+            for fut in as_completed(futures):
+                done += 1
+                if done % 50 == 0:
+                    log.info(f"  → Progress: {done}/{len(candidates)} stocks analysed")
+                result = fut.result()
+                if result is None:
+                    continue
+
+                cand, row, full, entry, sl, tp, qty, fund_d, smc_d = result
+                sym = cand["symbol"]
+                log_kite_call("historical_data", f"{sym} — parallel")
 
                 sig = {
                     "symbol":       sym,
@@ -265,7 +287,7 @@ def run_full_scan():
                     "tp":           tp,
                     "qty":          qty,
                     "score":        full["total"],
-                    "max_score":    full["max"],   # 27
+                    "max_score":    full["max"],
                     "signal":       full["signal"],
                     "signal_class": full["signal_class"],
                     "breakdown":    full["breakdown"],
@@ -274,12 +296,12 @@ def run_full_scan():
                     "pe":           fund_d.get("pe"),
                     "roe":          fund_d.get("roe"),
                     "mcap_cr":      fund_d.get("mcap_cr"),
-                    # SMC fields for display
+                    # Cast to Python bool — prevents numpy bool_ JSON crash
                     "smc_ob":       smc_d.get("ob"),
                     "smc_fvg":      smc_d.get("fvg"),
-                    "smc_bos":      smc_d.get("bos", False),
-                    "smc_choch":    smc_d.get("choch", False),
-                    "smc_sweep":    smc_d.get("sweep", False),
+                    "smc_bos":      bool(smc_d.get("bos", False)),
+                    "smc_choch":    bool(smc_d.get("choch", False)),
+                    "smc_sweep":    bool(smc_d.get("sweep", False)),
                 }
 
                 # ── Entry: BUY ────────────────────────────────
@@ -303,7 +325,7 @@ def run_full_scan():
                     STATE["positions"][sym] = {
                         "entry": entry, "sl": sl, "tp": tp, "qty": qty,
                         "score": full["total"], "date": str(datetime.now()),
-                        "token": token, "trailing": False,
+                        "token": cand["token"], "trailing": False,
                     }
                     open_count += 1
                     sig["action"] = "BUY"
@@ -335,13 +357,6 @@ def run_full_scan():
                         sig["action"] = f"SELL ({reason})"
 
                 signals.append(sig)
-
-                if i % 50 == 0:
-                    log.info(f"  → Progress: {i}/{len(candidates)} stocks analysed")
-
-            except Exception as e:
-                STATE["errors"].append({"time": str(datetime.now()), "msg": f"{sym}: {str(e)[:80]}"})
-
         # ─────────────────────────────────────────────────────
         # STEP 7: Sync positions with Kite
         # KITE API: kite.positions() + kite.orders()
@@ -394,13 +409,30 @@ def dashboard():
     return render_template_string(DASHBOARD_HTML)
 
 
+def _sanitize(obj):
+    """Recursively convert numpy types to JSON-safe Python types."""
+    if isinstance(obj, dict):
+        return {k: _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize(v) for v in obj]
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, float) and (np.isnan(obj) or np.isinf(obj)):
+        return None
+    return obj
+
+
 @app.route("/api/state")
 def api_state():
     tl    = STATE["trade_log"]
     pnl   = sum(t["pnl"] for t in tl)
     wins  = [t for t in tl if t["pnl"] > 0]
     wr    = round(len(wins)/len(tl)*100, 1) if tl else 0
-    return jsonify({
+    return jsonify(_sanitize({
         "signals":       STATE["signals"][:100],    # top 100 by score
         "positions":     STATE["positions"],
         "trade_log":     tl[-30:],
@@ -423,7 +455,7 @@ def api_state():
             "win_rate":       wr,
         },
         "auth": STATE["auth"],
-    })
+    }))
 
 
 @app.route("/api/scan", methods=["POST"])
