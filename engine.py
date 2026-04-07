@@ -27,13 +27,54 @@ import numpy as np
 log = logging.getLogger("ENGINE")
 
 # ─────────────────────────────────────────────────────────────
+# TOKEN STORE  — persists access token across restarts
+# Railway has an ephemeral filesystem, so we store in /tmp
+# (survives the session) and also keep it in memory via CFG.
+# ─────────────────────────────────────────────────────────────
+TOKEN_FILE = os.path.join(os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "/tmp"), "kite_token.json")
+
+def save_token(access_token: str):
+    """Persist access token to disk + update live CFG."""
+    try:
+        with open(TOKEN_FILE, "w") as f:
+            json.dump({"access_token": access_token,
+                       "saved_at": datetime.now().isoformat()}, f)
+        CFG["ACCESS_TOKEN"] = access_token
+        log.info(f"  [Auth] ✅ Token saved to {TOKEN_FILE}")
+    except Exception as e:
+        log.warning(f"  [Auth] Could not save token file: {e}")
+        CFG["ACCESS_TOKEN"] = access_token  # still update in memory
+
+def load_token() -> str:
+    """Load token: env var takes priority, then file, then empty."""
+    # 1. Explicit env var always wins
+    env_token = os.environ.get("KITE_ACCESS_TOKEN", "")
+    if env_token:
+        log.info("  [Auth] Token loaded from KITE_ACCESS_TOKEN env var")
+        return env_token
+    # 2. Previously saved file
+    try:
+        with open(TOKEN_FILE) as f:
+            data = json.load(f)
+        token = data.get("access_token", "")
+        saved = data.get("saved_at", "unknown")
+        if token:
+            log.info(f"  [Auth] Token loaded from file (saved: {saved})")
+            return token
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning(f"  [Auth] Could not read token file: {e}")
+    return ""
+
+# ─────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────
 CFG = {
     # ── Kite credentials ──────────────────────────────────────
     "KITE_API_KEY":    os.environ.get("KITE_API_KEY",    ""),
     "KITE_API_SECRET": os.environ.get("KITE_API_SECRET", ""),
-    "ACCESS_TOKEN":    os.environ.get("KITE_ACCESS_TOKEN", ""),
+    "ACCESS_TOKEN":    load_token(),   # loaded from env or saved file
 
     # ── Universe filters ─────────────────────────────────────
     # We pull ALL NSE EQ stocks from Kite and filter down
