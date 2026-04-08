@@ -7,6 +7,7 @@
 """
 
 import os, json, logging, threading, math
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from flask import Flask, jsonify, render_template_string, redirect, request
 import numpy as np
@@ -61,6 +62,32 @@ nse   = NSEClient()
 kl: KiteLayer           = None   # initialised on first scan
 universe: UniverseManager = None
 
+# Thread lock — all writes to STATE go through this to prevent race conditions
+_STATE_LOCK = threading.Lock()
+
+# Paper portfolio persistence — survives server restarts
+PAPER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paper_portfolio.json")
+
+def load_paper_portfolio() -> dict:
+    default = {"capital": 10000.0, "cash": 10000.0, "holdings": {}, "pnl_realised": 0.0}
+    try:
+        with open(PAPER_FILE) as f:
+            data = json.load(f)
+        log.info(f"  [Paper] Portfolio loaded from {PAPER_FILE}")
+        return {**default, **data}
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning(f"  [Paper] Could not load portfolio: {e}")
+    return default
+
+def save_paper_portfolio():
+    try:
+        with open(PAPER_FILE, "w") as f:
+            json.dump(STATE["paper_portfolio"], f, indent=2)
+    except Exception as e:
+        log.warning(f"  [Paper] Could not save portfolio: {e}")
+
 STATE = {
     "signals":       [],
     "positions":     {},
@@ -79,12 +106,7 @@ STATE = {
         "stocks_total": 0,      # total candidates
         "pct":        0,        # 0-100
     },
-    "paper_portfolio": {        # paper trading portfolio state
-        "capital":    10000.0,  # starting capital ₹10,000
-        "cash":       10000.0,  # available cash
-        "holdings":   {},       # symbol → {qty, avg_price, invested}
-        "pnl_realised": 0.0,
-    },
+    "paper_portfolio": load_paper_portfolio(),   # loaded from disk — persists restarts
     "kite_calls":    [],
     "errors":        [],
     "auth": {
@@ -305,52 +327,60 @@ def run_full_scan():
             log.warning(f"  [NSE] Prefetch failed (non-fatal): {_pe}")
 
         # ─────────────────────────────────────────────────────
-        # STEP 5: Get available capital from Kite
+        # STEP 5: Get available capital from Kite — HARD STOP if invalid
         # ─────────────────────────────────────────────────────
         available_cap = kl.get_available_capital()
         if available_cap < 1000:
-            log.warning(f"  [Capital] Kite returned ₹{available_cap:.2f} — using CFG fallback ₹{CFG['CAPITAL']:,}")
+            if not CFG["PAPER_TRADE"]:
+                raise RuntimeError(
+                    f"Capital check returned ₹{available_cap:.0f} — aborting scan to prevent "
+                    "unintended orders. Check Kite margins or set PAPER_TRADE=true."
+                )
+            log.warning(f"  [Capital] Kite returned ₹{available_cap:.2f} — using CFG fallback ₹{CFG['CAPITAL']:,} (paper mode)")
             available_cap = CFG["CAPITAL"]
         log_kite_call("margins('equity')", f"₹{available_cap:,.0f} available")
         log.info(f"  STEP 5 — Available capital: ₹{available_cap:,.0f}")
         set_progress(5, f"Capital confirmed ₹{available_cap:,.0f} — starting deep analysis...")
 
-        # ─────────────────────────────────────────────────────
-        # STEP 6: Deep Analysis — Historical data per stock
-        # KITE API: kite.historical_data(token, ...) per stock
-        # ─────────────────────────────────────────────────────
-        log.info(f"  STEP 6 — Deep analysis on {len(candidates)} stocks...")
-        signals    = []
-        open_count = len(STATE["positions"])
-        set_progress(6, f"Deep-analysing {len(candidates)} candidates...", 0, len(candidates))
+        # BEAR market hard gate — block all new buys, just score and track
+        if bear_market:
+            log.warning(f"  [Regime] ⚠️  BEAR MARKET detected — all new BUY orders are BLOCKED this scan")
 
-        for i, cand in enumerate(candidates, 1):
+        # ─────────────────────────────────────────────────────
+        # STEP 6: Deep Analysis — PARALLEL via ThreadPoolExecutor
+        # KITE API: kite.historical_data(token, ...) per stock
+        # Using 6 workers → ~5× faster than serial scan
+        # ─────────────────────────────────────────────────────
+        log.info(f"  STEP 6 — Parallel deep analysis on {len(candidates)} stocks (6 workers)...")
+
+        # Take a snapshot of current positions — workers read this, main thread writes
+        positions_snapshot = dict(STATE["positions"])
+        open_count_snap    = len(positions_snapshot)
+
+        signals      = []
+        skipped      = 0
+        _done_lock   = threading.Lock()
+        done_counter = [0]   # mutable list for closure
+
+        set_progress(6, f"Parallel deep-analysing {len(candidates)} candidates...", 0, len(candidates))
+
+        def _analyse(cand: dict):
+            """Analyse one stock — runs in a worker thread. Returns sig dict or None."""
             sym   = cand["symbol"]
             token = cand["token"]
-            quote = cand
-
             if not token:
-                continue
-
-            # Update progress every 10 stocks
-            if i % 10 == 0 or i == 1:
-                set_progress(6, f"Analysing {sym} ({i}/{len(candidates)})...", i, len(candidates))
-
+                return None
             try:
-                # KITE API: kite.historical_data(token, from_dt, to_dt, interval)
                 df = kl.get_ohlcv(token, days=300)
                 if df.empty or len(df) < 60:
-                    continue
+                    return None
                 df = TechnicalEngine.compute(df)
                 if df.empty:
-                    continue
-                log_kite_call("historical_data", f"{sym} — {len(df)} candles")
+                    return None
 
-                row = df.iloc[-1]
-
-                # Score all engines including SMC and Fibonacci
+                row     = df.iloc[-1]
                 tech_s,  tech_f  = TechnicalEngine.score(row)
-                brk_s,   brk_f   = BreakoutScanner.score(df, row, nifty_df, quote)
+                brk_s,   brk_f   = BreakoutScanner.score(df, row, nifty_df, cand)
                 fund_d           = FundamentalEngine.compute(df, row, nifty_df)
                 inst_s,  inst_f  = InstitutionalEngine.score(nse, sym, fii, oc, vix)
                 smc_d            = SMCEngine.compute(df)
@@ -363,7 +393,6 @@ def run_full_scan():
                 sl, tp = RiskManager.sl_tp(entry, float(row["atr"]), fib_d)
                 qty    = RiskManager.position_size(entry, sl, available_cap)
 
-                # Label whether TP is Fib-based or ATR-based for display
                 tp_source = (
                     "FIB 1.618"
                     if fib_d.get("score", 0) >= 2
@@ -372,107 +401,137 @@ def run_full_scan():
                     else "ATR×3.5"
                 )
 
-                sig = {
+                return {
                     "symbol":       sym,
-                    "ltp":          round(cand["ltp"], 2),
-                    "gap_pct":      cand.get("gap_pct", 0),
-                    "change_pct":   cand.get("change_pct", 0),
-                    "volume":       cand.get("volume", 0),
+                    "ltp":          round(float(cand["ltp"]), 2),
+                    "gap_pct":      float(cand.get("gap_pct", 0)),
+                    "change_pct":   float(cand.get("change_pct", 0)),
+                    "volume":       int(cand.get("volume", 0)),
                     "rsi":          round(float(row.get("rsi", 0)), 1),
                     "adx":          round(float(row.get("adx", 0)), 1),
                     "atr":          round(float(row.get("atr", 0)), 2),
-                    "sl":           sl,
-                    "tp":           tp,
+                    "sl":           float(sl),
+                    "tp":           float(tp),
                     "tp_source":    tp_source,
-                    "qty":          qty,
-                    "score":        full["total"],
-                    "max_score":    full["max"],   # 30
+                    "qty":          int(qty),
+                    "score":        int(full["total"]),
+                    "max_score":    int(full["max"]),
                     "signal":       full["signal"],
                     "signal_class": full["signal_class"],
                     "breakdown":    full["breakdown"],
                     "action":       "HOLD",
                     "time":         str(datetime.now()),
+                    "token":        token,
+                    "entry":        float(entry),
                     "pe":           fund_d.get("pe"),
                     "roe":          fund_d.get("roe"),
                     "mcap_cr":      fund_d.get("mcap_cr"),
-                    # SMC fields for display
                     "smc_ob":       smc_d.get("ob"),
                     "smc_fvg":      smc_d.get("fvg"),
-                    "smc_bos":      smc_d.get("bos", False),
-                    "smc_choch":    smc_d.get("choch", False),
-                    "smc_sweep":    smc_d.get("sweep", False),
-                    # Fibonacci fields for display
-                    "fib_score":        fib_d.get("score", 0),
+                    "smc_bos":      bool(smc_d.get("bos", False)),
+                    "smc_choch":    bool(smc_d.get("choch", False)),
+                    "smc_sweep":    bool(smc_d.get("sweep", False)),
+                    "fib_score":        int(fib_d.get("score", 0)),
                     "fib_golden_high":  fib_d.get("golden_zone_high"),
                     "fib_golden_low":   fib_d.get("golden_zone_low"),
                     "fib_tp_1618":      fib_d.get("fib_tp_1618"),
                     "fib_swing_high":   fib_d.get("swing_high"),
                     "fib_swing_low":    fib_d.get("swing_low"),
-                    "fib_in_golden":    fib_d.get("price_in_golden", False),
-                    "fib_at_key":       fib_d.get("fib_at_key_level", False),
+                    "fib_in_golden":    bool(fib_d.get("price_in_golden", False)),
+                    "fib_at_key":       bool(fib_d.get("fib_at_key_level", False)),
                 }
+            except Exception as e:
+                with _STATE_LOCK:
+                    STATE["errors"].append({"time": str(datetime.now()), "msg": f"{sym}: {str(e)[:80]}"})
+                    if len(STATE["errors"]) > 30:
+                        STATE["errors"] = STATE["errors"][-30:]
+                return None
 
-                # ── Entry: BUY ────────────────────────────────
-                buy_threshold = CFG["SCORE_BUY"] + bear_premium
-                if (full["total"] >= buy_threshold
-                        and sym not in STATE["positions"]
-                        and open_count < CFG["MAX_OPEN_TRADES"]
-                        and regime_ok):
+        # Run all stock analyses in parallel
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            future_map = {executor.submit(_analyse, cand): cand for cand in candidates}
+            for future in as_completed(future_map):
+                sig = future.result()
+                with _done_lock:
+                    done_counter[0] += 1
+                    n = done_counter[0]
+                if sig is None:
+                    skipped += 1
+                else:
+                    log_kite_call("historical_data", f"{sig['symbol']} — scored {sig['score']}/30")
+                    signals.append(sig)
+                if n % 10 == 0 or n == len(candidates):
+                    cand_sym = future_map[future]["symbol"]
+                    set_progress(6, f"Analysed {n}/{len(candidates)} · skipped {skipped} · {cand_sym}",
+                                 n, len(candidates))
 
-                    if CFG["PAPER_TRADE"]:
-                        log.info(f"  📝 PAPER BUY {sym} | {full['signal']} | Score {full['total']}/{full['max']} | Qty {qty}")
-                    else:
-                        # KITE API: kite.place_order(...)
-                        order_id = kl.place_order(sym, "NSE", "BUY", qty)
-                        log_kite_call("place_order", f"BUY {qty} {sym}")
-                        if order_id:
-                            # KITE API: kite.place_gtt(...) — auto SL+TP
-                            gtt_id = kl.place_gtt(sym, "NSE", qty, entry, sl, tp)
-                            log_kite_call("place_gtt", f"{sym} SL:{sl} TP:{tp}")
+        log.info(f"  → Parallel analysis complete: {len(signals)} scored, {skipped} skipped")
 
+        # ── Entry / Exit decisions (serial — needs consistent state) ──
+        open_count = open_count_snap
+        for sig in signals:
+            sym   = sig["symbol"]
+            token = sig["token"]
+            entry = sig["entry"]
+            sl    = sig["sl"]
+            tp    = sig["tp"]
+            qty   = sig["qty"]
+            score = sig["score"]
+
+            # ── BEAR market hard gate — no new buys ───────────
+            buy_threshold = CFG["SCORE_BUY"]   # no bear_premium — just hard block
+            if (score >= buy_threshold
+                    and sym not in STATE["positions"]
+                    and open_count < CFG["MAX_OPEN_TRADES"]
+                    and regime_ok
+                    and not bear_market):          # ← HARD GATE
+
+                if CFG["PAPER_TRADE"]:
+                    log.info(f"  📝 PAPER BUY {sym} | {sig['signal']} | Score {score}/{sig['max_score']} | Qty {qty}")
+                else:
+                    order_id = kl.place_order(sym, "NSE", "BUY", qty)
+                    log_kite_call("place_order", f"BUY {qty} {sym}")
+                    if order_id:
+                        gtt_id = kl.place_gtt(sym, "NSE", qty, entry, sl, tp)
+                        log_kite_call("place_gtt", f"{sym} SL:{sl} TP:{tp}")
+
+                with _STATE_LOCK:
                     STATE["positions"][sym] = {
                         "entry": entry, "sl": sl, "tp": tp, "qty": qty,
-                        "score": full["total"], "date": str(datetime.now()),
+                        "score": score, "date": str(datetime.now()),
                         "token": token, "trailing": False,
                     }
-                    open_count += 1
-                    sig["action"] = "BUY"
+                open_count += 1
+                sig["action"] = "BUY"
 
-                # ── Exit: SELL ────────────────────────────────
-                elif sym in STATE["positions"]:
-                    pos    = STATE["positions"][sym]
-                    pos    = RiskManager.trailing_stop(pos, cand["ltp"], float(row["atr"]))
+            # ── Exit: SELL ─────────────────────────────────────
+            elif sym in STATE["positions"]:
+                pos    = STATE["positions"][sym]
+                # Get latest row atr for trailing stop
+                atr_val = sig.get("atr", entry * 0.02)
+                pos    = RiskManager.trailing_stop(pos, sig["ltp"], atr_val)
+                with _STATE_LOCK:
                     STATE["positions"][sym] = pos
-                    reason = RiskManager.check_exit(cand["ltp"], pos, row)
+                reason = RiskManager.check_exit(sig["ltp"], pos, None)
 
-                    if reason:
-                        pnl = (cand["ltp"] - pos["entry"]) * pos["qty"] - CFG["BROKERAGE"] * 2
-                        if CFG["PAPER_TRADE"]:
-                            log.info(f"  📝 PAPER SELL {sym} | {reason} | PnL ₹{pnl:.0f}")
-                        else:
-                            # KITE API: kite.place_order(SELL)
-                            kl.place_order(sym, "NSE", "SELL", pos["qty"])
-                            log_kite_call("place_order", f"SELL {pos['qty']} {sym} — {reason}")
+                if reason:
+                    pnl = (sig["ltp"] - pos["entry"]) * pos["qty"] - CFG["BROKERAGE"] * 2
+                    if CFG["PAPER_TRADE"]:
+                        log.info(f"  📝 PAPER SELL {sym} | {reason} | PnL ₹{pnl:.0f}")
+                    else:
+                        kl.place_order(sym, "NSE", "SELL", pos["qty"])
+                        log_kite_call("place_order", f"SELL {pos['qty']} {sym} — {reason}")
 
+                    with _STATE_LOCK:
                         STATE["trade_log"].append({
                             "symbol": sym, "entry": pos["entry"],
-                            "exit": cand["ltp"], "qty": pos["qty"],
+                            "exit": sig["ltp"], "qty": pos["qty"],
                             "pnl": round(pnl, 2), "reason": reason,
                             "date": str(datetime.now()),
                         })
                         del STATE["positions"][sym]
-                        open_count -= 1
-                        sig["action"] = f"SELL ({reason})"
-
-                signals.append(sig)
-
-                if i % 50 == 0:
-                    log.info(f"  → Progress: {i}/{len(candidates)} stocks analysed")
-
-            except Exception as e:
-                STATE["errors"].append({"time": str(datetime.now()), "msg": f"{sym}: {str(e)[:80]}"})
-
-        # ─────────────────────────────────────────────────────
+                    open_count -= 1
+                    sig["action"] = f"SELL ({reason})"        # ─────────────────────────────────────────────────────
         # STEP 7: Sync positions with Kite
         # KITE API: kite.positions() + kite.orders()
         # ─────────────────────────────────────────────────────
@@ -496,6 +555,7 @@ def run_full_scan():
         log.info(f"\n  ✅ SCAN COMPLETE")
         log.info(f"     Stocks scanned:   {len(quote_data)}")
         log.info(f"     Deep analysed:    {len(candidates)}")
+        log.info(f"     Skipped (no data):{skipped}")
         log.info(f"     Gap-ups found:    {len(gap_alerts)}")
         log.info(f"     Signals scored:   {len(signals)}")
         log.info(f"     Strong Buy (≥{CFG['SCORE_STRONG_BUY']}): {len(strong_buy)}")
@@ -544,7 +604,7 @@ def api_state():
         "scan_progress": STATE["scan_progress"],
         "paper_trade":   CFG["PAPER_TRADE"],
         "kite_calls":    STATE["kite_calls"][-20:],
-        "errors":        STATE["errors"][-5:],
+        "errors":        STATE["errors"][-30:],
         "stats": {
             "universe_size":  STATE["universe_size"],
             "signals_count":  len(STATE["signals"]),
@@ -590,6 +650,7 @@ def paper_buy():
     else:
         port["holdings"][sym] = {"qty": qty, "avg_price": round(price, 2), "invested": cost, "symbol": sym}
     log.info(f"  [Paper] BUY {qty} {sym} @ ₹{price} | Cash left ₹{port['cash']:.0f}")
+    save_paper_portfolio()
     return jsonify({"ok": True, "cash": port["cash"], "holdings": port["holdings"]})
 
 
@@ -616,6 +677,7 @@ def paper_sell():
     else:
         h["invested"] = round(h["avg_price"] * h["qty"], 2)
     log.info(f"  [Paper] SELL {qty} {sym} @ ₹{price} | PnL ₹{pnl} | Cash ₹{port['cash']:.0f}")
+    save_paper_portfolio()
     return jsonify({"ok": True, "pnl": pnl, "cash": port["cash"], "holdings": port["holdings"]})
 
 
@@ -626,6 +688,7 @@ def paper_reset():
         "capital": 10000.0, "cash": 10000.0,
         "holdings": {}, "pnl_realised": 0.0,
     }
+    save_paper_portfolio()
     return jsonify({"ok": True})
 
 
@@ -692,91 +755,92 @@ def fno_signals():
     """
     Derives simple F&O option trade ideas from the top equity signals.
     Uses the scored equity signals + ATR to suggest ATM/OTM strikes.
-    For proper F&O execution use algotrade_pro_enhanced.py locally.
     """
-    if not STATE["signals"]:
-        return jsonify({"error": "No scan data yet — run a full scan first."})
-
-    # Load NFO instrument list for lot sizes
-    nfo_lots = {}
     try:
-        nfo_path = os.path.join(os.path.dirname(__file__), "_nfo_instruments.json")
-        if os.path.exists(nfo_path):
-            with open(nfo_path) as f:
-                nfo_data = json.load(f)
-            for item in nfo_data:
-                sym = item.get("tradingsymbol","").replace("-EQ","").split("-")[0]
-                if item.get("instrument_type") == "FUT":
-                    nfo_lots[sym] = item.get("lot_size", 1)
-    except Exception:
-        pass
+        if not STATE["signals"]:
+            return jsonify({"error": "No scan data yet — run a full scan first."})
 
-    KNOWN_LOTS = {  # fallback lot sizes for major F&O stocks
-        "NIFTY":256, "BANKNIFTY":30, "FINNIFTY":40,
-        "RELIANCE":250, "TCS":150, "INFY":300, "HDFCBANK":550,
-        "ICICIBANK":700, "SBIN":1500, "TATAMOTORS":1425,
-        "WIPRO":1500, "BAJFINANCE":125, "LT":175,
-    }
+        # Load NFO instrument list for lot sizes
+        nfo_lots = {}
+        try:
+            nfo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_nfo_instruments.json")
+            if os.path.exists(nfo_path):
+                with open(nfo_path) as f:
+                    nfo_data = json.load(f)
+                for item in nfo_data:
+                    sym = item.get("tradingsymbol","").replace("-EQ","").split("-")[0]
+                    if item.get("instrument_type") == "FUT":
+                        nfo_lots[sym] = item.get("lot_size", 1)
+        except Exception:
+            pass
 
-    results = []
-    seen    = set()
-    for sig in STATE["signals"]:
-        sym   = sig["symbol"]
-        score = sig.get("score", 0)
-        if score < CFG["SCORE_WATCHLIST"]:
-            break                           # sorted by score; rest are worse
-        if sym in seen or len(results) >= 15:
-            break
-        seen.add(sym)
+        KNOWN_LOTS = {
+            "NIFTY":256, "BANKNIFTY":30, "FINNIFTY":40,
+            "RELIANCE":250, "TCS":150, "INFY":300, "HDFCBANK":550,
+            "ICICIBANK":700, "SBIN":1500, "TATAMOTORS":1425,
+            "WIPRO":1500, "BAJFINANCE":125, "LT":175,
+        }
 
-        ltp = sig.get("ltp", 0)
-        atr = sig.get("atr", ltp * 0.02)   # fallback 2% ATR
-        sl  = sig.get("sl",  ltp - 1.5 * atr)
-        tp  = sig.get("tp",  ltp + 3.5 * atr)
+        results = []
+        seen    = set()
+        for sig in STATE["signals"]:
+            sym   = sig["symbol"]
+            score = sig.get("score", 0)
+            if score < CFG["SCORE_WATCHLIST"]:
+                break
+            if sym in seen or len(results) >= 15:
+                break
+            seen.add(sym)
 
-        direction = "CALL" if sig.get("signal_class") in ("buy","strong-buy") else "PUT"
+            ltp = float(sig.get("ltp", 0))
+            atr = float(sig.get("atr", ltp * 0.02))
+            sl  = float(sig.get("sl",  ltp - 1.5 * atr))
+            tp  = float(sig.get("tp",  ltp + 3.5 * atr))
 
-        # ATM strike: round to nearest 50 for most stocks, 100 for > ₹5000
-        step = 100 if ltp > 5000 else 50 if ltp > 1000 else 10
-        atm  = round(ltp / step) * step
+            direction = "CALL" if sig.get("signal_class") in ("buy","strong-buy") else "PUT"
+            step = 100 if ltp > 5000 else 50 if ltp > 1000 else 10
+            atm  = round(ltp / step) * step
+            lot  = nfo_lots.get(sym) or KNOWN_LOTS.get(sym) or 500
 
-        lot  = nfo_lots.get(sym) or KNOWN_LOTS.get(sym) or 500
+            premium_est = round(2.0 * atr, 1)
+            sl_opt      = round(premium_est * 0.40, 1)
+            tp_opt      = round(premium_est * 2.20, 1)
+            rr          = round(tp_opt / sl_opt, 1) if sl_opt else 0
 
-        # Premium estimate: ~2×ATR for ATM option (very rough Black-Scholes proxy)
-        premium_est = round(2.0 * atr, 1)
-        sl_opt      = round(premium_est * 0.40, 1)   # SL at 40% of premium
-        tp_opt      = round(premium_est * 2.20, 1)   # TP at 2.2× premium
-        rr          = round(tp_opt / sl_opt, 1) if sl_opt else 0
+            results.append({
+                "symbol":        sym,
+                "equity_score":  int(score),
+                "equity_signal": sig.get("signal",""),
+                "ltp":           ltp,
+                "direction":     direction,
+                "strike":        int(atm),
+                "option_type":   direction,
+                "premium_est":   premium_est,
+                "lot_size":      int(lot),
+                "sl_option":     sl_opt,
+                "tp_option":     tp_opt,
+                "rr":            rr,
+                "equity_sl":     round(sl, 2),
+                "equity_tp":     round(tp, 2),
+                "smc_bos":       bool(sig.get("smc_bos", False)),
+                "smc_ob":        sig.get("smc_ob"),
+                "note":          (
+                    "⚠️ Premium estimates are ATR-based (2×ATR for ATM). "
+                    "Always verify strikes on Zerodha option chain before placing any order."
+                ),
+            })
 
-        results.append({
-            "symbol":        sym,
-            "equity_score":  score,
-            "equity_signal": sig.get("signal",""),
-            "ltp":           ltp,
-            "direction":     direction,
-            "strike":        atm,
-            "option_type":   direction,
-            "premium_est":   premium_est,
-            "lot_size":      lot,
-            "sl_option":     sl_opt,
-            "tp_option":     tp_opt,
-            "rr":            rr,
-            "equity_sl":     sl,
-            "equity_tp":     tp,
-            "smc_bos":       sig.get("smc_bos", False),
-            "smc_ob":        sig.get("smc_ob"),
-            "note":          (
-                "⚠️ Use algotrade_pro_enhanced.py for real-time option chain data. "
-                "This is an indicative idea based on equity analysis."
-            ),
-        })
+        return jsonify(_np_sanitize({
+            "count":   len(results),
+            "signals": results,
+            "regime":  STATE["regime"].get("label",""),
+            "vix":     float(STATE["vix"]),
+            "bear_blocked": STATE["regime"].get("label","").startswith("BEAR"),
+        }))
 
-    return jsonify({
-        "count":   len(results),
-        "signals": results,
-        "regime":  STATE["regime"].get("label",""),
-        "vix":     STATE["vix"],
-    })
+    except Exception as e:
+        log.error(f"  [FnO] /api/fno-signals error: {e}")
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
 
 
 @app.route("/health")
@@ -1447,7 +1511,13 @@ tr.selected td{background:rgba(0,229,255,.06)}
 <div class="panel">
   <div class="ph">
     <span class="ph-l">F&amp;O Option Ideas <span style="font-size:8px;color:var(--muted)">derived from equity signals</span></span>
-    <span class="ph-r" id="fno-ct">—</span>
+    <span style="display:flex;align-items:center;gap:.6rem">
+      <span class="ph-r" id="fno-ct">—</span>
+      <button onclick="loadFno()" style="font-family:var(--raj);font-size:8px;font-weight:700;letter-spacing:.1em;padding:.25rem .7rem;background:rgba(0,229,255,.08);border:1px solid rgba(0,229,255,.3);color:var(--cyan);border-radius:2px;cursor:pointer" title="Refresh F&O ideas">⟳ REFRESH</button>
+    </span>
+  </div>
+  <div id="fno-bear-banner" style="display:none;grid-column:1/-1;background:rgba(255,45,85,.08);border:1px solid rgba(255,45,85,.25);border-radius:3px;padding:.5rem .8rem;font-size:9px;color:var(--red);font-family:var(--raj);margin:.5rem .7rem 0">
+    🐻 BEAR MARKET ACTIVE — New BUY orders are blocked. These are WATCHLIST ideas only. No trades will be executed until regime turns BULL.
   </div>
   <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:.6rem;padding:.7rem">
     <div style="grid-column:1/-1;background:rgba(255,170,0,.06);border:1px solid rgba(255,170,0,.2);border-radius:3px;padding:.5rem .8rem;font-size:9px;color:var(--amber);font-family:var(--raj)">
@@ -1552,22 +1622,30 @@ function startProgressPoll() {
 
 /* ── F&O CARDS ───────────────────── */
 async function loadFno() {
-  const container = document.getElementById('fno-cards');
+  const container  = document.getElementById('fno-cards');
+  const bearBanner = document.getElementById('fno-bear-banner');
+  container.innerHTML = '<div class="no-data" style="color:var(--muted)">⟳ Loading F&O ideas...</div>';
   try {
-    const r = await (await fetch('/api/fno-signals')).json();
+    const resp = await fetch('/api/fno-signals');
+    if(!resp.ok){ container.innerHTML=`<div class="no-data">Server error ${resp.status} — check logs</div>`; return; }
+    const r = await resp.json();
     if(r.error){ container.innerHTML=`<div class="no-data">${r.error}</div>`; return; }
+    // Show/hide bear-market warning banner
+    if(bearBanner) bearBanner.style.display = r.bear_blocked ? 'block' : 'none';
     document.getElementById('fno-ct').textContent = (r.count||0)+' ideas · VIX '+(r.vix||0).toFixed(1);
     const sigs = r.signals||[];
-    if(!sigs.length){ container.innerHTML='<div class="no-data">No signals above threshold</div>'; return; }
+    if(!sigs.length){ container.innerHTML='<div class="no-data">No signals above watchlist threshold (score ≥9)</div>'; return; }
     container.innerHTML = sigs.map(s => {
       const isBull = s.direction==='CALL';
       const tagCls = isBull?'fno-call':'fno-put';
       const rrColor = s.rr>=2?'var(--green)':s.rr>=1.5?'var(--amber)':'var(--red)';
+      const bearTag = r.bear_blocked ? `<span style="font-size:7px;color:var(--red);font-family:var(--raj);margin-left:.3rem">WATCH ONLY</span>` : '';
       return `<div class="fno-card">
         <div style="margin-bottom:.5rem">
           <span class="fno-sym">${s.symbol}</span>
           <span class="fno-tag ${tagCls}">${s.direction}</span>
           <span style="font-family:var(--raj);font-size:8px;color:var(--muted);margin-left:.4rem">${s.equity_signal.split(' ')[0]} ${s.equity_score}/30</span>
+          ${bearTag}
         </div>
         <div class="fno-row"><span class="fno-key">LTP</span><span class="fno-val">₹${s.ltp.toLocaleString('en-IN')}</span></div>
         <div class="fno-row"><span class="fno-key">STRIKE</span><span class="fno-val c">₹${s.strike}</span></div>
@@ -1580,7 +1658,10 @@ async function loadFno() {
         ${s.smc_bos?'<div style="font-size:8px;color:#00ffcc;margin-top:.3rem">✅ SMC Break of Structure</div>':''}
       </div>`;
     }).join('');
-  } catch(e) { container.innerHTML='<div class="no-data">Error: '+e.message+'</div>'; }
+  } catch(e) {
+    container.innerHTML='<div class="no-data">Error: '+e.message+' — check console</div>';
+    console.error('loadFno error:', e);
+  }
 }
 
 /* ── PAPER TRADE ─────────────────── */
@@ -1774,7 +1855,7 @@ function render(d) {
 
   // refresh paper state if on paper tab
   if(document.getElementById('tab-paper').style.display!=='none') loadPaperState();
-  // refresh F&O tab if currently visible
+  // refresh F&O tab if currently visible — picks up new signals after scan
   if(document.getElementById('tab-fno').style.display!=='none') loadFno();
 }
 
@@ -1972,8 +2053,7 @@ async function triggerScan() {
       if(!d.scanning){
         clearInterval(poll); render(d);
         btn.disabled=false; btn.querySelector('span').textContent='▶ FULL SCAN'; btn.classList.remove('running');
-        // Always refresh F&O after scan so it picks up new signals immediately
-        loadFno();
+        loadFno();  // always refresh F&O immediately after scan completes
       }
     } catch(e){clearInterval(poll);}
   },2500);

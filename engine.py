@@ -262,26 +262,32 @@ class KiteLayer:
                   interval: str = "day") -> pd.DataFrame:
         """
         KITE API: kite.historical_data(instrument_token, from_date, to_date, interval)
-        Interval options: minute, 3minute, 5minute, 10minute, 15minute,
-                          30minute, 60minute, day, week
-        For positional/stock mode, use interval="week".
+        Retries up to 3 times with exponential backoff on transient errors.
         """
         to_dt   = datetime.now()
         from_dt = to_dt - timedelta(days=days)
-        records = self._k.historical_data(
-            instrument_token = token,
-            from_date        = from_dt,
-            to_date          = to_dt,
-            interval         = interval,
-            continuous       = False,
-            oi               = False,
-        )
-        if not records:
-            return pd.DataFrame()
-        df = pd.DataFrame(records)
-        df.columns = [c.lower() for c in df.columns]
-        df["date"] = pd.to_datetime(df["date"])
-        return df.sort_values("date").reset_index(drop=True)
+        for attempt in range(3):
+            try:
+                records = self._k.historical_data(
+                    instrument_token = token,
+                    from_date        = from_dt,
+                    to_date          = to_dt,
+                    interval         = interval,
+                    continuous       = False,
+                    oi               = False,
+                )
+                if not records:
+                    return pd.DataFrame()
+                df = pd.DataFrame(records)
+                df.columns = [c.lower() for c in df.columns]
+                df["date"] = pd.to_datetime(df["date"])
+                return df.sort_values("date").reset_index(drop=True)
+            except Exception as e:
+                if attempt < 2:
+                    time.sleep(1.0 * (attempt + 1))   # 1s then 2s backoff
+                else:
+                    log.warning(f"  [Kite] get_ohlcv token={token} failed after 3 attempts: {e}")
+        return pd.DataFrame()
 
     # ── 5. PLACE ORDER ────────────────────────────────────────
     def place_order(self, symbol: str, exchange: str, txn_type: str,
