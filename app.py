@@ -1774,6 +1774,8 @@ function render(d) {
 
   // refresh paper state if on paper tab
   if(document.getElementById('tab-paper').style.display!=='none') loadPaperState();
+  // refresh F&O tab if currently visible
+  if(document.getElementById('tab-fno').style.display!=='none') loadFno();
 }
 
 function renderSignals(sigs) {
@@ -1970,6 +1972,8 @@ async function triggerScan() {
       if(!d.scanning){
         clearInterval(poll); render(d);
         btn.disabled=false; btn.querySelector('span').textContent='▶ FULL SCAN'; btn.classList.remove('running');
+        // Always refresh F&O after scan so it picks up new signals immediately
+        loadFno();
       }
     } catch(e){clearInterval(poll);}
   },2500);
