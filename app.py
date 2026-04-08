@@ -642,6 +642,7 @@ def paper_state():
     }))
 
 
+@app.route("/api/scan", methods=["POST"])
 def trigger_scan():
     if not STATE["scanning"]:
         threading.Thread(target=run_full_scan, daemon=True).start()
