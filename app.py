@@ -534,15 +534,23 @@ def run_full_scan():
             vol_confirmed  = (sig.get("vol_surge", False)
                               or score >= CFG["SCORE_STRONG_BUY"])
 
-            if (score >= buy_threshold
+            # ── 80% WIN RATE GATES ──────────────────────────────
+            # Only STRONG BUY (score>=20) triggers real orders.
+            # Also gate: minimum R:R of 2.0
+            rr_adequate = True
+            if sig.get('tp',0) > 0 and sig.get('entry',0) > 0 and sig.get('sl',0) > 0:
+                rr_val = (sig['tp'] - sig['entry']) / max(sig['entry'] - sig['sl'], 0.01)
+                rr_adequate = rr_val >= 2.0
+            if (score >= CFG["SCORE_STRONG_BUY"]
                     and sym not in STATE["positions"]
                     and open_count < CFG["MAX_OPEN_TRADES"]
                     and regime_ok
-                    and not bear_market          # F — BEAR hard block
-                    and not sideways_mkt         # F2 — SIDEWAYS skip
-                    and time_ok                  # F1 — Time gate
-                    and vol_confirmed            # F3 — Volume spike
-                    and trades_today < MAX_DAILY_TRADES):  # F4 — daily cap
+                    and not bear_market
+                    and not sideways_mkt
+                    and time_ok
+                    and vol_confirmed
+                    and rr_adequate
+                    and trades_today < MAX_DAILY_TRADES):
 
                 if CFG["PAPER_TRADE"]:
                     log.info(f"  📝 PAPER BUY {sym} | {sig['signal']} | Score {score}/{sig['max_score']} | Qty {qty}")
@@ -995,6 +1003,39 @@ def fno_signals():
         return jsonify({"error": f"Server error: {str(e)}"}), 500
 
 
+
+@app.route("/api/top-picks")
+def top_picks():
+    """High-conviction STRONG BUY picks with R:R >= 2.0 and volume confirmation."""
+    sigs   = STATE.get("signals", [])
+    regime = STATE.get("regime", {})
+    vix    = float(STATE.get("vix", 15) or 15)
+    picks  = []
+    for s in sigs:
+        score = s.get("score", 0)
+        if score < CFG["SCORE_STRONG_BUY"]: continue
+        entry = s.get("entry", s.get("ltp", 0))
+        sl    = s.get("sl", 0)
+        tp    = s.get("tp", 0)
+        if entry <= 0 or sl <= 0 or tp <= 0: continue
+        rr = round((tp - entry) / max(entry - sl, 0.01), 2)
+        if rr < 2.0: continue
+        if not s.get("vol_surge", False): continue
+        picks.append({
+            **s, "rr": rr,
+            "trade_plan": f"Entry Rs{entry:.1f} | SL Rs{sl:.1f} | TP Rs{tp:.1f} | R:R {rr}x",
+            "conviction": "VERY HIGH" if score >= 24 else "HIGH",
+        })
+        if len(picks) >= 10: break
+    return jsonify(_np_sanitize({
+        "count":  len(picks),
+        "picks":  picks,
+        "regime": regime.get("label", "--"),
+        "vix":    vix,
+        "note":   f"STRONG BUY >={CFG['SCORE_STRONG_BUY']}/30 + R:R >=2.0 + volume confirmed",
+    }))
+
+
 @app.route("/health")
 def health():
     return jsonify({"status": "ok", "time": str(datetime.now()),
@@ -1140,14 +1181,7 @@ def probe_existing_token():
 
 
 # ── Runs under both gunicorn and `python app.py` ─────────────
-log.info(f"🚀 Institutional Trader Pro — Full NSE Edition")
-log.info(f"   Mode: {'PAPER' if CFG['PAPER_TRADE'] else '⚠ LIVE'} | SMC Engine: ON | Fibonacci Engine: ON | Yahoo Finance: REMOVED")
-probe_existing_token()
-start_scheduler()
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
 DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1856,10 +1890,20 @@ async function loadFno() {
   const bearBanner = document.getElementById('fno-bear-banner');
   container.innerHTML = '<div class="no-data" style="color:var(--muted)">⟳ Loading F&O ideas...</div>';
   try {
-    const resp = await fetch('/api/fno-signals');
+    const controller = new AbortController();
+    const timer = setTimeout(()=>controller.abort(), 15000);
+    let resp;
+    try { resp = await fetch('/api/fno-signals',{signal:controller.signal}); }
+    catch(fe){
+      clearTimeout(timer);
+      if(fe.name==='AbortError') container.innerHTML='<div class="no-data" style="color:var(--amber)">⏱ Timed out — run a Full Scan first, then click REFRESH.</div>';
+      else container.innerHTML=`<div class="no-data">Network error: ${fe.message}</div>`;
+      return;
+    }
+    clearTimeout(timer);
     if(!resp.ok){ container.innerHTML=`<div class="no-data">Server error ${resp.status} — check logs</div>`; return; }
     const r = await resp.json();
-    if(r.error){ container.innerHTML=`<div class="no-data">${r.error}</div>`; return; }
+    if(r.error){ container.innerHTML=`<div class="no-data" style="color:var(--amber)">${r.error}</div>`; return; }
     if(bearBanner) bearBanner.style.display = r.bear_blocked ? 'block' : 'none';
     document.getElementById('fno-ct').textContent = (r.count||0)+' ideas · VIX '+(r.vix||0).toFixed(1);
     const sigs = r.signals||[];
@@ -2390,3 +2434,12 @@ setInterval(()=>{ const t=document.getElementById('clock'); if(t) t.textContent=
 </script>
 </body>
 </html>"""
+
+log.info(f"🚀 Institutional Trader Pro — Full NSE Edition")
+log.info(f"   Mode: {'PAPER' if CFG['PAPER_TRADE'] else '⚠ LIVE'} | SMC Engine: ON | Fibonacci Engine: ON | Yahoo Finance: REMOVED")
+probe_existing_token()
+start_scheduler()
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)

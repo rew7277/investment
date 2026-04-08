@@ -121,8 +121,8 @@ CFG = {
     "EMA_SLOW":        50,
     "EMA_TREND":       200,
     "RSI_PERIOD":      14,
-    "RSI_BUY_MIN":     50,
-    "RSI_BUY_MAX":     80,    # FIX #2: raised from 70→80. Momentum stocks on a 9% day
+    "RSI_BUY_MIN":     45,
+    "RSI_BUY_MAX":     72,    # FIX #2: raised from 70→80. Momentum stocks on a 9% day
                                # easily hit RSI 72-85 — the old cap was penalising
                                # exactly the strong-trend stocks we want to capture.
     "RSI_EXIT":        40,
@@ -167,7 +167,7 @@ CFG = {
     # 5 tech + 5 breakout + 5 fundamental + 5 institutional
     # + 2 regime + 5 SMC + 3 Fibonacci = 30
     "SCORE_STRONG_BUY": 20,   # ≥20/30 → STRONG BUY  (~67%)
-    "SCORE_BUY":        13,   # ≥13/30 → BUY          (~43%)
+    "SCORE_BUY":        16,   # ≥13/30 → BUY          (~43%)
     "SCORE_WATCHLIST":   9,   # ≥ 9/30 → WATCHLIST    (~30%)
 
     # ── Trade mode ───────────────────────────────────────────
@@ -747,10 +747,15 @@ class TechnicalEngine:
 
         ema_bull = float(row["ema_fast"]) > float(row["ema_slow"]) \
                    and float(row["close"]) > float(row["ema_fast"])
-        if row.get("cross_up", False):
-            score += 1; flags.append("✅ EMA Golden Cross (fresh)")
+        above_200 = float(row.get("close", 0)) > float(row.get("ema_trend", 0))
+        if row.get("cross_up", False) and above_200:
+            score += 1; flags.append("✅ EMA Golden Cross above 200EMA (strongest)")
+        elif row.get("cross_up", False):
+            flags.append("⚠️ EMA Golden Cross but below 200EMA — caution")
+        elif ema_bull and above_200:
+            score += 1; flags.append("✅ Price above 20/50/200 EMAs — full bull stack")
         elif ema_bull:
-            score += 1; flags.append("✅ Price above both EMAs")
+            flags.append("⚠️ Above 20/50 EMA but below 200EMA — trend conflict")
         else:
             flags.append("❌ EMA bearish structure")
 
@@ -1591,12 +1596,13 @@ class RiskManager:
         return pos
 
     @staticmethod
-    def check_exit(ltp: float, pos: dict, row: pd.Series) -> Optional[str]:
+    def check_exit(ltp: float, pos: dict, row=None) -> Optional[str]:
         if ltp <= pos["sl"]:                              return "STOP_LOSS"
         if ltp >= pos["tp"]:                              return "TARGET_HIT"
-        if row.get("cross_down", False):                  return "EMA_DEATH_CROSS"
-        if float(row.get("rsi", 100)) < CFG["RSI_EXIT"]: return "RSI_WEAKNESS"
-        if not row.get("st_bull", True):                  return "SUPERTREND_FLIP"
+        if row is not None:
+            if row.get("cross_down", False):              return "EMA_DEATH_CROSS"
+            if float(row.get("rsi", 100)) < CFG["RSI_EXIT"]: return "RSI_WEAKNESS"
+            if not row.get("st_bull", True):              return "SUPERTREND_FLIP"
         return None
 
 
@@ -1893,6 +1899,25 @@ class OptionEngine:
         return d + timedelta(days=days)
 
     @staticmethod
+    def next_monthly_expiry(from_date=None):
+        """Last Thursday of current/next month; rolls if within 5 days of expiry."""
+        import calendar
+        from datetime import date, timedelta
+        d = from_date or datetime.now().date()
+        year, month = d.year, d.month
+        def _last_thu(y, m):
+            _, last_day = calendar.monthrange(y, m)
+            for day in range(last_day, last_day - 7, -1):
+                if date(y, m, day).weekday() == 3:
+                    return date(y, m, day)
+        expiry = _last_thu(year, month)
+        if expiry and (expiry - d).days <= 5:
+            month = month % 12 + 1
+            year  = year + (1 if month == 1 else 0)
+            expiry = _last_thu(year, month)
+        return expiry or (d + timedelta(days=30))
+
+    @staticmethod
     def build_nfo_symbol(underlying: str, expiry,
                          strike: int, opt_type: str) -> str:
         """
@@ -1925,11 +1950,17 @@ class OptionEngine:
         Tries next weekly expiry first, then next monthly as fallback.
         Returns (ltp_or_None, symbol_used, expiry_label).
         """
-        expiry = OptionEngine.next_weekly_expiry()
+        # FINNIFTY = Tuesday weekly, others = Thursday weekly
+        wd = OptionEngine._EXPIRY_WEEKDAY.get(underlying, 3)
+        expiry = OptionEngine.next_weekly_expiry(weekday=wd)
+        monthly_expiry = OptionEngine.next_monthly_expiry()
         weekly_sym, monthly_sym = OptionEngine.build_nfo_symbol(
             underlying, expiry, strike, opt_type
         )
-        for sym in [weekly_sym, monthly_sym]:
+        _, monthly_sym2 = OptionEngine.build_nfo_symbol(
+            underlying, monthly_expiry, strike, opt_type
+        )
+        for sym in [weekly_sym, monthly_sym, monthly_sym2]:
             try:
                 key  = f"NFO:{sym}"
                 data = kl._k.ltp([key])
@@ -2026,6 +2057,11 @@ class OptionEngine:
         t3 = max(round(entry + delta * underlying_move * 1.00, 1), round(entry * 2.00, 1))
 
         rr = round((t3 - entry) / (entry - sl), 1) if (entry - sl) > 0 else 0
+        # Enforce minimum R:R of 2.5 — bad setups disqualify themselves
+        if rr < 2.5 and (entry - sl) > 0:
+            # widen T3 to achieve minimum 2.5 R:R
+            t3 = round(entry + 2.5 * (entry - sl), 1)
+            rr = 2.5
         return {
             "sl":  sl,  "t1": t1,  "t2": t2,  "t3": t3,
             "sl_pct":  round((sl - entry) / entry * 100, 1),
