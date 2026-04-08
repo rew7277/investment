@@ -40,7 +40,7 @@ from engine import (
     CFG, KiteLayer, UniverseManager, NSEClient,
     TechnicalEngine, FundamentalEngine, BreakoutScanner,
     InstitutionalEngine, MarketRegime, RiskManager,
-    SMCEngine, FibonacciEngine,
+    SMCEngine, FibonacciEngine, PivotEngine,
     build_score, save_token, load_token, is_token_fresh
 )
 
@@ -99,6 +99,7 @@ STATE = {
     "universe_size": 0,
     "last_scan":     None,
     "scanning":      False,
+    "indices":       {},          # PivotEngine snapshot for 4 indices
     "scan_progress": {          # real-time progress tracking
         "step":       0,        # current step 0-7
         "step_label": "",       # e.g. "Loading NSE universe..."
@@ -302,19 +303,57 @@ def run_full_scan():
         STATE["vix"]     = vix if vix is not None else 0.0
         STATE["fii_dii"] = {**fii, "pcr": oc.get("pcr", "—")}
 
-        reg_s, reg_f, regime_ok, reg_label = MarketRegime.check(
+        reg_s, reg_f, regime_ok, reg_label, reg_conf = MarketRegime.check(
             nifty_df, vix,
             banknifty_df = banknifty_df if not banknifty_df.empty else None,
             finnifty_df  = finnifty_df  if not finnifty_df.empty  else None,
             midcap_df    = midcap_df    if not midcap_df.empty    else None,
+            pcr          = oc.get("pcr"),
         )
-        STATE["regime"] = {"score": reg_s, "label": reg_label, "flags": reg_f, "vix": vix}
-        log.info(f"  → Regime: {reg_label} | VIX: {vix:.1f} | FII: ₹{fii.get('fii_net',0)/1e7:.0f}Cr | PCR: {oc.get('pcr',1)}")
+        # reg_s_stock: normalized 0-2 pts for the 30-pt stock scoring system
+        # reg_s (0-7) drives regime label/confidence; only 2 pts flow into build_score
+        reg_s_stock = round(min(reg_s, 7.0) / 7.0 * 2.0, 1)
+        STATE["regime"] = {
+            "score":      reg_s,
+            "label":      reg_label,
+            "flags":      reg_f,
+            "vix":        vix,
+            "confidence": reg_conf,
+        }
+
+        # ── Compute pivot levels for all 4 indices ────────────
+        STATE["indices"] = PivotEngine.compute_all(
+            nifty_df     if not nifty_df.empty     else None,
+            banknifty_df if not banknifty_df.empty else None,
+            finnifty_df  if not finnifty_df.empty  else None,
+            midcap_df    if not midcap_df.empty    else None,
+        )
+
+        log.info(f"  → Regime: {reg_label} ({reg_conf:.0f}%) | VIX: {vix:.1f} | FII: ₹{fii.get('fii_net',0)/1e7:.0f}Cr | PCR: {oc.get('pcr',1)}")
 
         bear_market   = (reg_label.startswith("BEAR"))
+        sideways_mkt  = (reg_label.startswith("SIDEWAYS"))
         extreme_fear  = (vix > 30)
         regime_ok     = not extreme_fear
         bear_premium  = 4 if bear_market else 0
+
+        # ── ACCURACY FILTER 1: Time gate (10:00–14:00 IST) ───
+        # Avoids opening volatility and closing manipulation.
+        # Only active in intraday mode; swing/positional trade any time.
+        now_hour = datetime.now().hour
+        time_ok  = True
+        if CFG.get("TRADE_MODE") == "intraday":
+            time_ok = (10 <= now_hour <= 14)
+            if not time_ok:
+                log.info(f"  [Accuracy] Time gate: hour={now_hour} — outside 10-14 window, no new intraday entries")
+
+        # ── ACCURACY FILTER 2: Daily trade limit (max 3) ─────
+        today_str   = datetime.now().strftime("%Y-%m-%d")
+        trades_today = sum(
+            1 for t in STATE["trade_log"]
+            if t.get("date","").startswith(today_str)
+        )
+        MAX_DAILY_TRADES = 3
 
         # ─────────────────────────────────────────────────────
         # STEP 4b: NSE Data Prefetch
@@ -386,7 +425,8 @@ def run_full_scan():
                 smc_d            = SMCEngine.compute(df)
                 fib_d            = FibonacciEngine.compute(df)
                 full             = build_score(tech_s, tech_f, brk_s, brk_f,
-                                               fund_d, inst_s, inst_f, reg_s, reg_f,
+                                               fund_d, inst_s, inst_f,
+                                               reg_s_stock, reg_f,   # ← normalized 0-2
                                                smc_d, fib_d)
 
                 entry  = cand["ltp"] * (1 + CFG["SLIPPAGE_PCT"])
@@ -407,6 +447,10 @@ def run_full_scan():
                     "gap_pct":      float(cand.get("gap_pct", 0)),
                     "change_pct":   float(cand.get("change_pct", 0)),
                     "volume":       int(cand.get("volume", 0)),
+                    "vol_surge":    bool(row.get("vol_surge", False)),   # ← F3: volume spike
+                    "vol_ma":       round(float(row.get("vol_ma", 0)), 0),
+                    "vwap":         round(float(row.get("vwap", 0)), 2),
+                    "above_vwap":   bool(row.get("above_vwap", False)),
                     "rsi":          round(float(row.get("rsi", 0)), 1),
                     "adx":          round(float(row.get("adx", 0)), 1),
                     "atr":          round(float(row.get("atr", 0)), 2),
@@ -479,12 +523,26 @@ def run_full_scan():
             score = sig["score"]
 
             # ── BEAR market hard gate — no new buys ───────────
-            buy_threshold = CFG["SCORE_BUY"]   # no bear_premium — just hard block
+            # ACCURACY FILTERS applied here:
+            #   F1 — Time gate (intraday: 10-14h only)
+            #   F2 — Skip SIDEWAYS regime
+            #   F3 — Volume spike confirmation (soft — only gate BUY, not STRONG BUY)
+            #   F4 — Max 3 trades per day
+            buy_threshold  = CFG["SCORE_BUY"]
+            # F3: volume confirmation — skip regular BUY if no volume surge,
+            # but allow STRONG BUY through regardless (high conviction overrides)
+            vol_confirmed  = (sig.get("vol_surge", False)
+                              or score >= CFG["SCORE_STRONG_BUY"])
+
             if (score >= buy_threshold
                     and sym not in STATE["positions"]
                     and open_count < CFG["MAX_OPEN_TRADES"]
                     and regime_ok
-                    and not bear_market):          # ← HARD GATE
+                    and not bear_market          # F — BEAR hard block
+                    and not sideways_mkt         # F2 — SIDEWAYS skip
+                    and time_ok                  # F1 — Time gate
+                    and vol_confirmed            # F3 — Volume spike
+                    and trades_today < MAX_DAILY_TRADES):  # F4 — daily cap
 
                 if CFG["PAPER_TRADE"]:
                     log.info(f"  📝 PAPER BUY {sym} | {sig['signal']} | Score {score}/{sig['max_score']} | Qty {qty}")
@@ -501,7 +559,8 @@ def run_full_scan():
                         "score": score, "date": str(datetime.now()),
                         "token": token, "trailing": False,
                     }
-                open_count += 1
+                open_count   += 1
+                trades_today += 1
                 sig["action"] = "BUY"
 
             # ── Exit: SELL ─────────────────────────────────────
@@ -731,6 +790,12 @@ def gap_alerts():
     return jsonify(STATE["gap_alerts"])
 
 
+@app.route("/api/indices")
+def api_indices():
+    """Returns pivot + indicator snapshot for NIFTY, BANKNIFTY, FINNIFTY, MIDCAP."""
+    return jsonify(_np_sanitize(STATE.get("indices", {})))
+
+
 @app.route("/api/kite-calls")
 def kite_calls():
     """Shows every Kite API method called — for transparency."""
@@ -753,8 +818,13 @@ def signals_buy():
 @app.route("/api/fno-signals")
 def fno_signals():
     """
-    Derives simple F&O option trade ideas from the top equity signals.
-    Uses the scored equity signals + ATR to suggest ATM/OTM strikes.
+    Derives F&O option trade ideas from top equity signals.
+    Includes:
+      - type: INDEX vs STOCK
+      - confidence: regime confidence %
+      - pivot_ref: nearest pivot level to current price
+      - directional filter: CALL near support, PUT near resistance
+      - sideways_blocked flag
     """
     try:
         if not STATE["signals"]:
@@ -781,14 +851,80 @@ def fno_signals():
             "WIPRO":1500, "BAJFINANCE":125, "LT":175,
         }
 
+        INDEX_SYMS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCAP"}
+
+        reg_label    = STATE["regime"].get("label", "")
+        reg_conf     = float(STATE["regime"].get("confidence", 50.0))
+        sideways_blk = reg_label.startswith("SIDEWAYS")
+        bear_blk     = reg_label.startswith("BEAR")
+
+        # Build pivot lookup from STATE["indices"]
+        idx_pivots = STATE.get("indices", {})
+
         results = []
         seen    = set()
+
+        # ── Add index signals first (NIFTY, BANKNIFTY, FINNIFTY) ─────
+        for idx_key, idx_data in idx_pivots.items():
+            if not idx_data or idx_data.get("error"):
+                continue
+            ltp    = float(idx_data.get("ltp", 0))
+            trend  = idx_data.get("trend", "SIDEWAYS")
+            if trend == "SIDEWAYS" or ltp == 0:
+                continue
+            direction = "CALL" if trend == "BULL" else "PUT"
+            # Pivot-based directional filter for index
+            if direction == "CALL" and not idx_data.get("above_pivot", False):
+                continue   # CALL only when above PP (bullish bias)
+            if direction == "PUT" and idx_data.get("above_pivot", True):
+                continue   # PUT only when below PP (bearish bias)
+
+            pivot  = idx_data.get("pivot", ltp)
+            r1     = idx_data.get("r1", ltp)
+            s1     = idx_data.get("s1", ltp)
+            near   = idx_data.get("nearest_level", "PP")
+            near_p = idx_data.get("nearest_price", pivot)
+            atr    = ltp * 0.015   # ~1.5% as proxy ATR for indices
+
+            step   = 100
+            atm    = round(ltp / step) * step
+            lot    = KNOWN_LOTS.get(idx_key, 50)
+            prem   = round(2.0 * atr, 1)
+            sl_opt = round(prem * 0.40, 1)
+            tp_opt = round(prem * 2.20, 1)
+            rr     = round(tp_opt / sl_opt, 1) if sl_opt else 0
+
+            results.append({
+                "symbol":        idx_key,
+                "type":          "INDEX",
+                "equity_score":  0,
+                "equity_signal": trend,
+                "ltp":           ltp,
+                "direction":     direction,
+                "strike":        int(atm),
+                "option_type":   direction,
+                "premium_est":   prem,
+                "lot_size":      int(lot),
+                "sl_option":     sl_opt,
+                "tp_option":     tp_opt,
+                "rr":            rr,
+                "equity_sl":     round(s1, 2),
+                "equity_tp":     round(r1, 2),
+                "confidence":    round(reg_conf, 1),
+                "pivot_ref":     f"Near {near} ₹{near_p:,.0f}",
+                "smc_bos":       False,
+                "smc_ob":        None,
+                "note":          "Index pivot-based idea. Verify on Zerodha option chain.",
+            })
+            seen.add(idx_key)
+
+        # ── Add top equity stock signals ──────────────────────────────
         for sig in STATE["signals"]:
             sym   = sig["symbol"]
             score = sig.get("score", 0)
             if score < CFG["SCORE_WATCHLIST"]:
                 break
-            if sym in seen or len(results) >= 15:
+            if sym in seen or len(results) >= 18:
                 break
             seen.add(sym)
 
@@ -798,44 +934,74 @@ def fno_signals():
             tp  = float(sig.get("tp",  ltp + 3.5 * atr))
 
             direction = "CALL" if sig.get("signal_class") in ("buy","strong-buy") else "PUT"
+
+            # ── Pivot-based directional filter for stocks ──────────────
+            # Find nearest index pivot for context (use NIFTY as proxy)
+            nifty_piv  = idx_pivots.get("NIFTY", {})
+            pivot_ref  = None
+            pivot_warn = False   # True when pivot context conflicts with direction
+            if nifty_piv and not nifty_piv.get("error"):
+                near    = nifty_piv.get("nearest_level", "PP")
+                near_p  = nifty_piv.get("nearest_price", 0)
+                above   = nifty_piv.get("above_pivot", True)
+                pivot_ref = f"NIFTY near {near} ₹{near_p:,.0f}"
+                # Soft pivot filter — flag conflict but don't skip
+                if direction == "CALL" and not above:
+                    pivot_warn = True
+                    pivot_ref += " ⚠️ NIFTY below PP — headwind"
+                elif direction == "PUT" and above:
+                    pivot_warn = True
+                    pivot_ref += " ⚠️ NIFTY above PP — tailwind"
+
+            # Hard skip only if score is borderline AND pivot conflicts
+            if pivot_warn and score < CFG["SCORE_STRONG_BUY"]:
+                continue   # skip borderline signal with pivot headwind
+
             step = 100 if ltp > 5000 else 50 if ltp > 1000 else 10
             atm  = round(ltp / step) * step
             lot  = nfo_lots.get(sym) or KNOWN_LOTS.get(sym) or 500
 
-            premium_est = round(2.0 * atr, 1)
-            sl_opt      = round(premium_est * 0.40, 1)
-            tp_opt      = round(premium_est * 2.20, 1)
-            rr          = round(tp_opt / sl_opt, 1) if sl_opt else 0
+            prem   = round(2.0 * atr, 1)
+            sl_opt = round(prem * 0.40, 1)
+            tp_opt = round(prem * 2.20, 1)
+            rr     = round(tp_opt / sl_opt, 1) if sl_opt else 0
 
             results.append({
                 "symbol":        sym,
+                "type":          "INDEX" if sym in INDEX_SYMS else "STOCK",
                 "equity_score":  int(score),
                 "equity_signal": sig.get("signal",""),
                 "ltp":           ltp,
                 "direction":     direction,
                 "strike":        int(atm),
                 "option_type":   direction,
-                "premium_est":   premium_est,
+                "premium_est":   prem,
                 "lot_size":      int(lot),
                 "sl_option":     sl_opt,
                 "tp_option":     tp_opt,
                 "rr":            rr,
                 "equity_sl":     round(sl, 2),
                 "equity_tp":     round(tp, 2),
+                "confidence":    round(reg_conf, 1),
+                "pivot_ref":     pivot_ref,
                 "smc_bos":       bool(sig.get("smc_bos", False)),
                 "smc_ob":        sig.get("smc_ob"),
-                "note":          (
+                "above_vwap":    sig.get("above_vwap"),
+                "vol_surge":     sig.get("vol_surge", False),
+                "note": (
                     "⚠️ Premium estimates are ATR-based (2×ATR for ATM). "
                     "Always verify strikes on Zerodha option chain before placing any order."
                 ),
             })
 
         return jsonify(_np_sanitize({
-            "count":   len(results),
-            "signals": results,
-            "regime":  STATE["regime"].get("label",""),
-            "vix":     float(STATE["vix"]),
-            "bear_blocked": STATE["regime"].get("label","").startswith("BEAR"),
+            "count":            len(results),
+            "signals":          results,
+            "regime":           reg_label,
+            "vix":              float(STATE["vix"]),
+            "bear_blocked":     bear_blk,
+            "sideways_blocked": sideways_blk,
+            "confidence":       round(reg_conf, 1),
         }))
 
     except Exception as e:
@@ -1245,6 +1411,31 @@ tr.selected td{background:rgba(0,229,255,.06)}
 .no-data{padding:2rem;text-align:center;color:var(--muted);font-family:var(--raj);font-size:10px;letter-spacing:.1em}
 .pulse{animation:pulse-anim 1s ease-in-out infinite}
 @keyframes pulse-anim{0%,100%{opacity:1}50%{opacity:.3}}
+/* ── INDEX PIVOT CARDS ───────────────────────────────────── */
+#index-cards{display:grid;grid-template-columns:repeat(4,1fr);gap:.7rem;padding:.7rem}
+.idx-card{background:var(--surface);border:1px solid var(--border2);border-radius:4px;padding:.7rem .85rem;position:relative;overflow:hidden;transition:border-color .2s}
+.idx-card.BULL{border-color:rgba(0,255,157,.25)}
+.idx-card.BEAR{border-color:rgba(255,45,85,.25)}
+.idx-card.SIDEWAYS{border-color:rgba(255,170,0,.2)}
+.idx-trend{display:inline-block;font-family:var(--orb);font-size:7.5px;font-weight:700;letter-spacing:.15em;padding:.15rem .45rem;border-radius:2px;margin-bottom:.35rem}
+.idx-trend.BULL{background:rgba(0,255,157,.12);color:var(--green);border:1px solid rgba(0,255,157,.3)}
+.idx-trend.BEAR{background:rgba(255,45,85,.12);color:var(--red);border:1px solid rgba(255,45,85,.3)}
+.idx-trend.SIDEWAYS{background:rgba(255,170,0,.12);color:var(--amber);border:1px solid rgba(255,170,0,.3)}
+.idx-name{font-family:var(--raj);font-size:11px;font-weight:700;letter-spacing:.08em;color:var(--text2);margin-bottom:.25rem}
+.idx-price{font-family:var(--orb);font-size:16px;font-weight:700;color:var(--text);margin-right:.5rem}
+.idx-chg{font-family:var(--jet);font-size:10px;font-weight:600}
+.idx-pivot-grid{display:grid;grid-template-columns:auto 1fr;gap:.08rem .6rem;margin:.5rem 0 .4rem;font-size:8.5px}
+.idx-piv-lbl{color:var(--muted);font-family:var(--raj);font-weight:600;letter-spacing:.06em}
+.idx-piv-val{font-family:var(--jet)}
+.idx-piv-val.r{color:var(--red)}
+.idx-piv-val.g{color:var(--green)}
+.idx-piv-val.c{color:var(--cyan);font-weight:700}
+.idx-bias{font-size:8px;font-family:var(--raj);font-weight:600;padding:.25rem .5rem;border-radius:2px;background:rgba(0,0,0,.3);margin-top:.35rem;letter-spacing:.04em}
+.idx-bias.g{color:var(--green)}
+.idx-bias.r{color:var(--red)}
+.conf-bar{height:2px;background:var(--border2);border-radius:1px;margin-top:.4rem;overflow:hidden}
+.conf-fill{height:100%;border-radius:1px;transition:width .5s ease}
+.idx-card-ph{padding:2rem;text-align:center;color:var(--muted);font-family:var(--raj);font-size:10px;grid-column:1/-1}
 ::-webkit-scrollbar{width:3px;height:3px}
 ::-webkit-scrollbar-track{background:var(--void)}
 ::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px}
@@ -1398,7 +1589,7 @@ tr.selected td{background:rgba(0,229,255,.06)}
       <span class="chip chip-green">BREAKOUT ×5</span>
       <span class="chip chip-purple">FUNDAMENTAL ×5</span>
       <span class="chip chip-amber">INSTITUTIONAL ×5</span>
-      <span class="chip chip-red">REGIME ×2</span>
+      <span class="chip chip-red">REGIME ×2 <span style="font-size:7px;opacity:.7">(7-pt gate)</span></span>
       <span class="chip" style="background:rgba(0,229,255,.07);color:#00ffcc;border:1px solid rgba(0,255,204,.25)">SMC ×5</span>
       <span class="chip" style="background:rgba(255,170,0,.07);color:#ffd700;border:1px solid rgba(255,215,0,.3)">FIBONACCI ×3</span>
     </div>
@@ -1408,6 +1599,17 @@ tr.selected td{background:rgba(0,229,255,.06)}
       <span class="sl-item a">●&nbsp;9+ WATCHLIST</span>
       <span class="sl-item d">●&nbsp;&lt;9 AVOID</span>
     </div>
+  </div>
+</div>
+
+<!-- INDEX PIVOT CARDS — 4 indices with R1/R2/R3 S1/S2/S3 -->
+<div class="panel panel-accent-cyan">
+  <div class="ph">
+    <span class="ph-l">Index Levels — Pivot Points</span>
+    <span class="ph-r" id="idx-regime-conf" style="color:var(--cyan)">Run a scan for live levels</span>
+  </div>
+  <div id="index-cards">
+    <div class="idx-card-ph">▶ Run a full scan to load index pivot levels</div>
   </div>
 </div>
 
@@ -1620,6 +1822,48 @@ function startProgressPoll() {
   }, 800);
 }
 
+/* ── INDEX PIVOT CARDS ─────────────────────────────────────── */
+async function loadIndexCards() {
+  try {
+    const r = await (await fetch('/api/indices')).json();
+    const container = document.getElementById('index-cards');
+    const conf = document.getElementById('idx-regime-conf');
+    const ORDER = ['NIFTY','BANKNIFTY','FINNIFTY','MIDCAP'];
+    const HTML = ORDER.map(key => {
+      const d = r[key];
+      if(!d || !d.ltp) return '';
+      const bull = d.trend==='BULL', bear = d.trend==='BEAR';
+      const cls    = bull ? 'BULL' : bear ? 'BEAR' : 'SIDEWAYS';
+      const chgCls = (d.change_pct||0) >= 0 ? 'g' : 'r';
+      const biasC  = d.above_pivot ? 'g' : 'r';
+      return `<div class="idx-card ${cls}">
+        <div class="idx-trend ${cls}">${d.trend||'—'}</div>
+        <div class="idx-name">${d.name||key}</div>
+        <div style="margin-bottom:.3rem">
+          <span class="idx-price">₹${(d.ltp||0).toLocaleString('en-IN')}</span>
+          <span class="idx-chg ${chgCls}">${(d.change_pct||0)>=0?'+':''}${(d.change_pct||0).toFixed(2)}%</span>
+        </div>
+        <div class="idx-pivot-grid">
+          <span class="idx-piv-lbl">R3</span><span class="idx-piv-val r">₹${(d.r3||0).toLocaleString('en-IN')}</span>
+          <span class="idx-piv-lbl">R2</span><span class="idx-piv-val r">₹${(d.r2||0).toLocaleString('en-IN')}</span>
+          <span class="idx-piv-lbl">R1</span><span class="idx-piv-val r">₹${(d.r1||0).toLocaleString('en-IN')}</span>
+          <span class="idx-piv-lbl">PP</span><span class="idx-piv-val c">₹${(d.pivot||0).toLocaleString('en-IN')}</span>
+          <span class="idx-piv-lbl">S1</span><span class="idx-piv-val g">₹${(d.s1||0).toLocaleString('en-IN')}</span>
+          <span class="idx-piv-lbl">S2</span><span class="idx-piv-val g">₹${(d.s2||0).toLocaleString('en-IN')}</span>
+          <span class="idx-piv-lbl">S3</span><span class="idx-piv-val g">₹${(d.s3||0).toLocaleString('en-IN')}</span>
+          <span class="idx-piv-lbl">RSI</span><span class="idx-piv-val" style="color:${(d.rsi||50)>70?'var(--red)':(d.rsi||50)<35?'var(--green)':'var(--text)'}">${d.rsi||'—'}</span>
+        </div>
+        <div class="idx-bias ${biasC}">${d.bias||'—'} · ${d.nearest_level||''} ₹${(d.nearest_price||0).toLocaleString('en-IN')}</div>
+        <div class="conf-bar">
+          <div class="conf-fill" style="width:${d.adx||0}%;background:${bull?'var(--green)':bear?'var(--red)':'var(--amber)'}"></div>
+        </div>
+      </div>`;
+    }).join('');
+    if(container) container.innerHTML = HTML || '<div class="idx-card-ph">Run a scan to load index levels</div>';
+    if(conf) conf.textContent = 'Pivot levels from prev-day OHLC · ' + new Date().toLocaleTimeString('en-IN',{hour12:false});
+  } catch(e) { console.warn('loadIndexCards:', e); }
+}
+
 /* ── F&O CARDS ───────────────────── */
 async function loadFno() {
   const container  = document.getElementById('fno-cards');
@@ -1630,22 +1874,34 @@ async function loadFno() {
     if(!resp.ok){ container.innerHTML=`<div class="no-data">Server error ${resp.status} — check logs</div>`; return; }
     const r = await resp.json();
     if(r.error){ container.innerHTML=`<div class="no-data">${r.error}</div>`; return; }
-    // Show/hide bear-market warning banner
     if(bearBanner) bearBanner.style.display = r.bear_blocked ? 'block' : 'none';
     document.getElementById('fno-ct').textContent = (r.count||0)+' ideas · VIX '+(r.vix||0).toFixed(1);
     const sigs = r.signals||[];
     if(!sigs.length){ container.innerHTML='<div class="no-data">No signals above watchlist threshold (score ≥9)</div>'; return; }
     container.innerHTML = sigs.map(s => {
-      const isBull = s.direction==='CALL';
-      const tagCls = isBull?'fno-call':'fno-put';
-      const rrColor = s.rr>=2?'var(--green)':s.rr>=1.5?'var(--amber)':'var(--red)';
+      const isBull  = s.direction==='CALL';
+      const tagCls  = isBull ? 'fno-call' : 'fno-put';
+      const rrColor = s.rr>=2 ? 'var(--green)' : s.rr>=1.5 ? 'var(--amber)' : 'var(--red)';
       const bearTag = r.bear_blocked ? `<span style="font-size:7px;color:var(--red);font-family:var(--raj);margin-left:.3rem">WATCH ONLY</span>` : '';
+      const sidewaysTag = r.sideways_blocked ? `<span style="font-size:7px;color:var(--amber);font-family:var(--raj);margin-left:.3rem">SIDEWAYS</span>` : '';
+
+      // Type badge: INDEX vs STOCK
+      const typeBadge = s.type==='INDEX'
+        ? `<span style="font-size:7px;background:rgba(0,229,255,.12);color:var(--cyan);border:1px solid rgba(0,229,255,.3);border-radius:2px;padding:.1rem .3rem;font-family:var(--raj)">INDEX</span>`
+        : `<span style="font-size:7px;background:rgba(176,96,255,.1);color:var(--purple);border:1px solid rgba(176,96,255,.25);border-radius:2px;padding:.1rem .3rem;font-family:var(--raj)">STOCK</span>`;
+
+      // Confidence bar colour
+      const conf = s.confidence || 0;
+      const confColor = conf>=80 ? 'var(--green)' : conf>=60 ? 'var(--amber)' : 'var(--red)';
+      const pivotNote = s.pivot_ref ? `<div style="font-size:8px;color:var(--steel);margin-top:.3rem">📐 ${s.pivot_ref}</div>` : '';
+
       return `<div class="fno-card">
         <div style="margin-bottom:.5rem">
           <span class="fno-sym">${s.symbol}</span>
           <span class="fno-tag ${tagCls}">${s.direction}</span>
+          ${typeBadge}
           <span style="font-family:var(--raj);font-size:8px;color:var(--muted);margin-left:.4rem">${s.equity_signal.split(' ')[0]} ${s.equity_score}/30</span>
-          ${bearTag}
+          ${bearTag}${sidewaysTag}
         </div>
         <div class="fno-row"><span class="fno-key">LTP</span><span class="fno-val">₹${s.ltp.toLocaleString('en-IN')}</span></div>
         <div class="fno-row"><span class="fno-key">STRIKE</span><span class="fno-val c">₹${s.strike}</span></div>
@@ -1654,8 +1910,18 @@ async function loadFno() {
         <div class="fno-row"><span class="fno-key">OPT SL</span><span class="fno-val r">₹${s.sl_option}</span></div>
         <div class="fno-row"><span class="fno-key">OPT TP</span><span class="fno-val g">₹${s.tp_option}</span></div>
         <div class="fno-row"><span class="fno-key">R:R</span><span class="fno-val" style="color:${rrColor};font-weight:700">${s.rr}x</span></div>
+        <div class="fno-row"><span class="fno-key">CONF</span>
+          <span class="fno-val" style="display:flex;align-items:center;gap:.4rem">
+            <span style="color:${confColor};font-weight:700">${conf.toFixed(0)}%</span>
+            <span style="flex:1;height:3px;background:var(--border2);border-radius:1px;overflow:hidden;display:inline-block;width:50px">
+              <span style="display:block;height:100%;width:${conf}%;background:${confColor};border-radius:1px"></span>
+            </span>
+          </span>
+        </div>
         <div class="fno-row"><span class="fno-key">EQ SL→TP</span><span class="fno-val" style="font-size:8px"><span class="r">₹${s.equity_sl}</span> → <span class="g">₹${s.equity_tp}</span></span></div>
-        ${s.smc_bos?'<div style="font-size:8px;color:#00ffcc;margin-top:.3rem">✅ SMC Break of Structure</div>':''}
+        ${s.smc_bos ? '<div style="font-size:8px;color:#00ffcc;margin-top:.3rem">✅ SMC Break of Structure</div>' : ''}
+        ${s.above_vwap===true ? '<div style="font-size:8px;color:var(--green);margin-top:.2rem">✅ VWAP: Price above demand zone</div>' : (s.above_vwap===false?'<div style="font-size:8px;color:var(--amber);margin-top:.2rem">⚠️ VWAP: Price in supply zone</div>':'')}
+        ${pivotNote}
       </div>`;
     }).join('');
   } catch(e) {
@@ -1777,7 +2043,8 @@ function render(d) {
   const reg = d.regime || {};
   const rl  = reg.label || '—';
   const pe = document.getElementById('p-regime');
-  pe.textContent = rl; pe.className = 'pill-val '+(rl.includes('BULL')?'g':'r');
+  pe.textContent = rl;
+  pe.className = 'pill-val '+(rl.includes('BULL')?'g':rl.includes('SIDEWAYS')?'a':'r');
   const vix = d.vix || 15;
   const pv = document.getElementById('p-vix');
   pv.textContent = vix.toFixed(1); pv.className = 'pill-val '+(vix<15?'g':vix<20?'a':'r');
@@ -1802,8 +2069,8 @@ function render(d) {
 
   // regime
   document.getElementById('r-label').textContent  = rl;
-  document.getElementById('r-label').className    = 'regime-label '+(rl.includes('BULL')?'g':'r');
-  document.getElementById('r-score').textContent  = `${reg.score||0}/2`;
+  document.getElementById('r-label').className    = 'regime-label '+(rl.includes('BULL')?'g':rl.includes('SIDEWAYS')?'a':'r');
+  document.getElementById('r-score').textContent  = `${reg.score||0}/7 · ${reg.confidence||0}%`;
   document.getElementById('r-flags').innerHTML    = (reg.flags||[]).map(f=>{
     const cls = f.startsWith('✅')?'ok':f.startsWith('❌')?'fail':'warn';
     return `<div class="regime-flag ${cls}">${f}</div>`;
@@ -1857,6 +2124,8 @@ function render(d) {
   if(document.getElementById('tab-paper').style.display!=='none') loadPaperState();
   // refresh F&O tab if currently visible — picks up new signals after scan
   if(document.getElementById('tab-fno').style.display!=='none') loadFno();
+  // always refresh index cards — lightweight call, no-op if no data yet
+  loadIndexCards();
 }
 
 function renderSignals(sigs) {
@@ -2053,7 +2322,8 @@ async function triggerScan() {
       if(!d.scanning){
         clearInterval(poll); render(d);
         btn.disabled=false; btn.querySelector('span').textContent='▶ FULL SCAN'; btn.classList.remove('running');
-        loadFno();  // always refresh F&O immediately after scan completes
+        loadFno();         // refresh F&O immediately after scan
+        loadIndexCards();  // refresh pivot cards after scan
       }
     } catch(e){clearInterval(poll);}
   },2500);
@@ -2061,8 +2331,10 @@ async function triggerScan() {
 
 fetchState();
 loadPaperState();
+loadIndexCards();
 setInterval(fetchState, 30000);
 setInterval(loadPaperState, 15000);
+setInterval(loadIndexCards, 60000);  // refresh pivot cards every minute
 setInterval(()=>{ const t=document.getElementById('clock'); if(t) t.textContent=new Date().toLocaleTimeString('en-IN',{hour12:false}); }, 1000);
 </script>
 </body>

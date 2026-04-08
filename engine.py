@@ -705,8 +705,16 @@ class TechnicalEngine:
         df["cross_up"]   = (df["ema_fast"] > df["ema_slow"]) & (df["ema_fast"].shift() <= df["ema_slow"].shift())
         df["cross_down"] = (df["ema_fast"] < df["ema_slow"]) & (df["ema_fast"].shift() >= df["ema_slow"].shift())
 
+        # ── VWAP proxy (cumulative TP×Vol / cumulative Vol, rolling 20) ──
+        # True intraday VWAP needs tick data; this rolling daily proxy is a
+        # strong directional signal for swing/positional modes.
+        typical_price = (high + low + close) / 3
+        tp_vol        = typical_price * vol
+        df["vwap"]    = tp_vol.rolling(20).sum() / vol.rolling(20).sum()
+        df["above_vwap"] = close > df["vwap"]
+
         _core = ["ema_fast", "ema_slow", "ema_trend", "rsi", "atr",
-                 "adx", "macd", "macd_sig", "supertrend", "vol_ma"]
+                 "adx", "macd", "macd_sig", "supertrend", "vol_ma", "vwap"]
         return df.dropna(subset=_core).reset_index(drop=True)
 
     @staticmethod
@@ -747,6 +755,13 @@ class TechnicalEngine:
             flags.append("⚠️ Volume surge, no candle confirm")
         else:
             flags.append("❌ No volume confirmation")
+
+        # VWAP confirmation — price above rolling VWAP (institutional demand)
+        vwap = float(row.get("vwap", 0))
+        if vwap > 0 and float(row.get("close", 0)) > vwap:
+            flags.append(f"✅ VWAP: Price above VWAP ₹{vwap:.1f} — demand zone")
+        elif vwap > 0:
+            flags.append(f"⚠️ VWAP: Price below VWAP ₹{vwap:.1f} — supply zone")
 
         return score, flags
 
@@ -1188,6 +1203,23 @@ class InstitutionalEngine:
 
 # ═════════════════════════════════════════════════════════════
 # ███  MARKET REGIME  █████████████████████████████████████████
+# ─────────────────────────────────────────────────────────────
+# 7-POINT WEIGHTED SCORING METHODOLOGY (v3)
+#
+#   R1 — NIFTY > 200 EMA         → 2 pts  (primary trend — most weight)
+#   R2 — VIX < 20                → 1 pt   (fear gauge)
+#   R3 — NIFTY ADX > 25          → 1 pt   (trend has strength)
+#   R4 — BANKNIFTY > 50 EMA      → 1 pt   (financial sector breadth)
+#   R5 — FINNIFTY > 50 EMA       → 0.5 pt (fin services breadth)
+#   R6 — MIDCAP 150 > 50 EMA     → 1 pt   (market breadth)
+#   R7 — PCR ≥ 0.85              → 0.5 pt (OI sentiment)
+#
+#   BULL     ≥ 5.0/7 pts
+#   SIDEWAYS  3.0–4.5/7 pts
+#   BEAR     < 3.0/7 pts
+#
+#   confidence = score / 7.0 * 100  (drives UI progress bars)
+#   Returns: (score, flags, bullish, label, confidence)
 # ═════════════════════════════════════════════════════════════
 class MarketRegime:
 
@@ -1198,75 +1230,280 @@ class MarketRegime:
         banknifty_df: pd.DataFrame = None,
         finnifty_df:  pd.DataFrame = None,
         midcap_df:    pd.DataFrame = None,
-    ) -> Tuple[int, List[str], bool, str]:
+        pcr:          float        = None,
+    ) -> Tuple[float, List[str], bool, str, float]:
         """
-        Multi-index regime check.
-        Score 2 pts:
-          R1 — NIFTY 50 above its 200 EMA  (primary trend)
-          R2 — India VIX below VIX_MAX     (fear gauge from Kite/NSE)
+        7-point weighted multi-index regime check.
 
-        Bonus flags (no score change) for BANKNIFTY, FINNIFTY, MIDCAP breadth.
+        Returns
+        -------
+        (score, flags, bullish, label, confidence)
+          score      : weighted score 0–7
+          flags      : list of human-readable condition strings
+          bullish    : True when score ≥ 3 (SIDEWAYS or better)
+          label      : 'BULL 🟢' | 'SIDEWAYS 🟡' | 'BEAR 🔴'
+          confidence : score / 7 * 100 (0–100 float)
         """
-        score = 0
-        flags = []
+        score: float = 0.0
+        flags: List[str] = []
+
         try:
             if nifty_df is None or len(nifty_df) < 3:
                 log.warning("  [Regime] NIFTY data insufficient — using neutral regime")
-                return 1, ["⚠️ NIFTY data unavailable (market may be closed)"], True, "NEUTRAL ⚪"
+                return 3.5, ["⚠️ NIFTY data unavailable (market may be closed)"], True, "SIDEWAYS 🟡", 50.0
 
-            ema200  = nifty_df["close"].ewm(span=min(200, len(nifty_df)), adjust=False).mean()
             last    = float(nifty_df["close"].iloc[-1])
+
+            # ── R1 (2 pts): NIFTY 50 vs 200 EMA ──────────────
+            ema200  = nifty_df["close"].ewm(span=min(200, len(nifty_df)), adjust=False).mean()
             ema_val = float(ema200.iloc[-1])
-
-            # R1: NIFTY vs 200 EMA
             if last > ema_val:
-                score += 1
-                flags.append(f"✅ NIFTY {last:.0f} > 200EMA {ema_val:.0f}")
+                score += 2.0
+                flags.append(f"✅ R1(2pt) NIFTY {last:.0f} > 200EMA {ema_val:.0f} — Primary bull trend")
             else:
-                flags.append(f"❌ NIFTY {last:.0f} < 200EMA {ema_val:.0f} — Bear trend")
+                flags.append(f"❌ R1(2pt) NIFTY {last:.0f} < 200EMA {ema_val:.0f} — Primary bear trend")
 
-            # R2: VIX fear gauge — live from Kite or NSE API (no hardcode)
+            # ── R2 (1 pt): VIX fear gauge ─────────────────────
             if vix is None:
-                flags.append("⚠️ VIX unavailable — skipping fear check")
+                flags.append("⚠️ R2(1pt) VIX unavailable — skipping")
             elif vix < CFG["VIX_MAX"]:
-                score += 1
-                flags.append(f"✅ VIX {vix:.1f} calm market (< {CFG['VIX_MAX']})")
+                score += 1.0
+                flags.append(f"✅ R2(1pt) VIX {vix:.1f} calm (< {CFG['VIX_MAX']})")
             elif vix < 25:
-                flags.append(f"⚠️ VIX {vix:.1f} elevated — trade with caution")
+                score += 0.5
+                flags.append(f"⚠️ R2(0.5pt) VIX {vix:.1f} elevated — caution")
             else:
-                flags.append(f"❌ VIX {vix:.1f} high fear — reduce position size")
+                flags.append(f"❌ R2(0pt) VIX {vix:.1f} high fear")
 
-            # ── Breadth flags (informational — no score) ──────
-            for name, idx_df in [
-                ("BANKNIFTY", banknifty_df),
-                ("FINNIFTY",  finnifty_df),
-                ("MIDCAP150", midcap_df),
-            ]:
-                if idx_df is not None and len(idx_df) >= 3:
-                    try:
-                        idx_ema = idx_df["close"].ewm(
-                            span=min(50, len(idx_df)), adjust=False
-                        ).mean()
-                        idx_last = float(idx_df["close"].iloc[-1])
-                        idx_ema_val = float(idx_ema.iloc[-1])
-                        bull = idx_last > idx_ema_val
-                        icon = "✅" if bull else "❌"
-                        flags.append(
-                            f"{icon} {name} {idx_last:.0f} {'>' if bull else '<'} 50EMA {idx_ema_val:.0f}"
-                        )
-                    except Exception:
-                        pass
+            # ── R3 (1 pt): NIFTY ADX trend strength ──────────
+            try:
+                if "adx" in nifty_df.columns:
+                    adx_val = float(nifty_df["adx"].iloc[-1])
+                    if adx_val >= CFG["ADX_MIN"]:
+                        score += 1.0
+                        flags.append(f"✅ R3(1pt) NIFTY ADX {adx_val:.1f} — strong trend")
+                    else:
+                        flags.append(f"❌ R3(0pt) NIFTY ADX {adx_val:.1f} — weak/sideways trend")
+                else:
+                    flags.append("⚠️ R3(1pt) ADX not in NIFTY df — skipping")
+            except Exception:
+                flags.append("⚠️ R3 ADX check N/A")
 
-            bullish = (score >= 1)
-            label   = "BULL 🟢" if last > ema_val else "BEAR 🔴"
+            # ── R4 (1 pt): BANKNIFTY > 50 EMA ────────────────
+            if banknifty_df is not None and len(banknifty_df) >= 3:
+                try:
+                    bn_ema   = banknifty_df["close"].ewm(span=min(50, len(banknifty_df)), adjust=False).mean()
+                    bn_last  = float(banknifty_df["close"].iloc[-1])
+                    bn_ema_v = float(bn_ema.iloc[-1])
+                    if bn_last > bn_ema_v:
+                        score += 1.0
+                        flags.append(f"✅ R4(1pt) BANKNIFTY {bn_last:.0f} > 50EMA {bn_ema_v:.0f}")
+                    else:
+                        flags.append(f"❌ R4(0pt) BANKNIFTY {bn_last:.0f} < 50EMA {bn_ema_v:.0f}")
+                except Exception:
+                    flags.append("⚠️ R4 BANKNIFTY check N/A")
+            else:
+                flags.append("⚠️ R4(1pt) BANKNIFTY data unavailable")
+
+            # ── R5 (0.5 pt): FINNIFTY > 50 EMA ───────────────
+            if finnifty_df is not None and len(finnifty_df) >= 3:
+                try:
+                    fn_ema   = finnifty_df["close"].ewm(span=min(50, len(finnifty_df)), adjust=False).mean()
+                    fn_last  = float(finnifty_df["close"].iloc[-1])
+                    fn_ema_v = float(fn_ema.iloc[-1])
+                    if fn_last > fn_ema_v:
+                        score += 0.5
+                        flags.append(f"✅ R5(0.5pt) FINNIFTY {fn_last:.0f} > 50EMA {fn_ema_v:.0f}")
+                    else:
+                        flags.append(f"❌ R5(0pt) FINNIFTY {fn_last:.0f} < 50EMA {fn_ema_v:.0f}")
+                except Exception:
+                    flags.append("⚠️ R5 FINNIFTY check N/A")
+            else:
+                flags.append("⚠️ R5(0.5pt) FINNIFTY data unavailable")
+
+            # ── R6 (1 pt): MIDCAP 150 > 50 EMA (breadth) ────
+            if midcap_df is not None and len(midcap_df) >= 3:
+                try:
+                    mc_ema   = midcap_df["close"].ewm(span=min(50, len(midcap_df)), adjust=False).mean()
+                    mc_last  = float(midcap_df["close"].iloc[-1])
+                    mc_ema_v = float(mc_ema.iloc[-1])
+                    if mc_last > mc_ema_v:
+                        score += 1.0
+                        flags.append(f"✅ R6(1pt) MIDCAP {mc_last:.0f} > 50EMA {mc_ema_v:.0f} — Broad rally")
+                    else:
+                        flags.append(f"❌ R6(0pt) MIDCAP {mc_last:.0f} < 50EMA {mc_ema_v:.0f} — Narrow market")
+                except Exception:
+                    flags.append("⚠️ R6 MIDCAP check N/A")
+            else:
+                flags.append("⚠️ R6(1pt) MIDCAP data unavailable")
+
+            # ── R7 (0.5 pt): PCR OI sentiment ────────────────
+            if pcr is not None:
+                try:
+                    pcr_f = float(pcr)
+                    if pcr_f >= CFG.get("PCR_BULLISH_MIN", 0.85):
+                        score += 0.5
+                        flags.append(f"✅ R7(0.5pt) PCR {pcr_f:.2f} — bullish OI sentiment")
+                    else:
+                        flags.append(f"❌ R7(0pt) PCR {pcr_f:.2f} — bearish OI sentiment")
+                except Exception:
+                    flags.append("⚠️ R7 PCR check N/A")
+            else:
+                flags.append("⚠️ R7(0.5pt) PCR unavailable")
+
+            # ── Regime label ──────────────────────────────────
+            score = round(score, 2)
+            if   score >= 5.0: label = "BULL 🟢"
+            elif score >= 3.0: label = "SIDEWAYS 🟡"
+            else:              label = "BEAR 🔴"
+
+            bullish    = (score >= 3.0)
+            confidence = round(score / 7.0 * 100, 1)
+
+            log.info(f"  [Regime] {label} | Score {score}/7 | Confidence {confidence}%")
 
         except Exception as e:
             log.warning(f"  [Regime] Error: {e}")
-            bullish = True
-            label   = "NEUTRAL ⚪"
+            bullish    = True
+            label      = "SIDEWAYS 🟡"
+            score      = 3.5
+            confidence = 50.0
             flags.append(f"⚠️ Regime check error: {str(e)[:60]}")
 
-        return score, flags, bullish, label
+        return score, flags, bullish, label, confidence
+
+
+# ═════════════════════════════════════════════════════════════
+# ███  PIVOT ENGINE  ██████████████████████████████████████████
+# ─────────────────────────────────────────────────────────────
+# Computes Standard Pivot Points (Floor Trader Method) from the
+# PREVIOUS day's OHLC for any index or stock.
+#
+#   PP = (H + L + C) / 3
+#   R1 = 2*PP − L       S1 = 2*PP − H
+#   R2 = PP + (H − L)   S2 = PP − (H − L)
+#   R3 = H + 2*(PP − L) S3 = L − 2*(H − PP)
+#
+# Also computes:
+#   - LTP, change_pct
+#   - RSI (last candle), ADX (for confidence bar)
+#   - trend: BULL / BEAR / SIDEWAYS (vs pivot point)
+#   - nearest pivot level name + price
+#   - bias string e.g. "Above PP" / "Below PP"
+# ═════════════════════════════════════════════════════════════
+class PivotEngine:
+
+    INDEX_META = {
+        "NIFTY":     {"token": 256265, "name": "NIFTY 50"},
+        "BANKNIFTY": {"token": 260105, "name": "BANK NIFTY"},
+        "FINNIFTY":  {"token": 257801, "name": "FIN NIFTY"},
+        "MIDCAP":    {"token": 288009, "name": "MIDCAP 150"},
+    }
+
+    @staticmethod
+    def _pivot_from_prev(df: pd.DataFrame) -> dict:
+        """Compute pivot levels from the second-to-last candle (prev session)."""
+        if df is None or len(df) < 2:
+            return {}
+        prev = df.iloc[-2]
+        h, l, c = float(prev["high"]), float(prev["low"]), float(prev["close"])
+        pp = (h + l + c) / 3
+        r1 = 2 * pp - l;  r2 = pp + (h - l);  r3 = h + 2 * (pp - l)
+        s1 = 2 * pp - h;  s2 = pp - (h - l);  s3 = l - 2 * (h - pp)
+        return {
+            "pivot": round(pp, 2),
+            "r1": round(r1, 2), "r2": round(r2, 2), "r3": round(r3, 2),
+            "s1": round(s1, 2), "s2": round(s2, 2), "s3": round(s3, 2),
+        }
+
+    @staticmethod
+    def _nearest_level(ltp: float, levels: dict) -> Tuple[str, float]:
+        """Return the name and price of the nearest pivot level."""
+        best_name, best_price = "PP", levels.get("pivot", ltp)
+        best_dist = abs(ltp - best_price)
+        for name in ("r3","r2","r1","pivot","s1","s2","s3"):
+            px = levels.get(name, 0)
+            if px and abs(ltp - px) < best_dist:
+                best_dist  = abs(ltp - px)
+                best_name  = name.upper()
+                best_price = px
+        return best_name, best_price
+
+    @staticmethod
+    def compute_for_index(df: pd.DataFrame, key: str) -> dict:
+        """
+        Full pivot + indicator snapshot for one index.
+
+        Parameters
+        ----------
+        df  : OHLCV dataframe with indicators already computed by TechnicalEngine
+        key : 'NIFTY' | 'BANKNIFTY' | 'FINNIFTY' | 'MIDCAP'
+
+        Returns
+        -------
+        dict ready to be stored in STATE["indices"][key]
+        """
+        meta = PivotEngine.INDEX_META.get(key, {"name": key})
+        if df is None or len(df) < 2:
+            return {"name": meta["name"], "error": "No data"}
+
+        ltp       = float(df["close"].iloc[-1])
+        prev_close = float(df["close"].iloc[-2])
+        change_pct = round((ltp - prev_close) / prev_close * 100, 2) if prev_close else 0
+
+        levels    = PivotEngine._pivot_from_prev(df)
+        pivot     = levels.get("pivot", ltp)
+        above_pp  = ltp > pivot
+
+        # Trend from price vs pivot
+        if ltp > levels.get("r1", ltp):
+            trend = "BULL"
+        elif ltp < levels.get("s1", ltp):
+            trend = "BEAR"
+        else:
+            trend = "SIDEWAYS"
+
+        bias = "Above PP — Bullish" if above_pp else "Below PP — Bearish"
+        near_name, near_price = PivotEngine._nearest_level(ltp, levels)
+
+        # RSI and ADX from last row (pre-computed by TechnicalEngine)
+        rsi = None
+        adx = None
+        try:
+            row = df.iloc[-1]
+            if "rsi" in df.columns: rsi = round(float(row["rsi"]), 1)
+            if "adx" in df.columns: adx = round(float(row["adx"]), 1)
+        except Exception:
+            pass
+
+        return {
+            "name":          meta["name"],
+            "ltp":           round(ltp, 2),
+            "change_pct":    change_pct,
+            "trend":         trend,
+            "above_pivot":   above_pp,
+            "bias":          bias,
+            "nearest_level": near_name,
+            "nearest_price": near_price,
+            "rsi":           rsi,
+            "adx":           adx,
+            **levels,
+        }
+
+    @staticmethod
+    def compute_all(
+        nifty_df:     pd.DataFrame,
+        banknifty_df: pd.DataFrame,
+        finnifty_df:  pd.DataFrame,
+        midcap_df:    pd.DataFrame,
+    ) -> dict:
+        """Compute pivot data for all 4 tracked indices."""
+        return {
+            "NIFTY":     PivotEngine.compute_for_index(nifty_df,     "NIFTY"),
+            "BANKNIFTY": PivotEngine.compute_for_index(banknifty_df, "BANKNIFTY"),
+            "FINNIFTY":  PivotEngine.compute_for_index(finnifty_df,  "FINNIFTY"),
+            "MIDCAP":    PivotEngine.compute_for_index(midcap_df,    "MIDCAP"),
+        }
 
 
 # ═════════════════════════════════════════════════════════════
