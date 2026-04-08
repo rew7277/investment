@@ -40,7 +40,7 @@ from engine import (
     CFG, KiteLayer, UniverseManager, NSEClient,
     TechnicalEngine, FundamentalEngine, BreakoutScanner,
     InstitutionalEngine, MarketRegime, RiskManager,
-    SMCEngine, FibonacciEngine, PivotEngine,
+    SMCEngine, FibonacciEngine, PivotEngine, OptionEngine,
     build_score, save_token, load_token, is_token_fresh
 )
 
@@ -818,190 +818,176 @@ def signals_buy():
 @app.route("/api/fno-signals")
 def fno_signals():
     """
-    Derives F&O option trade ideas from top equity signals.
-    Includes:
-      - type: INDEX vs STOCK
-      - confidence: regime confidence %
-      - pivot_ref: nearest pivot level to current price
-      - directional filter: CALL near support, PUT near resistance
-      - sideways_blocked flag
+    Institutional F&O signal panel — PRO version.
+
+    Improvements over v1:
+      • Real option LTP fetched from Kite NFO (kite.ltp("NFO:NIFTY2641024000CE"))
+      • Correct NFO symbol built from next weekly expiry date
+      • Structure-based SL (delta-weighted from underlying pivot SL)
+      • T1/T2/T3 anchored to underlying TP structure, min % enforced
+      • IV assessment: cheap / fair / expensive relative to VIX
+      • Time-of-day window filter (9:45–11:30, 13:45–15:00)
+      • OI confirmation score from NSE option chain
+      • Setup quality score 0–5 per signal
     """
     try:
-        if not STATE["signals"]:
+        if not STATE["signals"] and not STATE.get("indices"):
             return jsonify({"error": "No scan data yet — run a full scan first."})
 
-        # Load NFO instrument list for lot sizes
-        nfo_lots = {}
-        try:
-            nfo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_nfo_instruments.json")
-            if os.path.exists(nfo_path):
-                with open(nfo_path) as f:
-                    nfo_data = json.load(f)
-                for item in nfo_data:
-                    sym = item.get("tradingsymbol","").replace("-EQ","").split("-")[0]
-                    if item.get("instrument_type") == "FUT":
-                        nfo_lots[sym] = item.get("lot_size", 1)
-        except Exception:
-            pass
+        reg_label  = STATE["regime"].get("label", "")
+        reg_conf   = float(STATE["regime"].get("confidence", 50.0))
+        vix        = float(STATE.get("vix", 15.0) or 15.0)
+        bear_blk   = reg_label.startswith("BEAR")
+        sw_blk     = reg_label.startswith("SIDEWAYS")
+        idx_pivots = STATE.get("indices", {})
+        oc_nifty   = nse.get_option_chain_pcr("NIFTY")
+        fii        = STATE.get("fii_dii", {})
+
+        # Need kl for real LTP fetch; gracefully fall back if not available
+        _kl = kl    # global KiteLayer — may be None before first scan
 
         KNOWN_LOTS = {
-            "NIFTY":256, "BANKNIFTY":30, "FINNIFTY":40,
-            "RELIANCE":250, "TCS":150, "INFY":300, "HDFCBANK":550,
-            "ICICIBANK":700, "SBIN":1500, "TATAMOTORS":1425,
-            "WIPRO":1500, "BAJFINANCE":125, "LT":175,
+            "NIFTY": 75, "BANKNIFTY": 30, "FINNIFTY": 40,
+            "RELIANCE": 250, "TCS": 150, "INFY": 300,
+            "HDFCBANK": 550, "ICICIBANK": 700, "SBIN": 1500,
+            "TATAMOTORS": 1425, "WIPRO": 1500, "BAJFINANCE": 125, "LT": 175,
         }
-
         INDEX_SYMS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCAP"}
-
-        reg_label    = STATE["regime"].get("label", "")
-        reg_conf     = float(STATE["regime"].get("confidence", 50.0))
-        sideways_blk = reg_label.startswith("SIDEWAYS")
-        bear_blk     = reg_label.startswith("BEAR")
-
-        # Build pivot lookup from STATE["indices"]
-        idx_pivots = STATE.get("indices", {})
 
         results = []
         seen    = set()
 
-        # ── Add index signals first (NIFTY, BANKNIFTY, FINNIFTY) ─────
+        # ──────────────────────────────────────────────────────
+        # BLOCK 1: Index signals (NIFTY, BANKNIFTY, FINNIFTY)
+        # ──────────────────────────────────────────────────────
         for idx_key, idx_data in idx_pivots.items():
             if not idx_data or idx_data.get("error"):
                 continue
-            ltp    = float(idx_data.get("ltp", 0))
-            trend  = idx_data.get("trend", "SIDEWAYS")
-            if trend == "SIDEWAYS" or ltp == 0:
+            ltp   = float(idx_data.get("ltp", 0))
+            trend = idx_data.get("trend", "SIDEWAYS")
+            if trend == "SIDEWAYS" or ltp < 100:
                 continue
+
             direction = "CALL" if trend == "BULL" else "PUT"
-            # Pivot-based directional filter for index
+
+            # Hard pivot gate: CALL only above PP, PUT only below PP
             if direction == "CALL" and not idx_data.get("above_pivot", False):
-                continue   # CALL only when above PP (bullish bias)
+                continue
             if direction == "PUT" and idx_data.get("above_pivot", True):
-                continue   # PUT only when below PP (bearish bias)
+                continue
 
-            pivot  = idx_data.get("pivot", ltp)
-            r1     = idx_data.get("r1", ltp)
-            s1     = idx_data.get("s1", ltp)
-            near   = idx_data.get("nearest_level", "PP")
-            near_p = idx_data.get("nearest_price", pivot)
-            atr    = ltp * 0.015   # ~1.5% as proxy ATR for indices
+            pivot  = float(idx_data.get("pivot", ltp))
+            r1     = float(idx_data.get("r1",    ltp * 1.01))
+            r2     = float(idx_data.get("r2",    ltp * 1.02))
+            s1     = float(idx_data.get("s1",    ltp * 0.99))
+            s2     = float(idx_data.get("s2",    ltp * 0.98))
 
-            step   = 100
-            atm    = round(ltp / step) * step
-            lot    = KNOWN_LOTS.get(idx_key, 50)
-            prem   = round(2.0 * atr, 1)
-            sl_opt = round(prem * 0.40, 1)
-            tp_opt = round(prem * 2.20, 1)
-            rr     = round(tp_opt / sl_opt, 1) if sl_opt else 0
+            und_sl = s1 if direction == "CALL" else r1
+            und_tp = r1 if direction == "CALL" else s1
 
-            results.append({
-                "symbol":        idx_key,
-                "type":          "INDEX",
-                "equity_score":  0,
-                "equity_signal": trend,
-                "ltp":           ltp,
-                "direction":     direction,
-                "strike":        int(atm),
-                "option_type":   direction,
-                "premium_est":   prem,
-                "lot_size":      int(lot),
-                "sl_option":     sl_opt,
-                "tp_option":     tp_opt,
-                "rr":            rr,
-                "equity_sl":     round(s1, 2),
-                "equity_tp":     round(r1, 2),
-                "confidence":    round(reg_conf, 1),
-                "pivot_ref":     f"Near {near} ₹{near_p:,.0f}",
-                "smc_bos":       False,
-                "smc_ob":        None,
-                "note":          "Index pivot-based idea. Verify on Zerodha option chain.",
+            lot = KNOWN_LOTS.get(idx_key, 50)
+
+            # Build full signal (fetches real Kite LTP internally)
+            sig = OptionEngine.build_signal(
+                kl            = _kl,
+                underlying    = idx_key,
+                ltp           = ltp,
+                direction     = direction,
+                underlying_sl = und_sl,
+                underlying_tp = und_tp,
+                vix           = vix,
+                oc_data       = oc_nifty,
+                equity_score  = 0,
+                equity_signal = trend,
+                pivot_data    = idx_data,
+            )
+            sig.update({
+                "symbol":     idx_key,
+                "type":       "INDEX",
+                "lot_size":   int(lot),
+                "confidence": round(reg_conf, 1),
+                "bear_blocked":     bear_blk,
+                "sideways_blocked": sw_blk,
             })
+            results.append(sig)
             seen.add(idx_key)
 
-        # ── Add top equity stock signals ──────────────────────────────
-        for sig in STATE["signals"]:
-            sym   = sig["symbol"]
-            score = sig.get("score", 0)
-            if score < CFG["SCORE_WATCHLIST"]:
-                break
-            if sym in seen or len(results) >= 18:
+        # ──────────────────────────────────────────────────────
+        # BLOCK 2: Top equity stock F&O signals
+        # ──────────────────────────────────────────────────────
+        for eq_sig in STATE["signals"]:
+            sym   = eq_sig["symbol"]
+            score = eq_sig.get("score", 0)
+            if score < CFG["SCORE_WATCHLIST"] or sym in seen or len(results) >= 20:
                 break
             seen.add(sym)
 
-            ltp = float(sig.get("ltp", 0))
-            atr = float(sig.get("atr", ltp * 0.02))
-            sl  = float(sig.get("sl",  ltp - 1.5 * atr))
-            tp  = float(sig.get("tp",  ltp + 3.5 * atr))
+            ltp = float(eq_sig.get("ltp", 0))
+            if ltp < 50:
+                continue
 
-            direction = "CALL" if sig.get("signal_class") in ("buy","strong-buy") else "PUT"
+            atr = float(eq_sig.get("atr", ltp * 0.02))
+            sl  = float(eq_sig.get("sl",  ltp - 1.5 * atr))
+            tp  = float(eq_sig.get("tp",  ltp + 3.5 * atr))
 
-            # ── Pivot-based directional filter for stocks ──────────────
-            # Find nearest index pivot for context (use NIFTY as proxy)
-            nifty_piv  = idx_pivots.get("NIFTY", {})
-            pivot_ref  = None
-            pivot_warn = False   # True when pivot context conflicts with direction
-            if nifty_piv and not nifty_piv.get("error"):
-                near    = nifty_piv.get("nearest_level", "PP")
-                near_p  = nifty_piv.get("nearest_price", 0)
-                above   = nifty_piv.get("above_pivot", True)
-                pivot_ref = f"NIFTY near {near} ₹{near_p:,.0f}"
-                # Soft pivot filter — flag conflict but don't skip
-                if direction == "CALL" and not above:
-                    pivot_warn = True
-                    pivot_ref += " ⚠️ NIFTY below PP — headwind"
-                elif direction == "PUT" and above:
-                    pivot_warn = True
-                    pivot_ref += " ⚠️ NIFTY above PP — tailwind"
+            direction = "CALL" if eq_sig.get("signal_class") in ("buy", "strong-buy") else "PUT"
 
-            # Hard skip only if score is borderline AND pivot conflicts
+            # Pivot conflict check against NIFTY
+            nifty_piv = idx_pivots.get("NIFTY", {})
+            above_pp  = nifty_piv.get("above_pivot", True)
+            pivot_warn = (direction == "CALL" and not above_pp) or \
+                         (direction == "PUT"  and above_pp)
             if pivot_warn and score < CFG["SCORE_STRONG_BUY"]:
-                continue   # skip borderline signal with pivot headwind
+                continue
 
-            step = 100 if ltp > 5000 else 50 if ltp > 1000 else 10
-            atm  = round(ltp / step) * step
-            lot  = nfo_lots.get(sym) or KNOWN_LOTS.get(sym) or 500
+            # Fetch OI for stocks (best-effort from NSE)
+            oc_stock = {}
+            try:
+                oc_stock = nse.get_option_chain_pcr(sym)
+            except Exception:
+                oc_stock = oc_nifty   # fallback to NIFTY OI context
 
-            prem   = round(2.0 * atr, 1)
-            sl_opt = round(prem * 0.40, 1)
-            tp_opt = round(prem * 2.20, 1)
-            rr     = round(tp_opt / sl_opt, 1) if sl_opt else 0
+            lot = KNOWN_LOTS.get(sym, 500)
 
-            results.append({
+            sig = OptionEngine.build_signal(
+                kl            = _kl,
+                underlying    = sym,
+                ltp           = ltp,
+                direction     = direction,
+                underlying_sl = sl,
+                underlying_tp = tp,
+                vix           = vix,
+                oc_data       = oc_stock,
+                equity_score  = int(score),
+                equity_signal = eq_sig.get("signal", ""),
+                pivot_data    = nifty_piv,
+            )
+            sig.update({
                 "symbol":        sym,
-                "type":          "INDEX" if sym in INDEX_SYMS else "STOCK",
-                "equity_score":  int(score),
-                "equity_signal": sig.get("signal",""),
-                "ltp":           ltp,
-                "direction":     direction,
-                "strike":        int(atm),
-                "option_type":   direction,
-                "premium_est":   prem,
+                "type":          "STOCK",
                 "lot_size":      int(lot),
-                "sl_option":     sl_opt,
-                "tp_option":     tp_opt,
-                "rr":            rr,
-                "equity_sl":     round(sl, 2),
-                "equity_tp":     round(tp, 2),
                 "confidence":    round(reg_conf, 1),
-                "pivot_ref":     pivot_ref,
-                "smc_bos":       bool(sig.get("smc_bos", False)),
-                "smc_ob":        sig.get("smc_ob"),
-                "above_vwap":    sig.get("above_vwap"),
-                "vol_surge":     sig.get("vol_surge", False),
-                "note": (
-                    "⚠️ Premium estimates are ATR-based (2×ATR for ATM). "
-                    "Always verify strikes on Zerodha option chain before placing any order."
-                ),
+                "above_vwap":    eq_sig.get("above_vwap"),
+                "vol_surge":     eq_sig.get("vol_surge", False),
+                "smc_bos":       bool(eq_sig.get("smc_bos", False)),
+                "smc_ob":        eq_sig.get("smc_ob"),
+                "bear_blocked":     bear_blk,
+                "sideways_blocked": sw_blk,
             })
+            results.append(sig)
 
         return jsonify(_np_sanitize({
             "count":            len(results),
             "signals":          results,
             "regime":           reg_label,
-            "vix":              float(STATE["vix"]),
+            "vix":              vix,
             "bear_blocked":     bear_blk,
-            "sideways_blocked": sideways_blk,
+            "sideways_blocked": sw_blk,
             "confidence":       round(reg_conf, 1),
+            "note": (
+                "Signals with premium_live=true use real Kite NFO LTP. "
+                "premium_live=false = IV-model estimate — verify on Zerodha before trading."
+            ),
         }))
 
     except Exception as e:
@@ -1879,37 +1865,94 @@ async function loadFno() {
     const sigs = r.signals||[];
     if(!sigs.length){ container.innerHTML='<div class="no-data">No signals above watchlist threshold (score ≥9)</div>'; return; }
     container.innerHTML = sigs.map(s => {
-      const isBull  = s.direction==='CALL';
-      const tagCls  = isBull ? 'fno-call' : 'fno-put';
-      const rrColor = s.rr>=2 ? 'var(--green)' : s.rr>=1.5 ? 'var(--amber)' : 'var(--red)';
-      const bearTag = r.bear_blocked ? `<span style="font-size:7px;color:var(--red);font-family:var(--raj);margin-left:.3rem">WATCH ONLY</span>` : '';
-      const sidewaysTag = r.sideways_blocked ? `<span style="font-size:7px;color:var(--amber);font-family:var(--raj);margin-left:.3rem">SIDEWAYS</span>` : '';
+      const isBull   = s.direction==='CALL';
+      const tagCls   = isBull ? 'fno-call' : 'fno-put';
+      const rrColor  = s.rr>=2 ? 'var(--green)' : s.rr>=1.5 ? 'var(--amber)' : 'var(--red)';
+      const conf     = s.confidence || 0;
+      const confColor= conf>=80 ? 'var(--green)' : conf>=60 ? 'var(--amber)' : 'var(--red)';
 
-      // Type badge: INDEX vs STOCK
+      // Action flag colour
+      const af = s.action_flag || '';
+      const afColor = af.startsWith('🟢') ? 'var(--green)' : af.startsWith('🟡') ? 'var(--amber)' : 'var(--red)';
+
+      // Setup quality pips (0-5)
+      const sp = s.setup_score || 0;
+      const setupPips = [0,1,2,3,4].map(i=>`<span style="display:inline-block;width:10px;height:4px;border-radius:1px;margin-right:1px;background:${i<sp?(sp>=4?'var(--green)':sp>=3?'var(--amber)':'var(--red)'):'var(--dim)'}"></span>`).join('');
+
+      // Live premium badge
+      const liveBadge = s.premium_live
+        ? `<span style="font-size:7px;background:rgba(0,255,157,.12);color:var(--green);border:1px solid rgba(0,255,157,.3);border-radius:2px;padding:.1rem .3rem;font-family:var(--raj);margin-left:.3rem">🟢 LIVE</span>`
+        : `<span style="font-size:7px;background:rgba(255,170,0,.1);color:var(--amber);border:1px solid rgba(255,170,0,.3);border-radius:2px;padding:.1rem .3rem;font-family:var(--raj);margin-left:.3rem">~EST</span>`;
+
+      // Type badge
       const typeBadge = s.type==='INDEX'
         ? `<span style="font-size:7px;background:rgba(0,229,255,.12);color:var(--cyan);border:1px solid rgba(0,229,255,.3);border-radius:2px;padding:.1rem .3rem;font-family:var(--raj)">INDEX</span>`
         : `<span style="font-size:7px;background:rgba(176,96,255,.1);color:var(--purple);border:1px solid rgba(176,96,255,.25);border-radius:2px;padding:.1rem .3rem;font-family:var(--raj)">STOCK</span>`;
 
-      // Confidence bar colour
-      const conf = s.confidence || 0;
-      const confColor = conf>=80 ? 'var(--green)' : conf>=60 ? 'var(--amber)' : 'var(--red)';
-      const pivotNote = s.pivot_ref ? `<div style="font-size:8px;color:var(--steel);margin-top:.3rem">📐 ${s.pivot_ref}</div>` : '';
+      // IV badge
+      const ivCls = s.iv_level==='LOW' ? 'color:var(--green)' : s.iv_level==='HIGH' ? 'color:var(--red)' : 'color:var(--amber)';
 
-      return `<div class="fno-card">
-        <div style="margin-bottom:.5rem">
+      // Time badge
+      const timeStyle = s.time_ok ? 'color:var(--green)' : 'color:var(--amber)';
+
+      // OI badge
+      const oiStyle = (s.oi_score||0) >= 2 ? 'color:var(--green)' : 'color:var(--amber)';
+
+      // SL / target pct displays
+      const slPct  = s.sl_pct  ? `(${s.sl_pct}%)` : '';
+      const t1Pct  = s.t1_pct  ? `(+${s.t1_pct}%)` : '';
+      const t2Pct  = s.t2_pct  ? `(+${s.t2_pct}%)` : '';
+      const t3Pct  = s.t3_pct  ? `(+${s.t3_pct}%)` : '';
+
+      // Setup flags accordion
+      const allFlags = (s.setup_flags||[]).map(f=>{
+        const fc = f.startsWith('✅')?'color:var(--green)':f.startsWith('❌')?'color:var(--red)':'color:var(--amber)';
+        return `<div style="font-size:8px;${fc};font-family:var(--raj);line-height:1.8">${f}</div>`;
+      }).join('');
+
+      const bearTag     = r.bear_blocked     ? `<span style="font-size:7px;color:var(--red);font-family:var(--raj);margin-left:.3rem">WATCH ONLY</span>` : '';
+      const sidewaysTag = r.sideways_blocked ? `<span style="font-size:7px;color:var(--amber);font-family:var(--raj);margin-left:.3rem">SIDEWAYS</span>` : '';
+
+      return `<div class="fno-card" style="min-width:220px">
+        <!-- Header -->
+        <div style="margin-bottom:.5rem;display:flex;align-items:center;flex-wrap:wrap;gap:.2rem">
           <span class="fno-sym">${s.symbol}</span>
           <span class="fno-tag ${tagCls}">${s.direction}</span>
-          ${typeBadge}
-          <span style="font-family:var(--raj);font-size:8px;color:var(--muted);margin-left:.4rem">${s.equity_signal.split(' ')[0]} ${s.equity_score}/30</span>
-          ${bearTag}${sidewaysTag}
+          ${typeBadge}${liveBadge}${bearTag}${sidewaysTag}
         </div>
-        <div class="fno-row"><span class="fno-key">LTP</span><span class="fno-val">₹${s.ltp.toLocaleString('en-IN')}</span></div>
-        <div class="fno-row"><span class="fno-key">STRIKE</span><span class="fno-val c">₹${s.strike}</span></div>
-        <div class="fno-row"><span class="fno-key">PREM ~</span><span class="fno-val a">₹${s.premium_est}</span></div>
-        <div class="fno-row"><span class="fno-key">LOT SIZE</span><span class="fno-val">${s.lot_size}</span></div>
-        <div class="fno-row"><span class="fno-key">OPT SL</span><span class="fno-val r">₹${s.sl_option}</span></div>
-        <div class="fno-row"><span class="fno-key">OPT TP</span><span class="fno-val g">₹${s.tp_option}</span></div>
+
+        <!-- Action flag -->
+        <div style="font-family:var(--raj);font-size:9px;font-weight:700;${afColor ? 'color:'+afColor : ''};margin-bottom:.4rem;letter-spacing:.05em">${af}</div>
+
+        <!-- Setup quality -->
+        <div style="display:flex;align-items:center;gap:.4rem;margin-bottom:.5rem;border-bottom:1px solid var(--border);padding-bottom:.4rem">
+          <span style="font-size:8px;color:var(--muted);font-family:var(--raj)">SETUP</span>
+          ${setupPips}
+          <span style="font-family:var(--orb);font-size:9px;color:${sp>=4?'var(--green)':sp>=3?'var(--amber)':'var(--red)'}">${sp}/5</span>
+        </div>
+
+        <!-- Underlying info -->
+        <div class="fno-row"><span class="fno-key">UNDERLYING LTP</span><span class="fno-val">₹${s.ltp.toLocaleString('en-IN')}</span></div>
+        <div class="fno-row"><span class="fno-key">STRIKE (ATM)</span><span class="fno-val c">₹${(s.strike||0).toLocaleString('en-IN')}</span></div>
+        <div class="fno-row"><span class="fno-key">EXPIRY</span><span class="fno-val" style="color:var(--steel);font-size:9px">${s.expiry||'—'}</span></div>
+        <div class="fno-row"><span class="fno-key">NFO SYMBOL</span><span class="fno-val" style="color:var(--muted);font-size:8px;font-family:var(--raj)">${s.nfo_symbol||'—'}</span></div>
+
+        <!-- Option trade levels -->
+        <div style="margin-top:.4rem;background:rgba(0,229,255,.03);border:1px solid var(--border);border-radius:2px;padding:.4rem .5rem;margin-bottom:.4rem">
+          <div style="font-family:var(--raj);font-size:8px;font-weight:700;letter-spacing:.12em;color:var(--cyan);margin-bottom:.3rem">OPTION TRADE LEVELS</div>
+          <div class="fno-row" style="border-color:rgba(0,229,255,.15)"><span class="fno-key">ENTRY</span><span class="fno-val" style="color:var(--cyan);font-weight:900;font-size:12px">₹${(s.entry_option||0).toLocaleString('en-IN')}</span></div>
+          <div class="fno-row" style="background:rgba(255,45,85,.05);border-color:rgba(255,45,85,.15)"><span class="fno-key">SL ${slPct}</span><span class="fno-val r" style="font-weight:700">₹${(s.sl_option||0).toLocaleString('en-IN')}</span></div>
+          <div class="fno-row" style="background:rgba(0,255,157,.02)"><span class="fno-key" style="color:#4fc">T1 ${t1Pct}</span><span class="fno-val" style="color:#4fc;font-weight:700">₹${(s.t1_option||0).toLocaleString('en-IN')}</span></div>
+          <div class="fno-row" style="background:rgba(0,255,157,.03)"><span class="fno-key" style="color:var(--green)">T2 ${t2Pct}</span><span class="fno-val g" style="font-weight:700">₹${(s.t2_option||0).toLocaleString('en-IN')}</span></div>
+          <div class="fno-row" style="background:rgba(0,255,157,.05);border-bottom:none"><span class="fno-key" style="color:#0f6">T3 ${t3Pct}</span><span class="fno-val" style="color:#0f6;font-weight:900;text-shadow:0 0 8px rgba(0,255,157,.4)">₹${(s.t3_option||0).toLocaleString('en-IN')}</span></div>
+        </div>
+
+        <!-- R:R + meta -->
         <div class="fno-row"><span class="fno-key">R:R</span><span class="fno-val" style="color:${rrColor};font-weight:700">${s.rr}x</span></div>
+        <div class="fno-row"><span class="fno-key">LOT SIZE</span><span class="fno-val">${s.lot_size}</span></div>
+        <div class="fno-row"><span class="fno-key">IV</span><span class="fno-val" style="${ivCls};font-size:9px">${s.iv_level||'—'}</span></div>
+        <div class="fno-row"><span class="fno-key">TIME</span><span class="fno-val" style="${timeStyle};font-size:8px">${s.time_ok ? '✅ Prime' : '⚠️ Off-window'}</span></div>
+        <div class="fno-row"><span class="fno-key">OI CONF</span><span class="fno-val" style="${oiStyle}">${s.oi_score||0}/3 pts</span></div>
         <div class="fno-row"><span class="fno-key">CONF</span>
           <span class="fno-val" style="display:flex;align-items:center;gap:.4rem">
             <span style="color:${confColor};font-weight:700">${conf.toFixed(0)}%</span>
@@ -1918,10 +1961,18 @@ async function loadFno() {
             </span>
           </span>
         </div>
-        <div class="fno-row"><span class="fno-key">EQ SL→TP</span><span class="fno-val" style="font-size:8px"><span class="r">₹${s.equity_sl}</span> → <span class="g">₹${s.equity_tp}</span></span></div>
-        ${s.smc_bos ? '<div style="font-size:8px;color:#00ffcc;margin-top:.3rem">✅ SMC Break of Structure</div>' : ''}
-        ${s.above_vwap===true ? '<div style="font-size:8px;color:var(--green);margin-top:.2rem">✅ VWAP: Price above demand zone</div>' : (s.above_vwap===false?'<div style="font-size:8px;color:var(--amber);margin-top:.2rem">⚠️ VWAP: Price in supply zone</div>':'')}
-        ${pivotNote}
+
+        <!-- Underlying SL/TP for reference -->
+        <div class="fno-row"><span class="fno-key">UND SL→TP</span>
+          <span class="fno-val" style="font-size:8px"><span class="r">₹${(s.equity_sl||0).toLocaleString('en-IN')}</span> <span style="color:var(--muted)">→</span> <span class="g">₹${(s.equity_tp||0).toLocaleString('en-IN')}</span></span>
+        </div>
+        ${s.pivot_ref ? `<div style="font-size:8px;color:var(--steel);margin-top:.3rem">📐 ${s.pivot_ref}</div>` : ''}
+
+        <!-- Confluence flags -->
+        ${allFlags ? `<div style="margin-top:.4rem;border-top:1px solid var(--border);padding-top:.4rem">${allFlags}</div>` : ''}
+        ${s.smc_bos ? '<div style="font-size:8px;color:#00ffcc;margin-top:.2rem">✅ SMC Break of Structure</div>' : ''}
+        ${s.above_vwap===true  ? '<div style="font-size:8px;color:var(--green);margin-top:.2rem">✅ Price above VWAP</div>' : ''}
+        ${s.vol_surge          ? '<div style="font-size:8px;color:var(--amber);margin-top:.2rem">🔥 Volume surge detected</div>' : ''}
       </div>`;
     }).join('');
   } catch(e) {

@@ -103,7 +103,8 @@ CFG = {
     # ── Universe filters ─────────────────────────────────────
     "MIN_PRICE":       50,
     "MAX_PRICE":       99999,
-    "UNIVERSE_CAP":    500,    # total stocks for deep analysis
+    "UNIVERSE_CAP":    750,    # FIX #3: raised from 500→750. With intraday-movers bucket
+                               # added separately, this ensures mid-caps aren't crowded out.
     "GAP_UP_CAP":      150,    # max gap-ups included (top by gap%); rest from volume
     "GAP_SCAN_ALL":    True,
     "PRELOAD_TOKENS":  True,
@@ -121,13 +122,17 @@ CFG = {
     "EMA_TREND":       200,
     "RSI_PERIOD":      14,
     "RSI_BUY_MIN":     50,
-    "RSI_BUY_MAX":     70,
+    "RSI_BUY_MAX":     80,    # FIX #2: raised from 70→80. Momentum stocks on a 9% day
+                               # easily hit RSI 72-85 — the old cap was penalising
+                               # exactly the strong-trend stocks we want to capture.
     "RSI_EXIT":        40,
     "ATR_PERIOD":      14,
     "ATR_SL":          1.5,
     "ATR_TP":          3.5,
     "ADX_PERIOD":      14,
-    "ADX_MIN":         25,
+    "ADX_MIN":         18,    # FIX #5: lowered from 25→18. ADX lags on day-1 of a new
+                               # breakout move — new breakouts typically show ADX 15-22
+                               # before the trend confirms. 25 was silently killing entry.
     "ST_ATR_PERIOD":   10,
     "ST_MULTIPLIER":   3.0,
     "VOL_MA_PERIOD":   20,
@@ -140,7 +145,9 @@ CFG = {
 
     # ── Fundamental thresholds (Kite proxy — no Yahoo) ───────
     "VOL_ACCUM_X":     1.3,    # 5d vol > 1.3x 20d vol = accumulation
-    "HIGH_52W_PCT":    90,     # price within 90% of 52w high
+    "HIGH_52W_PCT":    75,     # FIX #4: lowered from 90→75. Reversal plays like Adani Green
+                               # are often at 55-70% of 52w high BEFORE the recovery move.
+                               # 90% was filtering out exactly the stocks we want on breakout day.
     "ST_BULL_DAYS":    8,      # supertrend bullish for ≥8 of last 10 days
     "RS_FUND_PCT":     5,      # outperform NIFTY by ≥5% over 20d
     "MACD_POS_DAYS":   4,      # MACD histogram +ve for ≥4 of last 5 days
@@ -435,7 +442,11 @@ class UniverseManager:
                 continue
             gap_pct    = (open_p - prev_close) / prev_close * 100 if prev_close else 0
             change_pct = (ltp - prev_close) / prev_close * 100 if prev_close else 0
-            gap_score  = max(gap_pct, 0)
+            # FIX #1: use max(gap_pct, change_pct) so intraday movers (e.g. Adani Green,
+            # Shriram Finance) that didn't gap at open but surged during the day still rank high.
+            # Previously change_pct was computed but NEVER used in rank_score — causing
+            # strong intraday movers to fall outside the 500-cap and get dropped entirely.
+            move_score = max(gap_pct, change_pct, 0)
             vol_score  = volume / 1_000_000
             candidates.append({
                 "symbol":     sym,
@@ -446,13 +457,20 @@ class UniverseManager:
                 "gap_pct":    round(gap_pct, 2),
                 "change_pct": round(change_pct, 2),
                 "volume":     volume,
-                "rank_score": gap_score * 2 + vol_score,
+                "rank_score": move_score * 2 + vol_score,
             })
         candidates.sort(key=lambda x: x["rank_score"], reverse=True)
 
         # Separate gap-ups and non-gap-ups
         gap_ups_all = [c for c in candidates if c["gap_pct"] >= CFG["GAP_UP_MIN_PCT"]]
-        rest        = [c for c in candidates if c["gap_pct"] < CFG["GAP_UP_MIN_PCT"]]
+        # FIX #3b: also force-include strong intraday movers (change_pct >= 4%) even if
+        # they didn't gap at open — these are the Adani Green / Shriram Finance class of moves
+        intraday_movers = [c for c in candidates
+                           if c["gap_pct"] < CFG["GAP_UP_MIN_PCT"]
+                           and c["change_pct"] >= 4.0]
+        rest        = [c for c in candidates
+                       if c["gap_pct"] < CFG["GAP_UP_MIN_PCT"]
+                       and c["change_pct"] < 4.0]
 
         # Sort gap-ups by gap% descending so we keep the strongest ones
         gap_ups_all.sort(key=lambda x: x["gap_pct"], reverse=True)
@@ -464,14 +482,20 @@ class UniverseManager:
         gap_up_cap  = CFG.get("GAP_UP_CAP", 150)
         gap_ups     = gap_ups_all[:gap_up_cap]
 
-        # Fill remaining slots with top-volume non-gap-up stocks
-        remaining   = max(0, CFG["UNIVERSE_CAP"] - len(gap_ups))
+        # Intraday movers always included (capped at 100 to be safe)
+        intraday_movers.sort(key=lambda x: x["change_pct"], reverse=True)
+        intraday_movers = intraday_movers[:100]
+
+        # Fill remaining slots with top-volume non-gap/non-intraday stocks
+        already = len(gap_ups) + len(intraday_movers)
+        remaining   = max(0, CFG["UNIVERSE_CAP"] - already)
         rest_top    = rest[:remaining]
 
-        final = gap_ups + rest_top
+        final = gap_ups + intraday_movers + rest_top
         log.info(
             f"  [Universe] {len(candidates)} candidates → "
             f"top {len(gap_ups)} gap-ups (of {len(gap_ups_all)} total, capped at {gap_up_cap}) + "
+            f"{len(intraday_movers)} intraday movers (≥4% change) + "
             f"{len(rest_top)} top-volume = {len(final)} for deep scan"
         )
         return final
@@ -1827,3 +1851,380 @@ def build_score(tech_s, tech_f, brk_s, brk_f,
             "fibonacci":     {"score": fib_s,  "max": 3, "flags": fib_f},
         }
     }
+
+
+# ═════════════════════════════════════════════════════════════
+# ███  OPTION ENGINE (PRO)  ███████████████████████████████████
+# ─────────────────────────────────────────────────────────────
+# Institutional-grade F&O signal engine.
+#
+# Key upgrades over previous ATR-based estimation:
+#   1. REAL option LTP fetched from Kite NFO segment
+#   2. Correct NFO tradingsymbol built from live expiry date
+#   3. Structure-based SL (delta-weighted from underlying swing)
+#   4. Professional targets: T1=+30%, T2=+60%, T3=+100%
+#      anchored to underlying pivot structure, not fixed %
+#   5. IV assessment: cheap / fair / expensive
+#   6. Time-of-day filter: 9:45–11:30, 13:45–15:00
+#   7. OI confirmation scoring (from NSE option chain)
+#   8. Setup quality score (0–5) visible on every card
+# ═════════════════════════════════════════════════════════════
+class OptionEngine:
+
+    # Strike step sizes per underlying
+    _STEPS = {
+        "NIFTY": 50, "BANKNIFTY": 100, "FINNIFTY": 50,
+        "MIDCAP": 50, "SENSEX": 100,
+    }
+
+    # ── Expiry helpers ────────────────────────────────────────
+    @staticmethod
+    def next_weekly_expiry(from_date=None, weekday: int = 3) -> "datetime.date":
+        """
+        Next weekly expiry.  Kite weekly options expire on Thursday (weekday=3).
+        If today IS Thursday, returns NEXT Thursday (next week's expiry) so we
+        don't accidentally try to price a same-day expiry with near-zero theta.
+        """
+        from datetime import date, timedelta
+        d = (from_date or datetime.now().date())
+        days = (weekday - d.weekday()) % 7
+        if days == 0:          # today is expiry day — use next week's
+            days = 7
+        return d + timedelta(days=days)
+
+    @staticmethod
+    def build_nfo_symbol(underlying: str, expiry,
+                         strike: int, opt_type: str) -> str:
+        """
+        Construct Kite NFO tradingsymbol for weekly options.
+        Weekly format: NIFTY + YY + M_CODE + DD + strike + CE/PE
+          where M_CODE is 1-9 for Jan-Sep, O/N/D for Oct/Nov/Dec
+          e.g. NIFTY2641024000CE  = NIFTY, 2026, Apr=4, 10th, 24000, CE
+        Monthly format (when weekly not found): NIFTY24APR24000CE
+        Returns the weekly symbol; caller tries monthly as fallback.
+        """
+        from datetime import date as _d
+        if isinstance(expiry, datetime):
+            expiry = expiry.date()
+        yy = expiry.strftime("%y")               # "26"
+        mm = expiry.month                         # 4
+        dd = expiry.strftime("%d")                # "10"
+        month_codes = {10: "O", 11: "N", 12: "D"}
+        m_code = month_codes.get(mm, str(mm))    # "4"
+        weekly  = f"{underlying}{yy}{m_code}{dd}{int(strike)}{opt_type}"
+        monthly_months = ["JAN","FEB","MAR","APR","MAY","JUN",
+                          "JUL","AUG","SEP","OCT","NOV","DEC"]
+        monthly = f"{underlying}{yy}{monthly_months[mm-1]}{int(strike)}{opt_type}"
+        return weekly, monthly
+
+    @staticmethod
+    def fetch_real_ltp(kl: "KiteLayer", underlying: str,
+                       strike: int, opt_type: str) -> Tuple[Optional[float], str, str]:
+        """
+        Fetch REAL option LTP from Kite NFO.
+        Tries next weekly expiry first, then next monthly as fallback.
+        Returns (ltp_or_None, symbol_used, expiry_label).
+        """
+        expiry = OptionEngine.next_weekly_expiry()
+        weekly_sym, monthly_sym = OptionEngine.build_nfo_symbol(
+            underlying, expiry, strike, opt_type
+        )
+        for sym in [weekly_sym, monthly_sym]:
+            try:
+                key  = f"NFO:{sym}"
+                data = kl._k.ltp([key])
+                if data and key in data:
+                    ltp = float(data[key]["last_price"])
+                    if ltp > 0:
+                        # label: "13 Apr (weekly)" or "24 Apr (monthly)"
+                        exp_label = f"{expiry.strftime('%d %b')} {'(weekly)' if sym==weekly_sym else '(monthly)'}"
+                        log.info(f"  [Option] Real LTP: {sym} = ₹{ltp:.1f}")
+                        return ltp, sym, exp_label
+            except Exception as e:
+                log.warning(f"  [Option] LTP fetch {sym}: {e}")
+        log.warning(f"  [Option] Could not fetch real LTP for {underlying} {strike} {opt_type} — using IV model")
+        return None, weekly_sym, expiry.strftime("%d %b (weekly)")
+
+    @staticmethod
+    def get_atm_strike(ltp: float, underlying: str = "NIFTY") -> int:
+        step = OptionEngine._STEPS.get(underlying, 50)
+        return int(round(ltp / step) * step)
+
+    # ── Premium estimation (fallback when real LTP fails) ────
+    @staticmethod
+    def estimate_premium(ltp: float, underlying: str, vix: float) -> float:
+        """
+        VIX-based ATM premium estimation for when Kite LTP fetch fails.
+        Uses: premium ≈ Δ × σ_daily × √DTE × LTP
+          Δ=0.5 (ATM), DTE=4 (weekly), σ=VIX/√252
+        Floors at 0.8% of LTP (NIFTY) or 1.2% (stocks).
+        """
+        dte    = 4
+        sigma  = (vix / 100) / (252 ** 0.5)
+        prem   = round(0.5 * sigma * (dte ** 0.5) * ltp, 1)
+        floor  = ltp * (0.008 if underlying in ("NIFTY","BANKNIFTY","FINNIFTY") else 0.012)
+        return max(prem, round(floor, 1))
+
+    # ── IV assessment ─────────────────────────────────────────
+    @staticmethod
+    def iv_assessment(actual_prem: float, ltp: float,
+                      vix: float, dte: int = 4) -> Tuple[str, str]:
+        """
+        Compare actual premium to VIX-implied fair value.
+        Returns (level, flag_string).
+        level: "LOW" | "FAIR" | "HIGH"
+        HIGH IV = premium crush risk → avoid buying.
+        """
+        sigma  = (vix / 100) / (252 ** 0.5)
+        fair   = round(0.5 * sigma * (dte ** 0.5) * ltp, 1)
+        if fair <= 0:
+            return "FAIR", "⚠️ IV calc skipped (VIX=0)"
+        ratio  = actual_prem / fair
+        if ratio <= 0.85:
+            return "LOW",  "✅ IV cheap — good premium to buy"
+        elif ratio <= 1.35:
+            return "FAIR", "✅ IV fair — reasonable entry"
+        else:
+            return "HIGH", f"⚠️ IV elevated ({ratio:.1f}× fair) — premium crush risk on reversal"
+
+    # ── Structure-based trade levels ─────────────────────────
+    @staticmethod
+    def compute_trade_levels(entry: float,
+                             underlying_ltp: float,
+                             underlying_sl: float,
+                             underlying_tp: float) -> dict:
+        """
+        Professional option trade levels derived from underlying structure.
+
+        SL logic (3-layer):
+          Layer 1 — Delta-weighted: underlying_risk × 0.5 (ATM delta)
+          Layer 2 — % cap: never lose >35% of premium (IV crush / whipsaw guard)
+          Final SL = whichever gives HIGHER exit price (tighter stop)
+
+        Target logic:
+          T1 = when underlying covers 35% of SL→TP distance (+~30% on option)
+          T2 = when underlying covers 65% of SL→TP distance (+~60% on option)
+          T3 = when underlying hits TP level       (+~100% on option, max for intraday)
+          Also enforced as minimum % multipliers so targets are never trivial.
+        """
+        if entry <= 0:
+            return {"sl": 0, "t1": 0, "t2": 0, "t3": 0,
+                    "sl_pct": 0, "t1_pct": 0, "t2_pct": 0, "t3_pct": 0,
+                    "rr": 0}
+        delta          = 0.50
+        underlying_risk = max(abs(underlying_ltp - underlying_sl), 1.0)
+        underlying_move = max(abs(underlying_tp  - underlying_ltp),  1.0)
+
+        # SL
+        sl_delta = round(entry - delta * underlying_risk, 1)
+        sl_pct   = round(entry * 0.65, 1)            # hard floor: max 35% loss
+        sl       = max(sl_delta, sl_pct, 1.0)
+
+        # Targets
+        t1 = max(round(entry + delta * underlying_move * 0.35, 1), round(entry * 1.30, 1))
+        t2 = max(round(entry + delta * underlying_move * 0.65, 1), round(entry * 1.60, 1))
+        t3 = max(round(entry + delta * underlying_move * 1.00, 1), round(entry * 2.00, 1))
+
+        rr = round((t3 - entry) / (entry - sl), 1) if (entry - sl) > 0 else 0
+        return {
+            "sl":  sl,  "t1": t1,  "t2": t2,  "t3": t3,
+            "sl_pct":  round((sl - entry) / entry * 100, 1),
+            "t1_pct":  round((t1 - entry) / entry * 100, 1),
+            "t2_pct":  round((t2 - entry) / entry * 100, 1),
+            "t3_pct":  round((t3 - entry) / entry * 100, 1),
+            "rr": rr,
+        }
+
+    # ── Time-of-day filter ────────────────────────────────────
+    @staticmethod
+    def time_window_check() -> Tuple[bool, str]:
+        """
+        Returns (is_ideal_window, flag_message).
+        Ideal for F&O entry:
+          09:45 – 11:30  — Trend establishment window (opening vol settled)
+          13:45 – 15:00  — Afternoon trend / expiry-day move window
+        Avoid:
+          09:15 – 09:44  — Opening volatility spike (unpredictable)
+          11:31 – 13:44  — Lunch chop (low volume, random moves)
+          15:01 – 15:30  — Closing auction noise
+        """
+        now = datetime.now()
+        m   = now.hour * 60 + now.minute
+        if   m <  9*60+15:  return False, "⏳ Pre-market — not open yet"
+        elif m <  9*60+45:  return False, "⚠️ Opening volatility (9:15-9:44) — wait"
+        elif m <= 11*60+30: return True,  "✅ Prime window: 9:45–11:30 (trend window)"
+        elif m <= 13*60+44: return False, "⚠️ Lunch chop (11:31–1:44) — avoid new entries"
+        elif m <= 15*60+00: return True,  "✅ Prime window: 1:45–3:00 (afternoon trend)"
+        else:               return False, "⛔ After 3:00 PM — avoid (closing noise)"
+
+    # ── OI confirmation score ─────────────────────────────────
+    @staticmethod
+    def oi_score(oc_data: dict, direction: str) -> Tuple[int, List[str]]:
+        """
+        Score option setup based on OI data (from NSE option chain).
+        Max 3 points:
+          +1  PCR aligned with direction (PCR>0.85 for CALL, PCR<0.7 for PUT)
+          +1  OI build-up on right side (PE OI rising for CALL trade)
+          +1  Not at extreme PCR (no contra squeeze risk: 0.5 < PCR < 1.5)
+        """
+        score = 0
+        flags = []
+        pcr   = float(oc_data.get("pcr", 1.0) or 1.0)
+        pe_oi = int(oc_data.get("total_pe_oi", 0) or 0)
+        ce_oi = int(oc_data.get("total_ce_oi", 0) or 0)
+
+        # P1: PCR direction alignment
+        if direction == "CALL":
+            if pcr >= 0.85:
+                score += 1; flags.append(f"✅ OI: PCR {pcr:.2f} — Put writers bullish (CALL favoured)")
+            elif pcr >= 0.70:
+                flags.append(f"⚠️ OI: PCR {pcr:.2f} — neutral, watch carefully")
+            else:
+                flags.append(f"❌ OI: PCR {pcr:.2f} — Call heavy (bearish OI)")
+        else:
+            if pcr <= 0.70:
+                score += 1; flags.append(f"✅ OI: PCR {pcr:.2f} — Call writers bearish (PUT favoured)")
+            elif pcr <= 0.85:
+                flags.append(f"⚠️ OI: PCR {pcr:.2f} — neutral, watch carefully")
+            else:
+                flags.append(f"❌ OI: PCR {pcr:.2f} — Put heavy (bullish OI bias)")
+
+        # P2: OI dominance on right side
+        if ce_oi > 0 and pe_oi > 0:
+            if direction == "CALL" and pe_oi > ce_oi:
+                score += 1; flags.append(f"✅ OI: PE OI ({pe_oi//1000}k) > CE OI ({ce_oi//1000}k) — smart money on CALL side")
+            elif direction == "PUT" and ce_oi > pe_oi:
+                score += 1; flags.append(f"✅ OI: CE OI ({ce_oi//1000}k) > PE OI ({pe_oi//1000}k) — smart money on PUT side")
+            else:
+                flags.append(f"⚠️ OI: OI not confirming direction")
+
+        # P3: Avoid extreme squeeze zones
+        if 0.50 <= pcr <= 1.50:
+            score += 1; flags.append(f"✅ OI: PCR in healthy range (no squeeze risk)")
+        else:
+            flags.append(f"⚠️ OI: PCR extreme ({pcr:.2f}) — squeeze / reversal risk")
+
+        return score, flags
+
+    # ── Master signal builder ─────────────────────────────────
+    @staticmethod
+    def build_signal(kl: "KiteLayer",
+                     underlying: str,
+                     ltp: float,
+                     direction: str,
+                     underlying_sl: float,
+                     underlying_tp: float,
+                     vix: float,
+                     oc_data: dict,
+                     equity_score: int = 0,
+                     equity_signal: str = "",
+                     pivot_data: dict = None) -> dict:
+        """
+        Full institutional F&O signal.  Called per instrument.
+        Returns a rich dict consumed by the frontend card.
+        """
+        ot  = "CE" if direction == "CALL" else "PE"
+        atm = OptionEngine.get_atm_strike(ltp, underlying)
+
+        # 1. Real option LTP from Kite
+        real_ltp, nfo_sym, exp_label = OptionEngine.fetch_real_ltp(kl, underlying, atm, ot)
+        entry     = real_ltp if real_ltp else OptionEngine.estimate_premium(ltp, underlying, vix)
+        is_live   = real_ltp is not None
+
+        # 2. Trade levels (structure-based)
+        levels    = OptionEngine.compute_trade_levels(entry, ltp, underlying_sl, underlying_tp)
+
+        # 3. IV assessment
+        iv_level, iv_flag = OptionEngine.iv_assessment(entry, ltp, vix)
+
+        # 4. Time window
+        time_ok, time_flag = OptionEngine.time_window_check()
+
+        # 5. OI score
+        oi_pts, oi_flags = OptionEngine.oi_score(oc_data, direction)
+
+        # 6. Setup quality score (0–5)
+        setup_pts = 0
+        setup_flags = []
+        if equity_score >= 20:
+            setup_pts += 2; setup_flags.append("✅ Equity: STRONG BUY signal")
+        elif equity_score >= 13:
+            setup_pts += 1; setup_flags.append("✅ Equity: BUY signal")
+        else:
+            setup_flags.append("⚠️ Equity score borderline")
+        if iv_level != "HIGH":
+            setup_pts += 1; setup_flags.append("✅ IV: Not expensive")
+        else:
+            setup_flags.append("❌ IV: Elevated — premium crush risk")
+        if time_ok:
+            setup_pts += 1; setup_flags.append("✅ Time: Prime entry window")
+        else:
+            setup_flags.append(f"⚠️ Time: {time_flag}")
+        if oi_pts >= 2:
+            setup_pts += 1; setup_flags.append("✅ OI: Confirming direction")
+        else:
+            setup_flags.append("⚠️ OI: Weak confirmation")
+
+        # Pivot context
+        pivot_ref = None
+        if pivot_data and not pivot_data.get("error"):
+            near  = pivot_data.get("nearest_level", "PP")
+            near_p = pivot_data.get("nearest_price", ltp)
+            pivot_ref = f"Near {near} ₹{near_p:,.0f}"
+
+        # Trade note: actionability + caveats
+        action_flag = "🟢 ACTIONABLE" if (setup_pts >= 3 and iv_level != "HIGH" and time_ok) \
+                      else "🟡 REVIEW BEFORE ENTRY" if setup_pts >= 2 \
+                      else "🔴 SKIP — low confluence"
+
+        return {
+            # Core identity
+            "underlying":      underlying,
+            "direction":       direction,
+            "option_type":     ot,
+            "strike":          atm,
+            "nfo_symbol":      nfo_sym,
+            "expiry":          exp_label,
+
+            # Prices
+            "ltp":             round(ltp, 2),
+            "entry_option":    round(entry, 1),
+            "premium_live":    is_live,             # True = from Kite, False = IV estimate
+
+            # Trade levels
+            "sl_option":       levels["sl"],
+            "t1_option":       levels["t1"],
+            "t2_option":       levels["t2"],
+            "t3_option":       levels["t3"],
+            "sl_pct":          levels["sl_pct"],
+            "t1_pct":          levels["t1_pct"],
+            "t2_pct":          levels["t2_pct"],
+            "t3_pct":          levels["t3_pct"],
+            "rr":              levels["rr"],
+
+            # Underlying anchors
+            "equity_sl":       round(underlying_sl, 2),
+            "equity_tp":       round(underlying_tp, 2),
+
+            # IV
+            "iv_level":        iv_level,
+            "iv_flag":         iv_flag,
+
+            # OI
+            "oi_score":        oi_pts,
+            "oi_flags":        oi_flags,
+
+            # Time
+            "time_ok":         time_ok,
+            "time_flag":       time_flag,
+
+            # Setup quality
+            "setup_score":     setup_pts,
+            "setup_flags":     setup_flags + oi_flags,
+            "action_flag":     action_flag,
+
+            # Equity context
+            "equity_score":    equity_score,
+            "equity_signal":   equity_signal,
+            "pivot_ref":       pivot_ref,
+        }
