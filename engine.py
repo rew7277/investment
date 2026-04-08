@@ -70,6 +70,27 @@ def load_token() -> str:
         log.warning(f"  [Auth] Token file read error: {e}")
     return ""
 
+
+def is_token_fresh(max_age_hours: int = 8) -> bool:
+    """
+    Returns True if the saved token was generated within max_age_hours.
+    Kite tokens expire at midnight IST; 8h is a safe intraday window.
+    Checks env-var tokens always as 'fresh' (Railway secrets are permanent).
+    """
+    if os.environ.get("KITE_ACCESS_TOKEN", ""):
+        return True          # env-var token managed externally
+    try:
+        with open(TOKEN_FILE) as f:
+            data = json.load(f)
+        saved_at = datetime.fromisoformat(data.get("saved_at", ""))
+        age = (datetime.now() - saved_at).total_seconds() / 3600
+        fresh = age <= max_age_hours
+        if not fresh:
+            log.warning(f"  [Auth] Token age {age:.1f}h > {max_age_hours}h — may be stale")
+        return fresh
+    except Exception:
+        return False
+
 # ─────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────
@@ -383,10 +404,19 @@ class UniverseManager:
         return df[["symbol", "token"]].to_dict("records")
 
     def filter_for_deep_scan(self, quote_data: dict) -> List[dict]:
+        # Suffixes that indicate non-equity instruments — skip them
+        EXCLUDE_SUFFIXES = (
+            "-BE", "-BL", "-BZ", "-IL", "-SM", "-GS",
+            "NIFTY", "SENSEX", "BANKNIFTY", "FINNIFTY",
+        )
         df = self.get_universe()
         token_map = dict(zip(df["symbol"], df["token"]))
         candidates = []
         for sym, q in quote_data.items():
+            # Skip index derivatives, bond ETFs, illiquid instruments
+            if any(sym.upper().endswith(sfx) or sym.upper().startswith(sfx)
+                   for sfx in EXCLUDE_SUFFIXES):
+                continue
             ltp        = q.get("ltp", 0)
             prev_close = q.get("prev_close", 0)
             volume     = q.get("volume", 0)
@@ -429,9 +459,23 @@ class NSEClient:
     }
 
     def __init__(self):
-        self.sess = requests.Session()
+        self.sess    = requests.Session()
         self.sess.headers.update(self.HEADERS)
+        self._cache  = {}          # prefetch cache: key → data
         self._warm_up()
+
+    def prefetch_scan_data(self):
+        """
+        Batch-warm the NSE session and cache VIX, FII/DII, block-deal data
+        before the per-stock loop begins.  Delivery% is still fetched per-stock
+        but with a short timeout since the session is already warm.
+        Call once between STEP 4 and STEP 5.
+        """
+        log.info("  [NSE] Prefetching VIX / FII / block-deals …")
+        self._cache["vix"]         = self._get("allIndices")
+        self._cache["fii"]         = self._get("fiidiiTradeReact")
+        self._cache["block_deals"] = self._get("block-deal")
+        log.info("  [NSE] Prefetch complete — delivery% will use warmed session")
 
     def _warm_up(self):
         try:
@@ -471,9 +515,21 @@ class NSEClient:
         return res
 
     def get_delivery_pct(self, symbol: str) -> dict:
-        data = self._get("deliveryToTrading", {"series": "EQ", "symbol": symbol})
-        res  = {"delivery_pct": 0.0, "institutional": False}
+        res = {"delivery_pct": 0.0, "institutional": False}
         try:
+            r = self.sess.get(
+                f"{self.BASE}/api/deliveryToTrading",
+                params={"series": "EQ", "symbol": symbol},
+                timeout=3,      # fast — session already warm from prefetch
+            )
+            if r.status_code == 401:
+                self._warm_up()
+                r = self.sess.get(
+                    f"{self.BASE}/api/deliveryToTrading",
+                    params={"series": "EQ", "symbol": symbol},
+                    timeout=3,
+                )
+            data = r.json() if r.ok else {}
             if data and "data" in data and data["data"]:
                 pct = float(data["data"][-1].get("deliveryToTradedQty", 0))
                 res["delivery_pct"]  = pct
@@ -515,7 +571,8 @@ class NSEClient:
         return 15.0
 
     def get_block_deals(self, symbol: str) -> dict:
-        data = self._get("block-deal")
+        # Use prefetched cache if available — avoids one NSE call per stock
+        data = self._cache.get("block_deals") or self._get("block-deal")
         res  = {"block_buy": False, "deals": []}
         try:
             if data and "data" in data:

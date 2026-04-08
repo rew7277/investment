@@ -39,7 +39,7 @@ from engine import (
     TechnicalEngine, FundamentalEngine, BreakoutScanner,
     InstitutionalEngine, MarketRegime, RiskManager,
     SMCEngine, FibonacciEngine,
-    build_score, save_token, load_token
+    build_score, save_token, load_token, is_token_fresh
 )
 
 try:
@@ -142,6 +142,14 @@ def run_full_scan():
     log.info(f"  FULL NSE INSTITUTIONAL SCAN — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     log.info(f"{'═'*65}")
 
+    # ── Token freshness gate ───────────────────────────────────
+    if not is_token_fresh(max_age_hours=8):
+        warn_msg = ("⚠️  Kite token may be stale (>8h old). "
+                    "Visit /kite-login to refresh before market open.")
+        log.warning(f"  [Auth] {warn_msg}")
+        STATE["errors"].append({"time": str(datetime.now()), "msg": warn_msg})
+        # Do NOT abort — the token might still work; let Kite decide
+
     try:
         # ── INIT KITE ─────────────────────────────────────────
         if kl is None:
@@ -221,7 +229,19 @@ def run_full_scan():
         bear_market   = (reg_label.startswith("BEAR"))
         extreme_fear  = (vix > 30)
         regime_ok     = not extreme_fear          # only block when VIX > 30
-        bear_premium  = 2 if bear_market else 0   # require 2 extra points in bear
+        bear_premium  = 4 if bear_market else 0   # require 4 extra points in bear
+
+        # ─────────────────────────────────────────────────────
+        # STEP 4b: NSE Data Prefetch
+        # Warms the NSE session + caches FII / block-deal data
+        # so the per-stock loop reuses it instead of hitting NSE
+        # once per stock for block-deals (~500 redundant calls).
+        # ─────────────────────────────────────────────────────
+        log.info("  STEP 4b — NSE prefetch (block-deals cache)…")
+        try:
+            nse.prefetch_scan_data()
+        except Exception as _pe:
+            log.warning(f"  [NSE] Prefetch failed (non-fatal): {_pe}")
 
         # ─────────────────────────────────────────────────────
         # STEP 5: Get available capital from Kite
@@ -649,6 +669,29 @@ def auth_status():
     return jsonify(STATE["auth"])
 
 
+@app.route("/api/token-status")
+def token_status():
+    """Quick endpoint — returns token age and freshness without a Kite call."""
+    fresh = is_token_fresh(max_age_hours=8)
+    token_saved = STATE["auth"].get("token_saved")
+    age_h = None
+    try:
+        import json as _json
+        with open("/tmp/kite_token.json") as _f:
+            _d = _json.load(_f)
+        from datetime import datetime as _dt
+        age_h = round((_dt.now() - _dt.fromisoformat(_d["saved_at"])).total_seconds() / 3600, 1)
+    except Exception:
+        pass
+    return jsonify({
+        "fresh":       fresh,
+        "age_hours":   age_h,
+        "status":      STATE["auth"]["status"],
+        "login_url":   STATE["auth"].get("login_url"),
+        "user_name":   STATE["auth"].get("user_name"),
+    })
+
+
 def _auth_page(title: str, message: str, success: bool) -> str:
     colour = "#00ff9d" if success else "#ff2d55"
     return f"""<!DOCTYPE html>
@@ -690,7 +733,11 @@ def start_scheduler():
 
 
 def probe_existing_token():
-    """Validate saved token silently on startup. Doesn't crash if missing."""
+    """
+    Validate saved token silently on startup.
+    Also warns if the token is older than 8 hours (stale risk).
+    Doesn't crash if missing — dashboard shows auth banner.
+    """
     global kl
     STATE["auth"]["login_url"] = build_login_url()
     token = CFG["ACCESS_TOKEN"]
@@ -698,8 +745,14 @@ def probe_existing_token():
         STATE["auth"]["status"] = "missing"
         log.warning("  [Auth] ⚠️  No token — visit /kite-login to authenticate")
         return
+    # Freshness warning before we even try Kite
+    if not is_token_fresh(max_age_hours=8):
+        STATE["auth"]["status"] = "stale"
+        log.warning("  [Auth] ⚠️  Token is >8h old — may have expired. Visit /kite-login")
     try:
         kl = init_kite(token)
+        if STATE["auth"]["status"] == "stale":
+            pass   # Kite confirmed it; keep stale label so dashboard can warn
         log.info("  [Auth] ✅ Token valid — ready to scan")
     except Exception as e:
         log.warning(f"  [Auth] Token invalid ({e}) — visit /kite-login")
@@ -1159,6 +1212,16 @@ tr.selected td { background: rgba(0,229,255,.06); }
   </div>
 </div>
 
+<!-- TOKEN STALE BANNER — hidden by default, shown by JS when auth.status==='stale' -->
+<div id="token-banner" style="display:none;position:sticky;top:48px;z-index:99;
+  background:rgba(255,170,0,.12);border-bottom:1px solid rgba(255,170,0,.35);
+  padding:.45rem 1.2rem;font-family:var(--raj);font-size:10px;font-weight:600;
+  color:var(--amber);letter-spacing:.04em;text-align:center">
+  ⚠ &nbsp;Kite token may be stale (&gt;8h old).
+  Scan results could fail.&nbsp;
+  <a href="/kite-login" style="color:var(--amber);text-decoration:underline">Re-login now →</a>
+</div>
+
 <main>
 
 <!-- STAT CARDS -->
@@ -1455,15 +1518,24 @@ function render(d) {
 
   // Auth badge
   const auth = d.auth || {};
-  const authOk  = document.getElementById('auth-ok');
-  const authBtn = document.getElementById('auth-btn');
+  const authOk     = document.getElementById('auth-ok');
+  const authBtn    = document.getElementById('auth-btn');
+  const tokenBanner = document.getElementById('token-banner');
   if (auth.status === 'ok') {
-    authOk.style.display  = 'inline-block';
-    authOk.title          = `${auth.user_name} (${auth.user_id})`;
-    authBtn.style.display = 'none';
+    authOk.style.display   = 'inline-block';
+    authOk.title           = `${auth.user_name} (${auth.user_id})`;
+    authBtn.style.display  = 'none';
+    tokenBanner.style.display = 'none';
+  } else if (auth.status === 'stale') {
+    authOk.style.display   = 'inline-block';
+    authOk.title           = `${auth.user_name} — token may be stale`;
+    authOk.style.color     = 'var(--amber)';
+    authBtn.style.display  = 'none';
+    tokenBanner.style.display = 'block';
   } else {
-    authOk.style.display  = 'none';
-    authBtn.style.display = 'inline-block';
+    authOk.style.display   = 'none';
+    authBtn.style.display  = 'inline-block';
+    tokenBanner.style.display = 'none';
   }
 
   if(selSym) {
