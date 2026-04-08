@@ -10,6 +10,7 @@ import os, json, logging, threading, math
 from datetime import datetime, timedelta
 from flask import Flask, jsonify, render_template_string, redirect, request
 import numpy as np
+import pandas as pd
 
 
 def _np_sanitize(obj):
@@ -252,8 +253,8 @@ def run_full_scan():
 
         nifty_df     = _fetch_index(CFG["NIFTY_TOKEN"],     "NIFTY 50")
         banknifty_df = _fetch_index(CFG["BANKNIFTY_TOKEN"], "BANKNIFTY")
-        finnifty_df  = _fetch_index(CFG.get("FINNIFTY_TOKEN", 257801), "FINNIFTY")
-        midcap_df    = _fetch_index(CFG.get("MIDCAP_TOKEN",  288009),  "MIDCAP 150")
+        finnifty_df  = _fetch_index(CFG["FINNIFTY_TOKEN"],  "FINNIFTY")
+        midcap_df    = _fetch_index(CFG["MIDCAP_TOKEN"],    "MIDCAP 150")
 
         log_kite_call(
             "historical_data",
@@ -262,9 +263,21 @@ def run_full_scan():
         )
 
         vix = nse.get_india_vix()
+        if vix is None:
+            # Fallback: Kite quote for India VIX index token
+            try:
+                vix_quote = kl.get_batch_quotes(["INDIA VIX"])
+                vix_data  = vix_quote.get("INDIA VIX", {})
+                if vix_data.get("ltp"):
+                    vix = round(float(vix_data["ltp"]), 2)
+                    log.info(f"  [Kite] India VIX = {vix:.2f} (from Kite quote fallback)")
+            except Exception as _ve:
+                log.warning(f"  [Kite] VIX quote fallback failed: {_ve}")
+        if vix is None:
+            log.warning("  [Regime] VIX completely unavailable — regime check will skip fear gate")
         fii = nse.get_fii_dii()
         oc  = nse.get_option_chain_pcr("NIFTY")
-        STATE["vix"]     = vix
+        STATE["vix"]     = vix if vix is not None else 0.0
         STATE["fii_dii"] = {**fii, "pcr": oc.get("pcr", "—")}
 
         reg_s, reg_f, regime_ok, reg_label = MarketRegime.check(
@@ -642,7 +655,6 @@ def paper_state():
     }))
 
 
-@app.route("/api/scan", methods=["POST"])
 def trigger_scan():
     if not STATE["scanning"]:
         threading.Thread(target=run_full_scan, daemon=True).start()

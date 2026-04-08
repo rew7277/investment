@@ -103,15 +103,17 @@ CFG = {
     # ── Universe filters ─────────────────────────────────────
     "MIN_PRICE":       50,
     "MAX_PRICE":       99999,
-    "UNIVERSE_CAP":    500,
+    "UNIVERSE_CAP":    500,    # total stocks for deep analysis
+    "GAP_UP_CAP":      150,    # max gap-ups included (top by gap%); rest from volume
     "GAP_SCAN_ALL":    True,
     "PRELOAD_TOKENS":  True,
 
     # ── Index tokens (Kite) ───────────────────────────────────
-    "NIFTY_TOKEN":     256265,
-    "BANKNIFTY_TOKEN": 260105,
-    "FINNIFTY_TOKEN":  257801,
-    "MIDCAP_TOKEN":    288009,   # NIFTY MIDCAP 150
+    "NIFTY_TOKEN":       256265,   # NIFTY 50
+    "BANKNIFTY_TOKEN":   260105,   # BANK NIFTY
+    "FINNIFTY_TOKEN":    257801,   # FINNIFTY
+    "MIDCAP_TOKEN":      288009,   # NIFTY MIDCAP 150
+    "INDIA_VIX_TOKEN":   264969,   # India VIX — fetched via Kite quote
 
     # ── Technical params ──────────────────────────────────────
     "EMA_FAST":        20,
@@ -441,11 +443,31 @@ class UniverseManager:
                 "rank_score": gap_score * 2 + vol_score,
             })
         candidates.sort(key=lambda x: x["rank_score"], reverse=True)
-        gap_ups = [c for c in candidates if c["gap_pct"] >= CFG["GAP_UP_MIN_PCT"]]
-        rest    = [c for c in candidates if c["gap_pct"] < CFG["GAP_UP_MIN_PCT"]]
-        final   = gap_ups + rest[:max(0, CFG["UNIVERSE_CAP"] - len(gap_ups))]
-        log.info(f"  [Universe] {len(candidates)} stocks → {len(gap_ups)} gap-ups + "
-                 f"{len(final)-len(gap_ups)} top volume = {len(final)} for deep scan")
+
+        # Separate gap-ups and non-gap-ups
+        gap_ups_all = [c for c in candidates if c["gap_pct"] >= CFG["GAP_UP_MIN_PCT"]]
+        rest        = [c for c in candidates if c["gap_pct"] < CFG["GAP_UP_MIN_PCT"]]
+
+        # Sort gap-ups by gap% descending so we keep the strongest ones
+        gap_ups_all.sort(key=lambda x: x["gap_pct"], reverse=True)
+
+        # ── KEY FIX: cap gap-ups at GAP_UP_CAP (default 150) ──
+        # On market-wide gap-up days (e.g. post-holiday 1500+ stocks gap),
+        # including every gap-up would make the scan take hours.
+        # We keep only the top GAP_UP_CAP strongest gap-ups by gap%.
+        gap_up_cap  = CFG.get("GAP_UP_CAP", 150)
+        gap_ups     = gap_ups_all[:gap_up_cap]
+
+        # Fill remaining slots with top-volume non-gap-up stocks
+        remaining   = max(0, CFG["UNIVERSE_CAP"] - len(gap_ups))
+        rest_top    = rest[:remaining]
+
+        final = gap_ups + rest_top
+        log.info(
+            f"  [Universe] {len(candidates)} candidates → "
+            f"top {len(gap_ups)} gap-ups (of {len(gap_ups_all)} total, capped at {gap_up_cap}) + "
+            f"{len(rest_top)} top-volume = {len(final)} for deep scan"
+        )
         return final
 
 
@@ -560,17 +582,29 @@ class NSEClient:
             log.warning(f"  [NSE] PCR parse: {e}")
         return res
 
-    def get_india_vix(self) -> float:
+    def get_india_vix(self) -> Optional[float]:
+        """
+        Fetch India VIX from NSE public API.
+        Returns the live float value, or None if unavailable.
+        The caller (app.py) should also try Kite quote for INDIA_VIX_TOKEN
+        and use whichever succeeds first.
+        Never returns a hardcoded fallback — None is surfaced to the UI as 'N/A'.
+        """
         data = self._get("allIndices")
         try:
             if data and "data" in data:
                 for idx in data["data"]:
                     name = (idx.get("index") or idx.get("indexSymbol") or "").upper()
                     if "VIX" in name:
-                        return float(idx.get("last") or idx.get("lastPrice") or 15.0)
-        except Exception:
-            pass
-        return 15.0
+                        val = idx.get("last") or idx.get("lastPrice")
+                        if val:
+                            vix = float(val)
+                            log.info(f"  [NSE] India VIX = {vix:.2f} (live from NSE API)")
+                            return vix
+        except Exception as e:
+            log.warning(f"  [NSE] VIX parse error: {e}")
+        log.warning("  [NSE] VIX unavailable from NSE API — will try Kite quote")
+        return None
 
     def get_block_deals(self, symbol: str) -> dict:
         # Use prefetched cache if available — avoids one NSE call per stock
@@ -1148,21 +1182,6 @@ class InstitutionalEngine:
 
 # ═════════════════════════════════════════════════════════════
 # ███  MARKET REGIME  █████████████████████████████████████████
-# ─────────────────────────────────────────────────────────────
-# Multi-index regime: evaluates NIFTY 50, BANKNIFTY, FINNIFTY,
-# and MIDCAP 150 against their 200-EMAs.
-#
-# Score breakdown (max = 2):
-#   +1 → NIFTY 50 above 200EMA  (primary — always weighted)
-#   +1 → VIX below threshold
-#
-# Label logic:
-#   Considers index breadth (how many of 4 indexes are bullish).
-#   Mixed market → appended "(mixed breadth)" or "(weak breadth)"
-#
-# All non-NIFTY indexes are informational flags — they do NOT
-# change the regime score (score stays 0–2 for compatibility),
-# but they do influence the label and flag commentary.
 # ═════════════════════════════════════════════════════════════
 class MarketRegime:
 
@@ -1175,97 +1194,65 @@ class MarketRegime:
         midcap_df:    pd.DataFrame = None,
     ) -> Tuple[int, List[str], bool, str]:
         """
-        Multi-index market regime check.
+        Multi-index regime check.
+        Score 2 pts:
+          R1 — NIFTY 50 above its 200 EMA  (primary trend)
+          R2 — India VIX below VIX_MAX     (fear gauge from Kite/NSE)
 
-        Parameters
-        ----------
-        nifty_df     : NIFTY 50 OHLCV with computed indicators (required)
-        vix          : India VIX float
-        banknifty_df : BANKNIFTY OHLCV (optional, informational)
-        finnifty_df  : FINNIFTY OHLCV  (optional, informational)
-        midcap_df    : MIDCAP 150 OHLCV (optional, informational)
-
-        Returns
-        -------
-        (score, flags, bullish, label)
+        Bonus flags (no score change) for BANKNIFTY, FINNIFTY, MIDCAP breadth.
         """
         score = 0
         flags = []
-
-        # Primary guard: NIFTY is mandatory
-        if nifty_df is None or len(nifty_df) < 3:
-            log.warning("  [Regime] NIFTY data insufficient — using neutral regime")
-            return 1, ["⚠️ NIFTY data unavailable (market may be closed)"], True, "NEUTRAL ⚪"
-
         try:
-            # ── Per-index 200EMA check ────────────────────────
-            INDEX_CHECKS = [
-                ("NIFTY 50",  nifty_df,     True),    # primary — scores +1
-                ("BANKNIFTY", banknifty_df, False),   # informational
-                ("FINNIFTY",  finnifty_df,  False),   # informational
-                ("MIDCAP 150",midcap_df,    False),   # informational
-            ]
+            if nifty_df is None or len(nifty_df) < 3:
+                log.warning("  [Regime] NIFTY data insufficient — using neutral regime")
+                return 1, ["⚠️ NIFTY data unavailable (market may be closed)"], True, "NEUTRAL ⚪"
 
-            bull_count  = 0
-            bear_count  = 0
-            total_idx   = 0
-            nifty_bull  = False
-            nifty_last  = 0.0
+            ema200  = nifty_df["close"].ewm(span=min(200, len(nifty_df)), adjust=False).mean()
+            last    = float(nifty_df["close"].iloc[-1])
+            ema_val = float(ema200.iloc[-1])
 
-            for idx_name, df, is_primary in INDEX_CHECKS:
-                if df is None or len(df) < 3:
-                    if is_primary:
-                        flags.append(f"⚠️ {idx_name} data unavailable")
-                    else:
-                        log.debug(f"  [Regime] {idx_name} data unavailable — skipped")
-                    continue
-
-                total_idx += 1
-                ema200  = df["close"].ewm(span=min(200, len(df)), adjust=False).mean()
-                last    = float(df["close"].iloc[-1])
-                ema_val = float(ema200.iloc[-1])
-
-                if last > ema_val:
-                    bull_count += 1
-                    flags.append(f"✅ {idx_name} {last:.0f} > 200EMA {ema_val:.0f}")
-                    if is_primary:
-                        score    += 1
-                        nifty_bull = True
-                        nifty_last = last
-                else:
-                    bear_count += 1
-                    flags.append(f"❌ {idx_name} {last:.0f} < 200EMA {ema_val:.0f} (Bear)")
-                    if is_primary:
-                        nifty_last = last
-
-            # ── VIX check ──────────────────────────────────────
-            if vix < CFG["VIX_MAX"]:
+            # R1: NIFTY vs 200 EMA
+            if last > ema_val:
                 score += 1
-                flags.append(f"✅ VIX {vix:.1f} calm market")
+                flags.append(f"✅ NIFTY {last:.0f} > 200EMA {ema_val:.0f}")
+            else:
+                flags.append(f"❌ NIFTY {last:.0f} < 200EMA {ema_val:.0f} — Bear trend")
+
+            # R2: VIX fear gauge — live from Kite or NSE API (no hardcode)
+            if vix is None:
+                flags.append("⚠️ VIX unavailable — skipping fear check")
+            elif vix < CFG["VIX_MAX"]:
+                score += 1
+                flags.append(f"✅ VIX {vix:.1f} calm market (< {CFG['VIX_MAX']})")
             elif vix < 25:
-                flags.append(f"⚠️ VIX {vix:.1f} elevated — caution")
+                flags.append(f"⚠️ VIX {vix:.1f} elevated — trade with caution")
             else:
-                flags.append(f"❌ VIX {vix:.1f} high fear / panic")
+                flags.append(f"❌ VIX {vix:.1f} high fear — reduce position size")
 
-            # ── Breadth summary ────────────────────────────────
-            if total_idx > 1:
-                flags.append(
-                    f"📊 Index breadth: {bull_count}/{total_idx} indexes above 200EMA"
-                )
+            # ── Breadth flags (informational — no score) ──────
+            for name, idx_df in [
+                ("BANKNIFTY", banknifty_df),
+                ("FINNIFTY",  finnifty_df),
+                ("MIDCAP150", midcap_df),
+            ]:
+                if idx_df is not None and len(idx_df) >= 3:
+                    try:
+                        idx_ema = idx_df["close"].ewm(
+                            span=min(50, len(idx_df)), adjust=False
+                        ).mean()
+                        idx_last = float(idx_df["close"].iloc[-1])
+                        idx_ema_val = float(idx_ema.iloc[-1])
+                        bull = idx_last > idx_ema_val
+                        icon = "✅" if bull else "❌"
+                        flags.append(
+                            f"{icon} {name} {idx_last:.0f} {'>' if bull else '<'} 50EMA {idx_ema_val:.0f}"
+                        )
+                    except Exception:
+                        pass
 
-            # ── Regime label ───────────────────────────────────
             bullish = (score >= 1)
-
-            if nifty_bull:
-                if total_idx > 1 and bull_count < (total_idx // 2 + 1):
-                    label = "BULL ⚠️ (weak breadth)"
-                else:
-                    label = "BULL 🟢"
-            else:
-                if total_idx > 1 and bear_count < (total_idx // 2 + 1):
-                    label = "BEAR ⚠️ (mixed breadth)"
-                else:
-                    label = "BEAR 🔴"
+            label   = "BULL 🟢" if last > ema_val else "BEAR 🔴"
 
         except Exception as e:
             log.warning(f"  [Regime] Error: {e}")
