@@ -110,6 +110,8 @@ CFG = {
     # ── Index tokens (Kite) ───────────────────────────────────
     "NIFTY_TOKEN":     256265,
     "BANKNIFTY_TOKEN": 260105,
+    "FINNIFTY_TOKEN":  257801,
+    "MIDCAP_TOKEN":    288009,   # NIFTY MIDCAP 150
 
     # ── Technical params ──────────────────────────────────────
     "EMA_FAST":        20,
@@ -1146,37 +1148,131 @@ class InstitutionalEngine:
 
 # ═════════════════════════════════════════════════════════════
 # ███  MARKET REGIME  █████████████████████████████████████████
+# ─────────────────────────────────────────────────────────────
+# Multi-index regime: evaluates NIFTY 50, BANKNIFTY, FINNIFTY,
+# and MIDCAP 150 against their 200-EMAs.
+#
+# Score breakdown (max = 2):
+#   +1 → NIFTY 50 above 200EMA  (primary — always weighted)
+#   +1 → VIX below threshold
+#
+# Label logic:
+#   Considers index breadth (how many of 4 indexes are bullish).
+#   Mixed market → appended "(mixed breadth)" or "(weak breadth)"
+#
+# All non-NIFTY indexes are informational flags — they do NOT
+# change the regime score (score stays 0–2 for compatibility),
+# but they do influence the label and flag commentary.
 # ═════════════════════════════════════════════════════════════
 class MarketRegime:
 
     @staticmethod
-    def check(nifty_df: pd.DataFrame, vix: float) -> Tuple[int, List[str], bool, str]:
-        score = 0; flags = []
+    def check(
+        nifty_df:     pd.DataFrame,
+        vix:          float,
+        banknifty_df: pd.DataFrame = None,
+        finnifty_df:  pd.DataFrame = None,
+        midcap_df:    pd.DataFrame = None,
+    ) -> Tuple[int, List[str], bool, str]:
+        """
+        Multi-index market regime check.
+
+        Parameters
+        ----------
+        nifty_df     : NIFTY 50 OHLCV with computed indicators (required)
+        vix          : India VIX float
+        banknifty_df : BANKNIFTY OHLCV (optional, informational)
+        finnifty_df  : FINNIFTY OHLCV  (optional, informational)
+        midcap_df    : MIDCAP 150 OHLCV (optional, informational)
+
+        Returns
+        -------
+        (score, flags, bullish, label)
+        """
+        score = 0
+        flags = []
+
+        # Primary guard: NIFTY is mandatory
+        if nifty_df is None or len(nifty_df) < 3:
+            log.warning("  [Regime] NIFTY data insufficient — using neutral regime")
+            return 1, ["⚠️ NIFTY data unavailable (market may be closed)"], True, "NEUTRAL ⚪"
+
         try:
-            if nifty_df is None or len(nifty_df) < 3:
-                log.warning("  [Regime] NIFTY data insufficient — using neutral regime")
-                return 1, ["⚠️ NIFTY data unavailable (market may be closed)"], True, "NEUTRAL ⚪"
+            # ── Per-index 200EMA check ────────────────────────
+            INDEX_CHECKS = [
+                ("NIFTY 50",  nifty_df,     True),    # primary — scores +1
+                ("BANKNIFTY", banknifty_df, False),   # informational
+                ("FINNIFTY",  finnifty_df,  False),   # informational
+                ("MIDCAP 150",midcap_df,    False),   # informational
+            ]
 
-            ema200  = nifty_df["close"].ewm(span=min(200, len(nifty_df)), adjust=False).mean()
-            last    = float(nifty_df["close"].iloc[-1])
-            ema_val = float(ema200.iloc[-1])
+            bull_count  = 0
+            bear_count  = 0
+            total_idx   = 0
+            nifty_bull  = False
+            nifty_last  = 0.0
 
-            if last > ema_val:
-                score += 1; flags.append(f"✅ NIFTY {last:.0f} > 200EMA {ema_val:.0f}")
-            else:
-                flags.append(f"❌ NIFTY {last:.0f} < 200EMA {ema_val:.0f} (Bear)")
+            for idx_name, df, is_primary in INDEX_CHECKS:
+                if df is None or len(df) < 3:
+                    if is_primary:
+                        flags.append(f"⚠️ {idx_name} data unavailable")
+                    else:
+                        log.debug(f"  [Regime] {idx_name} data unavailable — skipped")
+                    continue
 
+                total_idx += 1
+                ema200  = df["close"].ewm(span=min(200, len(df)), adjust=False).mean()
+                last    = float(df["close"].iloc[-1])
+                ema_val = float(ema200.iloc[-1])
+
+                if last > ema_val:
+                    bull_count += 1
+                    flags.append(f"✅ {idx_name} {last:.0f} > 200EMA {ema_val:.0f}")
+                    if is_primary:
+                        score    += 1
+                        nifty_bull = True
+                        nifty_last = last
+                else:
+                    bear_count += 1
+                    flags.append(f"❌ {idx_name} {last:.0f} < 200EMA {ema_val:.0f} (Bear)")
+                    if is_primary:
+                        nifty_last = last
+
+            # ── VIX check ──────────────────────────────────────
             if vix < CFG["VIX_MAX"]:
-                score += 1; flags.append(f"✅ VIX {vix:.1f} calm market")
+                score += 1
+                flags.append(f"✅ VIX {vix:.1f} calm market")
+            elif vix < 25:
+                flags.append(f"⚠️ VIX {vix:.1f} elevated — caution")
             else:
-                flags.append(f"❌ VIX {vix:.1f} high volatility")
+                flags.append(f"❌ VIX {vix:.1f} high fear / panic")
 
+            # ── Breadth summary ────────────────────────────────
+            if total_idx > 1:
+                flags.append(
+                    f"📊 Index breadth: {bull_count}/{total_idx} indexes above 200EMA"
+                )
+
+            # ── Regime label ───────────────────────────────────
             bullish = (score >= 1)
-            label   = "BULL 🟢" if last > ema_val else "BEAR 🔴"
+
+            if nifty_bull:
+                if total_idx > 1 and bull_count < (total_idx // 2 + 1):
+                    label = "BULL ⚠️ (weak breadth)"
+                else:
+                    label = "BULL 🟢"
+            else:
+                if total_idx > 1 and bear_count < (total_idx // 2 + 1):
+                    label = "BEAR ⚠️ (mixed breadth)"
+                else:
+                    label = "BEAR 🔴"
+
         except Exception as e:
             log.warning(f"  [Regime] Error: {e}")
-            bullish = True; label = "NEUTRAL ⚪"
-            flags.append(f"⚠️ Regime check error: {str(e)[:50]}")
+            bullish = True
+            label   = "NEUTRAL ⚪"
+            flags.append(f"⚠️ Regime check error: {str(e)[:60]}")
+
         return score, flags, bullish, label
 
 

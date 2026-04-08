@@ -200,18 +200,40 @@ def run_full_scan():
         log.info(f"  → {len(candidates)} candidates selected for full analysis")
 
         # ─────────────────────────────────────────────────────
-        # STEP 4: Market Regime + Macro Data
-        # KITE API: kite.historical_data(NIFTY_TOKEN, ...)
+        # STEP 4: Market Regime + Macro Data  (MULTI-INDEX)
+        # KITE API: kite.historical_data(...) × 4 indexes
         # NSE API:  India VIX, FII/DII flows
+        # Indexes: NIFTY 50, BANKNIFTY, FINNIFTY, MIDCAP 150
         # ─────────────────────────────────────────────────────
-        log.info("  STEP 4 — Macro regime check...")
-        nifty_raw = kl.get_ohlcv(CFG["NIFTY_TOKEN"], days=400)   # 400 cal days ≈ 280 trading days
-        nifty_df  = TechnicalEngine.compute(nifty_raw)
-        # Fallback: if compute() stripped all rows (unlikely after fix), use raw
-        if nifty_df.empty and not nifty_raw.empty:
-            log.warning("  [Regime] TechnicalEngine returned empty — using raw NIFTY data for regime check")
-            nifty_df = nifty_raw
-        log_kite_call("historical_data", f"NIFTY 50 — {len(nifty_raw)} candles")
+        log.info("  STEP 4 — Multi-index regime check (NIFTY / BANKNIFTY / FINNIFTY / MIDCAP)...")
+
+        def _fetch_index(token: int, name: str, days: int = 400) -> pd.DataFrame:
+            """Fetch + compute one index, with raw fallback."""
+            try:
+                raw = kl.get_ohlcv(token, days=days)
+                if raw.empty:
+                    log.warning(f"  [Regime] {name} — no data returned")
+                    return pd.DataFrame()
+                df = TechnicalEngine.compute(raw)
+                if df.empty and not raw.empty:
+                    log.warning(f"  [Regime] {name} — TechnicalEngine empty, using raw")
+                    return raw
+                log.info(f"  [Regime] {name} — {len(df)} candles loaded")
+                return df
+            except Exception as e:
+                log.warning(f"  [Regime] {name} fetch failed: {e}")
+                return pd.DataFrame()
+
+        nifty_df     = _fetch_index(CFG["NIFTY_TOKEN"],     "NIFTY 50")
+        banknifty_df = _fetch_index(CFG["BANKNIFTY_TOKEN"], "BANKNIFTY")
+        finnifty_df  = _fetch_index(CFG.get("FINNIFTY_TOKEN", 257801), "FINNIFTY")
+        midcap_df    = _fetch_index(CFG.get("MIDCAP_TOKEN",  288009),  "MIDCAP 150")
+
+        log_kite_call(
+            "historical_data",
+            f"4 indexes — NIFTY({len(nifty_df)}) BANKNIFTY({len(banknifty_df)}) "
+            f"FINNIFTY({len(finnifty_df)}) MIDCAP({len(midcap_df)}) candles"
+        )
 
         vix = nse.get_india_vix()
         fii = nse.get_fii_dii()
@@ -219,7 +241,12 @@ def run_full_scan():
         STATE["vix"]     = vix
         STATE["fii_dii"] = {**fii, "pcr": oc.get("pcr", "—")}
 
-        reg_s, reg_f, regime_ok, reg_label = MarketRegime.check(nifty_df, vix)
+        reg_s, reg_f, regime_ok, reg_label = MarketRegime.check(
+            nifty_df, vix,
+            banknifty_df = banknifty_df if not banknifty_df.empty else None,
+            finnifty_df  = finnifty_df  if not finnifty_df.empty  else None,
+            midcap_df    = midcap_df    if not midcap_df.empty    else None,
+        )
         STATE["regime"] = {"score": reg_s, "label": reg_label, "flags": reg_f, "vix": vix}
         log.info(f"  → Regime: {reg_label} | VIX: {vix:.1f} | FII: ₹{fii.get('fii_net',0)/1e7:.0f}Cr | PCR: {oc.get('pcr',1)}")
 
