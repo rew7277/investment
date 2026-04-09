@@ -41,6 +41,7 @@ from engine import (
     TechnicalEngine, FundamentalEngine, BreakoutScanner,
     InstitutionalEngine, MarketRegime, RiskManager,
     SMCEngine, FibonacciEngine, PivotEngine, OptionEngine,
+    NiftyOptionsEngine, TopMoversEngine, LiveIndexRefresher,
     build_score, save_token, load_token, is_token_fresh
 )
 
@@ -100,6 +101,9 @@ STATE = {
     "last_scan":     None,
     "scanning":      False,
     "indices":       {},          # PivotEngine snapshot for 4 indices
+    "top_movers":    {},          # TopMoversEngine output — updated after each scan
+    "live_fno":      [],          # NiftyOptionsEngine live signals — updated every 5s refresh
+    "quote_cache":   {},          # raw quote_data from last scan — for movers computation
     "scan_progress": {          # real-time progress tracking
         "step":       0,        # current step 0-7
         "step_label": "",       # e.g. "Loading NSE universe..."
@@ -613,6 +617,30 @@ def run_full_scan():
         STATE["last_scan"] = str(datetime.now())
         set_progress(7, "Scan complete ✅", len(candidates), len(candidates))
 
+        # ── Top Movers (computed from live quote_data) ─────────
+        try:
+            STATE["quote_cache"] = quote_data   # store for live refresh
+            STATE["top_movers"]  = TopMoversEngine.compute(quote_data, STATE["signals"])
+            log.info(f"  [Movers] Gainers:{len(STATE['top_movers'].get('gainers',[]))} "
+                     f"Momentum:{len(STATE['top_movers'].get('momentum',[]))} "
+                     f"Reversal:{len(STATE['top_movers'].get('reversal',[]))}")
+        except Exception as _me:
+            log.warning(f"  [Movers] TopMoversEngine error: {_me}")
+
+        # ── Generate live NIFTY F&O signals from index data ────
+        try:
+            _live_fno = []
+            _oc       = nse.get_option_chain_pcr("NIFTY")
+            _vix      = float(STATE.get("vix", 15.0) or 15.0)
+            for _ik, _id in STATE["indices"].items():
+                _sig = NiftyOptionsEngine.generate_signal(kl, _ik, _id, _oc, _vix)
+                if _sig:
+                    _live_fno.append(_sig)
+            STATE["live_fno"] = _live_fno
+            log.info(f"  [LiveFnO] {len(_live_fno)} index option signals generated")
+        except Exception as _fe:
+            log.warning(f"  [LiveFnO] error: {_fe}")
+
         buys       = [s for s in signals if s["action"] == "BUY"]
         strong_buy = [s for s in signals if s["score"] >= CFG["SCORE_STRONG_BUY"]]
         buy_grade  = [s for s in signals if s["score"] >= CFG["SCORE_BUY"]]
@@ -672,6 +700,8 @@ def api_state():
         "paper_trade":   CFG["PAPER_TRADE"],
         "kite_calls":    STATE["kite_calls"][-20:],
         "errors":        STATE["errors"][-30:],
+        "top_movers":    STATE.get("top_movers", {}),
+        "live_fno":      STATE.get("live_fno", []),
         "stats": {
             "universe_size":  STATE["universe_size"],
             "signals_count":  len(STATE["signals"]),
@@ -804,6 +834,106 @@ def api_indices():
     return jsonify(_np_sanitize(STATE.get("indices", {})))
 
 
+@app.route("/api/indices/live")
+def api_indices_live():
+    """
+    Lightweight 5-second live refresh: only fetches LTP via kite.ltp().
+    Updates STATE["indices"] in-place — does NOT trigger a full scan.
+    Called by the frontend every 5 seconds.
+    """
+    if kl is None:
+        return jsonify({"error": "Not authenticated", "indices": STATE.get("indices", {})})
+    try:
+        updated = LiveIndexRefresher.refresh(kl, STATE.get("indices", {}))
+        with _STATE_LOCK:
+            STATE["indices"] = updated
+
+        # Also refresh live F&O signals when indices refresh
+        try:
+            _oc  = nse.get_option_chain_pcr("NIFTY")
+            _vix = float(STATE.get("vix", 15.0) or 15.0)
+            _fno = []
+            for _ik, _id in updated.items():
+                _sig = NiftyOptionsEngine.generate_signal(kl, _ik, _id, _oc, _vix)
+                if _sig:
+                    _fno.append(_sig)
+            with _STATE_LOCK:
+                STATE["live_fno"] = _fno
+        except Exception as _fe:
+            log.debug(f"  [LiveFnO] refresh error: {_fe}")
+
+        return jsonify(_np_sanitize({
+            "ok":      True,
+            "indices": updated,
+            "live_fno": STATE.get("live_fno", []),
+            "time":    datetime.now().strftime("%H:%M:%S"),
+        }))
+    except Exception as e:
+        log.warning(f"  [LiveRefresh] error: {e}")
+        return jsonify({"ok": False, "error": str(e), "indices": STATE.get("indices", {})})
+
+
+@app.route("/api/index-fno/<index_key>")
+def api_index_fno(index_key: str):
+    """
+    Generate fresh F&O signal for a specific index on demand.
+    Called when user CLICKS an index card.
+    index_key: NIFTY | BANKNIFTY | FINNIFTY | MIDCAP
+    """
+    idx_key = index_key.upper()
+    idx_data = STATE.get("indices", {}).get(idx_key)
+    if not idx_data:
+        return jsonify({"error": f"No index data for {idx_key} — run a full scan first."})
+    try:
+        vix    = float(STATE.get("vix", 15.0) or 15.0)
+        oc     = nse.get_option_chain_pcr(idx_key if idx_key in ("NIFTY","BANKNIFTY","FINNIFTY") else "NIFTY")
+        signal = NiftyOptionsEngine.generate_signal(kl, idx_key, idx_data, oc, vix)
+        if not signal:
+            # Still return pivot data + reason
+            trend = NiftyOptionsEngine.get_trend(idx_data)
+            return jsonify(_np_sanitize({
+                "ok":       False,
+                "idx_key":  idx_key,
+                "trend":    trend,
+                "ltp":      idx_data.get("ltp", 0),
+                "message":  f"No high-probability setup for {idx_key} right now. "
+                            f"Trend: {trend}. Setup score too low or time window inactive.",
+                "pivot":    idx_data,
+            }))
+        return jsonify(_np_sanitize({"ok": True, "signal": signal, "pivot": idx_data}))
+    except Exception as e:
+        log.error(f"  [IndexFnO] {idx_key} error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/top-movers")
+def api_top_movers():
+    """Returns today's top movers — gainers, losers, momentum, volume, reversal."""
+    movers = STATE.get("top_movers", {})
+    hp     = TopMoversEngine.get_high_probability(movers, STATE.get("signals", []))
+    return jsonify(_np_sanitize({
+        "ok":               bool(movers),
+        "gainers":          movers.get("gainers",  [])[:15],
+        "losers":           movers.get("losers",   [])[:15],
+        "momentum":         movers.get("momentum", [])[:12],
+        "volume":           movers.get("volume",   [])[:12],
+        "reversal":         movers.get("reversal", [])[:8],
+        "high_probability": hp,
+        "note": "High Probability = Top mover AND BUY/STRONG BUY signal",
+    }))
+
+
+@app.route("/api/live-fno")
+def api_live_fno():
+    """Returns live NIFTY/BANKNIFTY/FINNIFTY option signals (refreshed every 5s)."""
+    return jsonify(_np_sanitize({
+        "ok":      True,
+        "signals": STATE.get("live_fno", []),
+        "count":   len(STATE.get("live_fno", [])),
+        "time":    datetime.now().strftime("%H:%M:%S"),
+    }))
+
+
 @app.route("/api/kite-calls")
 def kite_calls():
     """Shows every Kite API method called — for transparency."""
@@ -873,16 +1003,32 @@ def fno_signals():
                 continue
             ltp   = float(idx_data.get("ltp", 0))
             trend = idx_data.get("trend", "SIDEWAYS")
-            if trend == "SIDEWAYS" or ltp < 100:
+            if ltp < 100:
                 continue
 
-            direction = "CALL" if trend == "BULL" else "PUT"
+            # In bear market: allow PUT trades, block CALLs
+            # In sideways: allow both PUT and CALL with pivot alignment
+            above = idx_data.get("above_pivot", True)
+            if trend == "BULL":
+                direction = "CALL"
+            elif trend == "BEAR":
+                direction = "PUT"
+            elif above:
+                direction = "CALL"
+            else:
+                direction = "PUT"
 
-            # Hard pivot gate: CALL only above PP, PUT only below PP
-            if direction == "CALL" and not idx_data.get("above_pivot", False):
-                continue
-            if direction == "PUT" and idx_data.get("above_pivot", True):
-                continue
+            # Bear market: force PUT regardless of trend label
+            if bear_blk:
+                direction = "PUT"
+
+            # Relaxed pivot gate: only skip if strongly against direction
+            # CALL allowed from PP upward (not just above R1)
+            # PUT allowed from PP downward (not just below S1)
+            if direction == "CALL" and not above and trend == "BEAR":
+                continue   # clear bearish structure — skip CALL
+            if direction == "PUT" and above and trend == "BULL":
+                continue   # clear bullish structure — skip PUT
 
             pivot  = float(idx_data.get("pivot", ltp))
             r1     = float(idx_data.get("r1",    ltp * 1.01))
@@ -1143,6 +1289,42 @@ def _auth_page(title: str, message: str, success: bool) -> str:
 # ═════════════════════════════════════════════════════════════
 # SCHEDULER
 # ═════════════════════════════════════════════════════════════
+def _live_index_refresh_job():
+    """
+    Lightweight scheduled job: refreshes index LTP + live F&O signals.
+    Runs every 30 seconds during market hours (9:15–15:30 IST).
+    Uses kite.ltp() only — no historical_data() call. Very fast.
+    """
+    if kl is None:
+        return
+    now = datetime.now()
+    m   = now.hour * 60 + now.minute
+    # Only run during market hours Mon-Fri
+    if now.weekday() >= 5:       # Saturday/Sunday
+        return
+    if not (9*60+15 <= m <= 15*60+35):
+        return
+    try:
+        updated = LiveIndexRefresher.refresh(kl, STATE.get("indices", {}))
+        with _STATE_LOCK:
+            STATE["indices"] = updated
+        # Refresh live F&O signals
+        try:
+            _oc  = nse.get_option_chain_pcr("NIFTY")
+            _vix = float(STATE.get("vix", 15.0) or 15.0)
+            _fno = []
+            for _ik, _id in updated.items():
+                _sig = NiftyOptionsEngine.generate_signal(kl, _ik, _id, _oc, _vix)
+                if _sig:
+                    _fno.append(_sig)
+            with _STATE_LOCK:
+                STATE["live_fno"] = _fno
+        except Exception:
+            pass
+    except Exception as e:
+        log.debug(f"  [LiveRefreshJob] {e}")
+
+
 def start_scheduler():
     h, m  = CFG["SCAN_TIME"].split(":")
     sched = BackgroundScheduler(timezone="Asia/Kolkata")
@@ -1150,8 +1332,10 @@ def start_scheduler():
                   day_of_week="mon-fri", id="morning_scan")
     sched.add_job(run_full_scan, "cron", hour=14, minute=0,
                   day_of_week="mon-fri", id="midday_scan")
+    # Live index + F&O refresh every 30 seconds (market hours only)
+    sched.add_job(_live_index_refresh_job, "interval", seconds=30, id="live_refresh")
     sched.start()
-    log.info(f"📅 Scheduler: {CFG['SCAN_TIME']} + 14:00 IST (Mon–Fri)")
+    log.info(f"📅 Scheduler: {CFG['SCAN_TIME']} + 14:00 IST (Mon–Fri) | Live refresh: 30s")
 
 
 def probe_existing_token():
@@ -1276,8 +1460,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
   /* INDEX GRID */
   .index-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 24px; }
-  .index-card { background: var(--bg1); border: 0.5px solid var(--border); border-radius: var(--r); padding: 20px 20px 16px; position: relative; overflow: hidden; transition: border-color 0.25s, transform 0.2s; cursor: default; }
-  .index-card:hover { border-color: var(--border2); transform: translateY(-2px); }
+  .index-card { background: var(--bg1); border: 0.5px solid var(--border); border-radius: var(--r); padding: 20px 20px 16px; position: relative; overflow: hidden; transition: border-color 0.25s, transform 0.2s; cursor: pointer; }
+  .index-card:hover { border-color: var(--blue); transform: translateY(-2px); box-shadow: 0 0 0 1px rgba(0,122,255,.15); }
   .index-card .idx-lbl { font-size: 10.5px; font-weight: 600; color: var(--muted); letter-spacing: 1px; text-transform: uppercase; margin-bottom: 12px; display: flex; align-items: center; justify-content: space-between; }
   .tag { font-size: 9.5px; padding: 2px 8px; border-radius: 5px; font-weight: 600; letter-spacing: 0.5px; }
   .tag-bull { background: var(--green-dim); color: var(--green); }
@@ -1380,6 +1564,36 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
   /* TOASTS */
   .toast { position: fixed; bottom: 24px; right: 24px; background: var(--bg2); border: 0.5px solid var(--border2); border-radius: 10px; padding: 12px 18px; font-size: 12.5px; z-index: 9999; display: none; box-shadow: 0 8px 32px rgba(0,0,0,0.5); }
+
+  /* F&O CARDS */
+  .fno-idx-btn { background:var(--bg1);border:0.5px solid var(--border);border-radius:var(--r);padding:14px;text-align:center;font-size:11.5px;font-weight:600;cursor:pointer;transition:all .2s;color:var(--text); }
+  .fno-idx-btn:hover { border-color:var(--blue);background:var(--blue-dim);color:var(--blue); }
+  .fno-card { background:var(--bg1);border:0.5px solid var(--border);border-radius:var(--r);padding:16px 18px;margin-bottom:10px; }
+  .fno-card.call { border-left:3px solid var(--green); }
+  .fno-card.put  { border-left:3px solid var(--red); }
+  .fno-card-grid { display:grid;grid-template-columns:180px 1fr 1fr 1fr 1fr 1fr;gap:10px;align-items:start; }
+  .fno-card .fc-head { font-size:14px;font-weight:700;margin-bottom:3px; }
+  .fno-card .fc-sub  { font-size:10px;color:var(--muted); }
+  .fno-lbl  { font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:3px; }
+  .fno-val  { font-size:13px;font-weight:600;font-family:'DM Mono',monospace; }
+  .fno-why  { margin-top:10px;display:flex;gap:6px;flex-wrap:wrap;padding-top:8px;border-top:0.5px solid var(--border); }
+  .fno-why span { font-size:9.5px;padding:2px 8px;border-radius:4px;background:var(--bg2);color:var(--muted); }
+  .fno-action-green { display:inline-block;background:rgba(48,209,88,.12);color:var(--green);font-size:10px;padding:3px 10px;border-radius:5px;font-weight:700; }
+  .fno-action-amber { display:inline-block;background:var(--amber-dim);color:var(--amber);font-size:10px;padding:3px 10px;border-radius:5px;font-weight:700; }
+  .fno-action-red   { display:inline-block;background:var(--red-dim);color:var(--red);font-size:10px;padding:3px 10px;border-radius:5px;font-weight:700; }
+  /* HIGH PROBABILITY CARDS */
+  .hp-card { background:var(--bg1);border:0.5px solid rgba(48,209,88,.25);border-radius:var(--r);padding:16px 18px;margin-bottom:10px;position:relative;overflow:hidden; }
+  .hp-card::before { content:'';position:absolute;top:0;right:0;width:80px;height:80px;background:radial-gradient(circle at top right,rgba(48,209,88,.07),transparent 70%); }
+  .hp-card .hp-top { display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap; }
+  .hp-card .hp-sym { font-size:16px;font-weight:700; }
+  .hp-card .hp-cat { font-size:10px;padding:2px 8px;border-radius:4px;background:var(--green-dim);color:var(--green);font-weight:600; }
+  .hp-card .hp-grid { display:grid;grid-template-columns:repeat(6,1fr);gap:8px; }
+  .hp-item { background:var(--bg2);border-radius:8px;padding:8px 10px; }
+  .hp-lbl  { font-size:9px;color:var(--muted);text-transform:uppercase;margin-bottom:3px; }
+  .hp-val  { font-size:12px;font-weight:600;font-family:'DM Mono',monospace; }
+  /* LIVE DOT */
+  .live-dot { width:7px;height:7px;border-radius:50%;background:var(--green);display:inline-block;margin-right:4px;animation:livepulse 1.5s infinite; }
+  @keyframes livepulse { 0%,100%{opacity:1} 50%{opacity:.3} }
 
   /* ANIMATIONS */
   @keyframes fadeSlide { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:translateY(0); } }
@@ -1484,7 +1698,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
   <!-- TABS -->
   <div class="tab-bar">
-    <div class="tab active" onclick="switchTab('signals',this)">Signals</div>
+    <div class="tab active" onclick="switchTab('signals',this)">📊 Signals</div>
+    <div class="tab" onclick="switchTab('fno',this)">⚡ F&O Scanner</div>
+    <div class="tab" onclick="switchTab('movers',this)">🔥 Today's Movers</div>
+    <div class="tab" onclick="switchTab('highprob',this)">🎯 High Probability</div>
     <div class="tab" onclick="switchTab('paper',this)">Paper Trade</div>
     <div class="tab" onclick="switchTab('gaps',this)">Gap Alerts</div>
     <div class="tab" onclick="switchTab('positions',this)">Positions</div>
@@ -1501,11 +1718,106 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <th style="color:var(--blue)">Tech</th><th style="color:var(--green)">Brk</th>
           <th style="color:var(--amber)">Fund</th><th style="color:var(--blue)">Inst</th>
           <th style="color:var(--red)">SMC</th><th style="color:var(--purple)">Fib</th>
-          <th>Score</th><th>Signal</th><th>SL / TP</th>
+          <th>Score</th><th>Signal</th>
+          <th style="color:var(--red)">Entry</th>
+          <th style="color:var(--red)">SL</th>
+          <th style="color:var(--green)">T1</th>
+          <th style="color:var(--green)">T2</th>
+          <th style="color:var(--green)">T3</th>
+          <th>R:R</th>
         </tr></thead>
-        <tbody id="sig-body"><tr><td colspan="12" class="no-data">Press Full Scan to load signals</td></tr></tbody>
+        <tbody id="sig-body"><tr><td colspan="17" class="no-data">Press Full Scan to load signals</td></tr></tbody>
       </table>
     </div>
+  </div>
+
+  <!-- F&O SCANNER TAB -->
+  <div id="tab-fno" style="display:none">
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px;flex-wrap:wrap">
+      <div style="font-size:11px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.7px">Live Index F&O Signals</div>
+      <div id="fno-refresh-badge" style="font-size:10px;padding:2px 8px;border-radius:5px;background:var(--green-dim);color:var(--green)">● Live</div>
+      <div id="fno-last-update" style="font-size:10px;color:var(--muted)">Auto-refreshes every 5s</div>
+      <div style="margin-left:auto;display:flex;gap:8px">
+        <button onclick="loadFnO()" style="font-size:11px;padding:5px 12px;border-radius:6px;border:0.5px solid var(--border2);background:transparent;color:var(--muted);cursor:pointer">↻ Refresh</button>
+      </div>
+    </div>
+    <!-- Index click cards -->
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px" id="fno-index-btns">
+      <div class="fno-idx-btn" onclick="loadIndexFnO('NIFTY')">NIFTY 50 <span style="font-size:9px;opacity:.6">click for F&O</span></div>
+      <div class="fno-idx-btn" onclick="loadIndexFnO('BANKNIFTY')">BANK NIFTY <span style="font-size:9px;opacity:.6">click for F&O</span></div>
+      <div class="fno-idx-btn" onclick="loadIndexFnO('FINNIFTY')">FIN NIFTY <span style="font-size:9px;opacity:.6">click for F&O</span></div>
+      <div class="fno-idx-btn" onclick="loadIndexFnO('MIDCAP')">MIDCAP 150 <span style="font-size:9px;opacity:.6">click for F&O</span></div>
+    </div>
+    <!-- On-demand F&O result -->
+    <div id="fno-click-result" style="display:none;margin-bottom:16px"></div>
+    <!-- Live F&O signals cards -->
+    <div id="fno-cards"><div class="no-data" style="padding:24px;text-align:center">Run a Full Scan first, then live signals appear here every 5s</div></div>
+    <!-- Full F&O table from /api/fno-signals -->
+    <div style="margin-top:20px">
+      <div style="font-size:11px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.7px;margin-bottom:10px">All F&O Signals (equity + index)</div>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr>
+            <th>Symbol</th><th>Type</th><th>Direction</th><th>Strike</th><th>Expiry</th>
+            <th>Entry ₹</th><th style="color:var(--red)">SL</th>
+            <th style="color:var(--green)">T1</th><th style="color:var(--green)">T2</th><th style="color:var(--green)">T3</th>
+            <th>R:R</th><th>IV</th><th>Setup</th><th>Action</th>
+          </tr></thead>
+          <tbody id="fno-body"><tr><td colspan="14" class="no-data">Load F&O signals</td></tr></tbody>
+        </table>
+      </div>
+      <button onclick="loadFnOTable()" style="margin-top:10px;font-size:11px;padding:6px 16px;border-radius:6px;border:0.5px solid var(--blue);background:transparent;color:var(--blue);cursor:pointer">Load All F&O Signals</button>
+    </div>
+  </div>
+
+  <!-- TODAY'S MOVERS TAB -->
+  <div id="tab-movers" style="display:none">
+    <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-bottom:16px" id="movers-stat-row">
+      <div class="stat-card c-green"><div class="lbl">Gainers</div><div class="val" id="mv-gainers">0</div><div class="sub">≥2% up today</div></div>
+      <div class="stat-card c-red"><div class="lbl">Losers</div><div class="val" id="mv-losers">0</div><div class="sub">≥2% down today</div></div>
+      <div class="stat-card c-blue"><div class="lbl">Momentum</div><div class="val" id="mv-momentum">0</div><div class="sub">Intraday surge</div></div>
+      <div class="stat-card c-amber"><div class="lbl">Vol Surge</div><div class="val" id="mv-volume">0</div><div class="sub">3x avg volume</div></div>
+      <div class="stat-card"><div class="lbl">Reversal</div><div class="val" id="mv-reversal">0</div><div class="sub">Exhaustion plays</div></div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+      <div>
+        <div class="panel-title" style="margin-bottom:8px">🚀 Top Gainers</div>
+        <div class="tbl-wrap"><table>
+          <thead><tr><th>Symbol</th><th>Chg%</th><th>Gap%</th><th>Intraday</th><th>Category</th><th>Score</th></tr></thead>
+          <tbody id="mv-gainer-body"><tr><td colspan="6" class="no-data">Run scan</td></tr></tbody>
+        </table></div>
+      </div>
+      <div>
+        <div class="panel-title" style="margin-bottom:8px">📉 Top Losers</div>
+        <div class="tbl-wrap"><table>
+          <thead><tr><th>Symbol</th><th>Chg%</th><th>Gap%</th><th>Intraday</th><th>Category</th></tr></thead>
+          <tbody id="mv-loser-body"><tr><td colspan="5" class="no-data">Run scan</td></tr></tbody>
+        </table></div>
+      </div>
+      <div>
+        <div class="panel-title" style="margin-bottom:8px">⚡ Intraday Momentum (No Gap)</div>
+        <div class="tbl-wrap"><table>
+          <thead><tr><th>Symbol</th><th>Chg%</th><th>Intraday%</th><th>Volume</th><th>Score</th></tr></thead>
+          <tbody id="mv-momentum-body"><tr><td colspan="5" class="no-data">Run scan</td></tr></tbody>
+        </table></div>
+      </div>
+      <div>
+        <div class="panel-title" style="margin-bottom:8px">🔄 Reversal Candidates</div>
+        <div class="tbl-wrap"><table>
+          <thead><tr><th>Symbol</th><th>Chg%</th><th>Category</th><th>Signal</th></tr></thead>
+          <tbody id="mv-reversal-body"><tr><td colspan="4" class="no-data">Run scan</td></tr></tbody>
+        </table></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- HIGH PROBABILITY TAB -->
+  <div id="tab-highprob" style="display:none">
+    <div style="background:linear-gradient(135deg,rgba(48,209,88,.06),rgba(0,122,255,.04));border:0.5px solid var(--border);border-radius:var(--r);padding:14px 18px;margin-bottom:16px;font-size:12px;color:var(--muted)">
+      <strong style="color:var(--text)">⚡ High Probability = Top Mover + BUY/STRONG BUY Signal</strong><br>
+      These stocks are moving <em>and</em> have strong technical confirmation — highest-quality intraday setups.
+    </div>
+    <div id="hp-cards"><div class="no-data" style="padding:24px;text-align:center">Run a Full Scan to populate high-probability setups</div></div>
   </div>
 
   <!-- PAPER TRADE TAB -->
@@ -1589,13 +1901,17 @@ setInterval(() => {
 }, 1000);
 
 // ── Tab switching ──────────────────────────────────────────
-const TABS = ['signals','paper','gaps','positions','trades','kite'];
+const TABS = ['signals','fno','movers','highprob','paper','gaps','positions','trades','kite'];
 function switchTab(name, el) {
   TABS.forEach(t => {
     document.getElementById('tab-'+t).style.display = (t === name ? '' : 'none');
   });
   document.querySelectorAll('.tab-bar .tab').forEach(t => t.classList.remove('active'));
   if (el) el.classList.add('active');
+  // Load data when tabs opened
+  if (name === 'fno')      { loadFnO(); loadFnOTable(); }
+  if (name === 'movers')   { loadMovers(); }
+  if (name === 'highprob') { loadMovers(); }
 }
 
 // ── Score-bar animation on load ────────────────────────────
@@ -1635,6 +1951,8 @@ function startProgressPoll() {
         render(d);
         loadIndexCards();
         loadPaperState();
+        loadFnO();
+        loadMovers();
       }
     } catch(e) {}
   }, 1500);
@@ -1734,19 +2052,28 @@ function render(d) {
   renderTrades(tl);
   // Kite log
   renderKiteLog(d.kite_calls || []);
+  // New: movers + high prob + live fno extras
+  renderExtras(d);
 }
 
 function renderSignals(sigs) {
   const tb = document.getElementById('sig-body');
-  if (!sigs.length) { tb.innerHTML = '<tr><td colspan="12" class="no-data">Press Full Scan to load signals</td></tr>'; return; }
+  if (!sigs.length) { tb.innerHTML = '<tr><td colspan="17" class="no-data">Press Full Scan to load signals</td></tr>'; return; }
   tb.innerHTML = sigs.map(s => {
     const sc = s.score || 0;
     const sigLabel = sc >= 20 ? 'STRONG BUY' : sc >= 13 ? 'BUY' : sc >= 9 ? 'WATCHLIST' : 'AVOID';
     const sigCls   = sc >= 20 ? 'badge-sb' : sc >= 13 ? 'badge-buy' : sc >= 9 ? 'badge-wl' : 'badge-av';
     const bk = s.breakdown || {};
+    const entry = s.ltp || 0;
+    const sl  = s.sl  || 0;
+    const tp  = s.tp  || 0;
+    // T1=40% of SL→TP, T2=70%, T3=TP
+    const t1 = sl && tp ? (entry + (tp - entry) * 0.40) : 0;
+    const t2 = sl && tp ? (entry + (tp - entry) * 0.70) : 0;
+    const rr = sl && sl < entry ? ((tp - entry) / (entry - sl)).toFixed(1) : '—';
     return `<tr onclick="autofillPaper(${JSON.stringify(s).replace(/"/g,'&quot;')})">
       <td class="sym">${s.symbol}</td>
-      <td class="mono">₹${(s.ltp||0).toLocaleString('en-IN')}</td>
+      <td class="mono">₹${entry.toLocaleString('en-IN')}</td>
       <td class="${s.gap_pct>0?'g':'r'} mono">${s.gap_pct>0?'+':''}${(s.gap_pct||0).toFixed(1)}%</td>
       <td class="mono b">${(bk.technical?.score||0)}/${bk.technical?.max||5}</td>
       <td class="mono g">${(bk.breakout?.score||0)}/${bk.breakout?.max||5}</td>
@@ -1756,7 +2083,12 @@ function renderSignals(sigs) {
       <td class="mono" style="color:var(--purple)">${(bk.fibonacci?.score||0)}/${bk.fibonacci?.max||3}</td>
       <td class="mono" style="font-weight:700;color:${sc>=20?'var(--green)':sc>=13?'var(--blue)':sc>=9?'var(--amber)':'var(--red)'}">${sc}/30</td>
       <td><span class="badge ${sigCls}">${sigLabel}</span></td>
-      <td class="mono" style="font-size:11px"><span class="r">₹${(s.sl||0).toLocaleString('en-IN')}</span> · <span class="g">₹${(s.tp||0).toLocaleString('en-IN')}</span></td>
+      <td class="mono" style="font-size:11px">₹${entry.toLocaleString('en-IN',{maximumFractionDigits:1})}</td>
+      <td class="mono r" style="font-size:11px">₹${sl.toLocaleString('en-IN',{maximumFractionDigits:1})}</td>
+      <td class="mono g" style="font-size:11px">${t1 ? '₹'+t1.toLocaleString('en-IN',{maximumFractionDigits:0}) : '—'}</td>
+      <td class="mono g" style="font-size:11px">${t2 ? '₹'+t2.toLocaleString('en-IN',{maximumFractionDigits:0}) : '—'}</td>
+      <td class="mono g" style="font-size:11px">₹${tp.toLocaleString('en-IN',{maximumFractionDigits:1})}</td>
+      <td class="mono" style="font-size:11px;color:${rr>=3?'var(--green)':rr>=2?'var(--amber)':'var(--muted)'}">${rr}x</td>
     </tr>`;
   }).join('');
 }
@@ -1842,8 +2174,9 @@ async function loadIndexCards() {
       const pts = isBull ? '0,36 25,30 50,26 75,20 100,15 125,12 150,9 175,6 200,3'
                          : isBear ? '0,4 25,8 50,12 75,18 100,22 125,26 150,30 175,34 200,36'
                          : '0,20 25,18 50,22 75,19 100,21 125,18 150,22 175,20 200,19';
-      html += `<div class="index-card anim">
-        <div class="idx-lbl">${labels[k]||k} <span class="tag ${tagCls}">${trend}</span></div>
+      const liveTime = idx.live_refreshed ? `<span style="font-size:9px;opacity:.5;margin-left:6px">${idx.live_refreshed}</span>` : '';
+      html += `<div class="index-card anim" onclick="goToIndexFnO('${k}')" title="Click to load ${labels[k]||k} F&O signals">
+        <div class="idx-lbl">${labels[k]||k} <span class="tag ${tagCls}">${trend}</span>${liveTime}</div>
         <div class="idx-price">₹${ltp.toLocaleString('en-IN',{minimumFractionDigits:0})}</div>
         <div class="idx-chg ${chgCls}">${chg>=0?'+':''}${chg.toFixed(2)}% today</div>
         <div class="mini-chart">
@@ -1923,13 +2256,338 @@ async function paperReset() {
   loadPaperState();
 }
 
+// ── F&O Scanner functions ──────────────────────────────────
+function makeFnoCard(sig) {
+  const isCall = sig.direction === 'CALL';
+  const dirColor = isCall ? 'var(--green)' : 'var(--red)';
+  const dirBg    = isCall ? 'rgba(48,209,88,.12)' : 'rgba(255,69,58,.12)';
+  const actionCls = sig.action_flag && sig.action_flag.includes('ACTIONABLE') ? 'fno-action-green'
+                  : sig.action_flag && sig.action_flag.includes('REVIEW')      ? 'fno-action-amber'
+                  : 'fno-action-red';
+  const reasons = (sig.reasons || []).map(r => `<span>${r}</span>`).join('');
+  const setupFlags = (sig.setup_flags || []).slice(0,3).map(f => `<span>${f.replace(/^[✅❌⚠️]\s*/,'')}</span>`).join('');
+  const liveTag = sig.premium_live
+    ? `<span style="font-size:9px;background:var(--green-dim);color:var(--green);padding:1px 6px;border-radius:3px;margin-left:6px">● LIVE</span>`
+    : `<span style="font-size:9px;background:var(--amber-dim);color:var(--amber);padding:1px 6px;border-radius:3px;margin-left:6px">EST</span>`;
+  return `<div class="fno-card ${isCall?'call':'put'} anim">
+    <div class="fno-card-grid">
+      <div>
+        <div class="fc-head" style="color:${dirColor}">${sig.symbol} ${sig.direction}</div>
+        <div class="fc-sub">${sig.nfo_symbol||''} · ${sig.expiry||''}</div>
+        <div style="margin-top:6px"><span class="${actionCls}">${sig.action_flag||'—'}</span></div>
+        <div style="margin-top:5px;font-size:10px;color:var(--muted)">Setup ${sig.setup_score||0}/5 pts</div>
+      </div>
+      <div>
+        <div class="fno-lbl">Strike</div>
+        <div class="fno-val">₹${(sig.strike||0).toLocaleString('en-IN')}</div>
+        <div class="fno-lbl" style="margin-top:6px">Underlying</div>
+        <div class="fno-val" style="font-size:11px">₹${(sig.ltp||0).toLocaleString('en-IN')}</div>
+      </div>
+      <div>
+        <div class="fno-lbl">Entry Premium ${liveTag}</div>
+        <div class="fno-val" style="color:${dirColor}">₹${(sig.entry_option||0).toFixed(1)}</div>
+        <div class="fno-lbl" style="margin-top:6px">SL</div>
+        <div class="fno-val r">₹${(sig.sl_option||0).toFixed(1)} <span style="font-size:9px;color:var(--red)">(${sig.sl_pct||0}%)</span></div>
+      </div>
+      <div>
+        <div class="fno-lbl">T1</div>
+        <div class="fno-val g">₹${(sig.t1_option||0).toFixed(1)} <span style="font-size:9px;color:var(--green)">(+${sig.t1_pct||0}%)</span></div>
+        <div class="fno-lbl" style="margin-top:6px">T2</div>
+        <div class="fno-val g">₹${(sig.t2_option||0).toFixed(1)} <span style="font-size:9px;color:var(--green)">(+${sig.t2_pct||0}%)</span></div>
+      </div>
+      <div>
+        <div class="fno-lbl">T3</div>
+        <div class="fno-val g">₹${(sig.t3_option||0).toFixed(1)} <span style="font-size:9px;color:var(--green)">(+${sig.t3_pct||0}%)</span></div>
+        <div class="fno-lbl" style="margin-top:6px">R:R</div>
+        <div class="fno-val" style="color:${(sig.rr||0)>=3?'var(--green)':(sig.rr||0)>=2?'var(--amber)':'var(--muted)'}">${sig.rr||'—'}x</div>
+      </div>
+      <div>
+        <div class="fno-lbl">IV</div>
+        <div class="fno-val" style="font-size:11px;color:${sig.iv_level==='LOW'?'var(--green)':sig.iv_level==='HIGH'?'var(--red)':'var(--amber)'}">${sig.iv_level||'—'}</div>
+        <div class="fno-lbl" style="margin-top:6px">Time</div>
+        <div class="fno-val" style="font-size:10px;color:${sig.time_ok?'var(--green)':'var(--amber)'}">${sig.time_ok?'✅ Prime':'⚠ Off'}</div>
+      </div>
+    </div>
+    ${reasons || setupFlags ? `<div class="fno-why">${reasons||setupFlags}</div>` : ''}
+  </div>`;
+}
+
+async function loadFnO() {
+  try {
+    const d = await (await fetch('/api/live-fno')).json();
+    const sigs = d.signals || [];
+    const el = document.getElementById('fno-cards');
+    document.getElementById('fno-last-update').textContent = 'Updated: ' + (d.time||'—');
+    if (!sigs.length) {
+      el.innerHTML = '<div class="no-data" style="padding:20px;text-align:center">No live F&O signals — run Full Scan first or market may be closed</div>';
+      return;
+    }
+    el.innerHTML = sigs.map(makeFnoCard).join('');
+  } catch(e) { console.error('loadFnO',e); }
+}
+
+async function loadFnOTable() {
+  try {
+    const d = await (await fetch('/api/fno-signals')).json();
+    const sigs = d.signals || [];
+    const tb = document.getElementById('fno-body');
+    if (!sigs.length) { tb.innerHTML = '<tr><td colspan="14" class="no-data">No F&O signals</td></tr>'; return; }
+    tb.innerHTML = sigs.map(s => {
+      const isCall = s.direction === 'CALL';
+      const actCls = (s.action_flag||'').includes('ACTIONABLE') ? 'g' : (s.action_flag||'').includes('REVIEW') ? 'a' : 'r';
+      return `<tr>
+        <td class="sym">${s.symbol}</td>
+        <td style="font-size:10px;color:var(--muted)">${s.type||'—'}</td>
+        <td style="color:${isCall?'var(--green)':'var(--red)'};font-weight:600">${s.direction}</td>
+        <td class="mono">₹${(s.strike||0).toLocaleString('en-IN')}</td>
+        <td style="font-size:10px;color:var(--muted)">${s.expiry||'—'}</td>
+        <td class="mono" style="color:${isCall?'var(--green)':'var(--red)'}">₹${(s.entry_option||0).toFixed(1)}${s.premium_live?'<span style="font-size:8px;margin-left:3px;color:var(--green)">●</span>':''}</td>
+        <td class="mono r">₹${(s.sl_option||0).toFixed(1)}<span style="font-size:9px"> ${s.sl_pct||0}%</span></td>
+        <td class="mono g">₹${(s.t1_option||0).toFixed(1)}<span style="font-size:9px"> +${s.t1_pct||0}%</span></td>
+        <td class="mono g">₹${(s.t2_option||0).toFixed(1)}<span style="font-size:9px"> +${s.t2_pct||0}%</span></td>
+        <td class="mono g">₹${(s.t3_option||0).toFixed(1)}<span style="font-size:9px"> +${s.t3_pct||0}%</span></td>
+        <td class="mono" style="color:${(s.rr||0)>=3?'var(--green)':(s.rr||0)>=2?'var(--amber)':'var(--muted)'}">${s.rr||'—'}x</td>
+        <td style="font-size:10px;color:${s.iv_level==='LOW'?'var(--green)':s.iv_level==='HIGH'?'var(--red)':'var(--amber)'}">${s.iv_level||'—'}</td>
+        <td class="mono">${s.setup_score||0}/5</td>
+        <td class="${actCls}" style="font-size:10px;font-weight:600">${(s.action_flag||'—').replace(/^[🟢🟡🔴]\s*/,'')}</td>
+      </tr>`;
+    }).join('');
+  } catch(e) { console.error('loadFnOTable',e); }
+}
+
+async function loadIndexFnO(idxKey) {
+  const el = document.getElementById('fno-click-result');
+  el.style.display = 'block';
+  el.innerHTML = `<div style="padding:14px;color:var(--muted);font-size:12px">⟳ Loading ${idxKey} F&O signal...</div>`;
+  try {
+    const d = await (await fetch('/api/index-fno/'+idxKey)).json();
+    if (!d.ok) {
+      el.innerHTML = `<div style="padding:14px 18px;background:var(--bg1);border:0.5px solid var(--border);border-radius:var(--r)">
+        <div style="font-size:12px;color:var(--amber);font-weight:600">⚠ ${idxKey}: ${d.message||'No signal'}</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:4px">Trend: ${d.trend||'—'} · LTP: ₹${(d.ltp||0).toLocaleString('en-IN')}</div>
+      </div>`;
+      return;
+    }
+    el.innerHTML = makeFnoCard(d.signal);
+  } catch(e) {
+    el.innerHTML = `<div style="padding:14px;color:var(--red);font-size:12px">❌ Error loading ${idxKey} signal</div>`;
+  }
+}
+
+function goToIndexFnO(idxKey) {
+  // Switch to F&O tab and load signal for this index
+  const fnoTab = document.querySelector('.tab-bar .tab:nth-child(2)');
+  switchTab('fno', fnoTab);
+  loadIndexFnO(idxKey);
+}
+
+// ── Movers functions ────────────────────────────────────────
+async function loadMovers() {
+  try {
+    const d = await (await fetch('/api/top-movers')).json();
+    document.getElementById('mv-gainers').textContent  = (d.gainers||[]).length;
+    document.getElementById('mv-losers').textContent   = (d.losers||[]).length;
+    document.getElementById('mv-momentum').textContent = (d.momentum||[]).length;
+    document.getElementById('mv-volume').textContent   = (d.volume||[]).length;
+    document.getElementById('mv-reversal').textContent = (d.reversal||[]).length;
+
+    // Gainers
+    const gb = document.getElementById('mv-gainer-body');
+    if ((d.gainers||[]).length) {
+      gb.innerHTML = d.gainers.map(m => `<tr>
+        <td class="sym">${m.symbol}</td>
+        <td class="g mono">+${m.chg_pct.toFixed(2)}%</td>
+        <td class="mono ${m.gap_pct>0?'g':''}">${m.gap_pct>0?'+':''}${m.gap_pct.toFixed(1)}%</td>
+        <td class="mono ${m.intra_pct>0?'g':'r'}">${m.intra_pct>0?'+':''}${m.intra_pct.toFixed(1)}%</td>
+        <td style="font-size:10px">${m.category}</td>
+        <td class="mono" style="color:${m.score>=20?'var(--green)':m.score>=13?'var(--blue)':'var(--muted)'}">${m.score||'—'}</td>
+      </tr>`).join('');
+    } else { gb.innerHTML = '<tr><td colspan="6" class="no-data">No gainers yet</td></tr>'; }
+
+    // Losers
+    const lb = document.getElementById('mv-loser-body');
+    if ((d.losers||[]).length) {
+      lb.innerHTML = d.losers.map(m => `<tr>
+        <td class="sym">${m.symbol}</td>
+        <td class="r mono">${m.chg_pct.toFixed(2)}%</td>
+        <td class="mono">${m.gap_pct.toFixed(1)}%</td>
+        <td class="mono r">${m.intra_pct.toFixed(1)}%</td>
+        <td style="font-size:10px">${m.category}</td>
+      </tr>`).join('');
+    } else { lb.innerHTML = '<tr><td colspan="5" class="no-data">No losers yet</td></tr>'; }
+
+    // Momentum
+    const mb = document.getElementById('mv-momentum-body');
+    if ((d.momentum||[]).length) {
+      mb.innerHTML = d.momentum.map(m => `<tr>
+        <td class="sym">${m.symbol}</td>
+        <td class="g mono">+${m.chg_pct.toFixed(2)}%</td>
+        <td class="g mono">+${m.intra_pct.toFixed(2)}%</td>
+        <td class="mono" style="font-size:10px">${(m.volume/1e6).toFixed(1)}M</td>
+        <td class="mono" style="color:${m.score>=20?'var(--green)':m.score>=13?'var(--blue)':'var(--muted)'}">${m.score||'—'}</td>
+      </tr>`).join('');
+    } else { mb.innerHTML = '<tr><td colspan="5" class="no-data">No momentum stocks</td></tr>'; }
+
+    // Reversal
+    const rb = document.getElementById('mv-reversal-body');
+    if ((d.reversal||[]).length) {
+      rb.innerHTML = d.reversal.map(m => `<tr>
+        <td class="sym">${m.symbol}</td>
+        <td class="mono ${m.chg_pct>0?'g':'r'}">${m.chg_pct>0?'+':''}${m.chg_pct.toFixed(2)}%</td>
+        <td style="font-size:10px">${m.category}</td>
+        <td style="font-size:10px;color:var(--muted)">${m.signal||'—'}</td>
+      </tr>`).join('');
+    } else { rb.innerHTML = '<tr><td colspan="4" class="no-data">No reversals</td></tr>'; }
+
+    // High probability
+    renderHighProb(d.high_probability||[]);
+  } catch(e) { console.error('loadMovers',e); }
+}
+
+// ── High probability cards ──────────────────────────────────
+function renderHighProb(hp) {
+  const el = document.getElementById('hp-cards');
+  if (!hp.length) { el.innerHTML = '<div class="no-data" style="padding:24px;text-align:center">No high-probability setups — run a Full Scan first</div>'; return; }
+  el.innerHTML = hp.map(s => {
+    const sc = s.score||0;
+    const sigCls = sc>=20?'badge-sb':sc>=13?'badge-buy':'badge-wl';
+    const sl = s.sl||0; const tp = s.tp||0; const entry = s.ltp||0;
+    const t1 = sl&&tp ? (entry+(tp-entry)*.35) : 0;
+    const t2 = sl&&tp ? (entry+(tp-entry)*.65) : 0;
+    const rr = sl&&sl<entry ? ((tp-entry)/(entry-sl)).toFixed(1) : '—';
+    const bk = s.breakdown||{};
+    const vwapTag = s.above_vwap ? '<span style="font-size:9px;padding:1px 6px;border-radius:3px;background:rgba(48,209,88,.1);color:var(--green)">Above VWAP</span>' : '';
+    const volTag  = s.vol_surge  ? '<span style="font-size:9px;padding:1px 6px;border-radius:3px;background:rgba(0,122,255,.1);color:var(--blue)">Vol Surge</span>' : '';
+    const smcTag  = s.smc_bos   ? '<span style="font-size:9px;padding:1px 6px;border-radius:3px;background:rgba(255,214,10,.1);color:var(--amber)">BOS</span>' : '';
+    return `<div class="hp-card anim">
+      <div class="hp-top">
+        <div class="hp-sym">${s.symbol}</div>
+        <span class="badge ${sigCls}">${s.signal||'BUY'}</span>
+        <span class="hp-cat">${s.category||'High Prob'}</span>
+        ${vwapTag}${volTag}${smcTag}
+        <span style="font-size:11px;font-weight:700;color:${sc>=20?'var(--green)':'var(--blue)'}">Score ${sc}/30</span>
+        <span style="font-size:11px;color:${s.chg_pct>0?'var(--green)':'var(--red)'}">+${(s.chg_pct||0).toFixed(2)}% today</span>
+      </div>
+      <div class="hp-grid">
+        <div class="hp-item"><div class="hp-lbl">Entry</div><div class="hp-val">₹${entry.toLocaleString('en-IN',{maximumFractionDigits:1})}</div></div>
+        <div class="hp-item"><div class="hp-lbl">Stop Loss</div><div class="hp-val r">₹${sl.toLocaleString('en-IN',{maximumFractionDigits:1})}</div></div>
+        <div class="hp-item"><div class="hp-lbl">T1 (35%)</div><div class="hp-val g">${t1?'₹'+t1.toLocaleString('en-IN',{maximumFractionDigits:0}):'—'}</div></div>
+        <div class="hp-item"><div class="hp-lbl">T2 (65%)</div><div class="hp-val g">${t2?'₹'+t2.toLocaleString('en-IN',{maximumFractionDigits:0}):'—'}</div></div>
+        <div class="hp-item"><div class="hp-lbl">T3 (Full)</div><div class="hp-val g">₹${tp.toLocaleString('en-IN',{maximumFractionDigits:1})}</div></div>
+        <div class="hp-item"><div class="hp-lbl">R:R Ratio</div><div class="hp-val" style="color:${rr>=3?'var(--green)':rr>=2?'var(--amber)':'var(--muted)'}">${rr}x</div></div>
+      </div>
+      <div style="margin-top:10px;display:flex;gap:6px;flex-wrap:wrap">
+        <span style="font-size:10px;color:var(--muted)">Tech ${(bk.technical?.score||0)}/5</span>
+        <span style="font-size:10px;color:var(--muted)">Brk ${(bk.breakout?.score||0)}/5</span>
+        <span style="font-size:10px;color:var(--muted)">SMC ${(bk.smc?.score||0)}/5</span>
+        <span style="font-size:10px;color:var(--muted)">Fib ${(bk.fibonacci?.score||0)}/3</span>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// ── Live 5-second index + F&O refresh ──────────────────────
+let liveRefreshTimer = null;
+async function liveIndexRefresh() {
+  if (!liveRefreshTimer) return;
+  try {
+    const d = await (await fetch('/api/indices/live')).json();
+    if (d.ok && d.indices) {
+      // Update index card prices in-place without rebuilding entire grid
+      const keys = ['NIFTY','BANKNIFTY','FINNIFTY','MIDCAP'];
+      keys.forEach(k => {
+        const idx = d.indices[k];
+        if (!idx || idx.error) return;
+        // Update price cells if cards exist
+        const cards = document.querySelectorAll('#index-grid .index-card');
+        cards.forEach((card, i) => {
+          const lbl = card.querySelector('.idx-lbl');
+          if (lbl && lbl.textContent.includes(k === 'NIFTY' ? 'NIFTY 50' : k === 'BANKNIFTY' ? 'BANK' : k === 'FINNIFTY' ? 'FIN' : 'MIDCAP')) {
+            const priceEl = card.querySelector('.idx-price');
+            const chgEl   = card.querySelector('.idx-chg');
+            if (priceEl) priceEl.textContent = '₹' + (idx.ltp||0).toLocaleString('en-IN',{minimumFractionDigits:0});
+            if (chgEl) {
+              const chg = idx.change_pct||0;
+              chgEl.textContent = (chg>=0?'+':'') + chg.toFixed(2) + '% today';
+              chgEl.className = 'idx-chg ' + (chg>=0?'up':'dn');
+            }
+          }
+        });
+      });
+      // Refresh live F&O card display
+      if (document.getElementById('tab-fno').style.display !== 'none') {
+        const sigs = d.live_fno || [];
+        const el = document.getElementById('fno-cards');
+        if (sigs.length) {
+          el.innerHTML = sigs.map(makeFnoCard).join('');
+          document.getElementById('fno-last-update').textContent = 'Live · ' + (d.time||'—');
+        }
+      }
+    }
+  } catch(e) { /* silent — don't spam on 5s poll errors */ }
+}
+
+function startLiveRefresh() {
+  if (liveRefreshTimer) clearInterval(liveRefreshTimer);
+  liveRefreshTimer = setInterval(liveIndexRefresh, 5000);
+}
+
+// ── Updated render function — also populate movers/highprob ─
+function renderExtras(d) {
+  // After main render, also update movers from cached data
+  if (d.top_movers && Object.keys(d.top_movers).length) {
+    const mv = d.top_movers;
+    const gEl = document.getElementById('mv-gainers');
+    const lEl = document.getElementById('mv-losers');
+    const mEl = document.getElementById('mv-momentum');
+    const vEl = document.getElementById('mv-volume');
+    const rEl = document.getElementById('mv-reversal');
+    if (gEl) gEl.textContent = (mv.gainers||[]).length;
+    if (lEl) lEl.textContent = (mv.losers||[]).length;
+    if (mEl) mEl.textContent = (mv.momentum||[]).length;
+    if (vEl) vEl.textContent = (mv.volume||[]).length;
+    if (rEl) rEl.textContent = (mv.reversal||[]).length;
+    renderHighProb(TopMoversEngine_getHP(mv, d.signals||[]));
+  }
+  if ((d.live_fno||[]).length) {
+    const fnoEl = document.getElementById('fno-cards');
+    if (fnoEl && document.getElementById('tab-fno') && document.getElementById('tab-fno').style.display !== 'none') {
+      fnoEl.innerHTML = d.live_fno.map(makeFnoCard).join('');
+    }
+  }
+}
+
+// Client-side high-prob filter (mirrors backend logic)
+function TopMoversEngine_getHP(mv, sigs) {
+  const sigMap = {};
+  (sigs||[]).forEach(s => { sigMap[s.symbol] = s; });
+  const results = [];
+  const seen = new Set();
+  for (const cat of ['gainers','momentum']) {
+    for (const m of (mv[cat]||[])) {
+      if (seen.has(m.symbol)) continue;
+      const sig = sigMap[m.symbol];
+      if (!sig || (sig.score||0) < 13) continue;
+      seen.add(m.symbol);
+      results.push({...m, score:sig.score, signal:sig.signal, sl:sig.sl, tp:sig.tp,
+        vol_surge:sig.vol_surge, above_vwap:sig.above_vwap, breakdown:sig.breakdown||{},
+        smc_bos:sig.smc_bos, category:(sig.score||0)>=20?'⚡ High Probability':'🎯 BUY Candidate'});
+      if (results.length >= 10) break;
+    }
+  }
+  return results.sort((a,b) => (b.score||0)-(a.score||0));
+}
+
+// ── Tab switching — load data on tab open ──────────────────
+
 // ── Kick off ───────────────────────────────────────────────
 fetchState();
 loadPaperState();
 loadIndexCards();
+startLiveRefresh();
 setInterval(fetchState,    30000);
 setInterval(loadPaperState,15000);
-setInterval(loadIndexCards,60000);
+setInterval(loadIndexCards, 5000);  // Full card rebuild every 5s
 </script>
 </body>
 </html>

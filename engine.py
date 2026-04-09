@@ -1883,6 +1883,12 @@ class OptionEngine:
         "MIDCAP": 50, "SENSEX": 100,
     }
 
+    # Weekly expiry weekday per underlying (Thursday=3, Tuesday=1)
+    _EXPIRY_WEEKDAY = {
+        "NIFTY": 3, "BANKNIFTY": 3, "MIDCAP": 3, "SENSEX": 3,
+        "FINNIFTY": 1,  # Tuesday expiry
+    }
+
     # ── Expiry helpers ────────────────────────────────────────
     @staticmethod
     def next_weekly_expiry(from_date=None, weekday: int = 3) -> "datetime.date":
@@ -2264,3 +2270,410 @@ class OptionEngine:
             "equity_signal":   equity_signal,
             "pivot_ref":       pivot_ref,
         }
+
+
+# ═════════════════════════════════════════════════════════════
+# ███  NIFTY INTRADAY OPTIONS SIGNAL ENGINE  ██████████████████
+# ─────────────────────────────────────────────────────────────
+# 3-Layer Confirmation Model:
+#   Layer 1 — Trend (15min proxy via EMA + VWAP vs LTP)
+#   Layer 2 — Trigger (breakout/breakdown confirmation)
+#   Layer 3 — Options validation (OI + premium behavior)
+#
+# Generates direct index-based signals independent of equity scan.
+# Called every 5 sec by live index refresh loop.
+# ═════════════════════════════════════════════════════════════
+class NiftyOptionsEngine:
+
+    # Premium filter — ideal zone for intraday (risk-reward sweet spot)
+    PREMIUM_MIN = 80
+    PREMIUM_MAX = 350
+
+    @staticmethod
+    def get_trend(idx_data: dict) -> str:
+        """
+        Derive trend from index snapshot (pivot data).
+        BULLISH : LTP above R1 and above PP
+        BEARISH : LTP below S1 and below PP
+        SIDEWAYS: between S1 and R1
+        """
+        ltp   = float(idx_data.get("ltp",   0))
+        r1    = float(idx_data.get("r1",    ltp * 1.01))
+        s1    = float(idx_data.get("s1",    ltp * 0.99))
+        above = idx_data.get("above_pivot", True)
+        if ltp > r1:             return "BULLISH"
+        if ltp < s1:             return "BEARISH"
+        if above and ltp > (s1 + r1) / 2: return "BULLISH"
+        if not above:            return "BEARISH"
+        return "SIDEWAYS"
+
+    @staticmethod
+    def _body_ratio(o, c, h, l) -> float:
+        rng = h - l
+        return abs(c - o) / rng if rng > 0 else 0
+
+    @staticmethod
+    def score_setup(
+        idx_data:  dict,
+        oc_data:   dict,
+        vix:       float,
+        direction: str,
+    ) -> Tuple[int, List[str]]:
+        """
+        7-point setup quality score for direct NIFTY option trades.
+        Returns (score, reason_flags).
+        """
+        score = 0
+        flags = []
+        ltp   = float(idx_data.get("ltp", 0))
+        r1    = float(idx_data.get("r1",  ltp * 1.01))
+        s1    = float(idx_data.get("s1",  ltp * 0.99))
+        pp    = float(idx_data.get("pivot", ltp))
+        above = idx_data.get("above_pivot", True)
+
+        # T1: VWAP + pivot alignment
+        if direction == "CALL" and above:
+            score += 2; flags.append("✅ CALL: LTP above PP — bullish bias confirmed")
+        elif direction == "PUT" and not above:
+            score += 2; flags.append("✅ PUT: LTP below PP — bearish bias confirmed")
+        else:
+            flags.append("⚠️ Direction conflicts with pivot bias")
+
+        # T2: Distance from PP (momentum confirmation)
+        dist_r = abs(ltp - pp) / pp if pp else 0
+        if dist_r > 0.003:
+            score += 1; flags.append(f"✅ Momentum: {dist_r*100:.2f}% from PP — directional conviction")
+        else:
+            flags.append(f"⚠️ Only {dist_r*100:.2f}% from PP — chop zone, wait")
+
+        # T3: OI confirmation
+        pcr = float(oc_data.get("pcr", 1.0) or 1.0)
+        if direction == "CALL" and pcr >= 0.85:
+            score += 1; flags.append(f"✅ OI: PCR {pcr:.2f} — put writers active (CALL favoured)")
+        elif direction == "PUT" and pcr <= 0.80:
+            score += 1; flags.append(f"✅ OI: PCR {pcr:.2f} — call writers active (PUT favoured)")
+        else:
+            flags.append(f"⚠️ OI: PCR {pcr:.2f} — not strongly confirming {direction}")
+
+        # T4: VIX filter
+        if vix < 20:
+            score += 1; flags.append(f"✅ VIX {vix:.1f} — calm environment, premium reasonable")
+        elif vix < 25:
+            flags.append(f"⚠️ VIX {vix:.1f} — elevated, premium expensive — reduce size")
+        else:
+            flags.append(f"❌ VIX {vix:.1f} — too high, option buying risky")
+
+        # T5: Not inside S1-R1 chop zone
+        chop_range = r1 - s1
+        if chop_range > 0:
+            proximity_pct = min(abs(ltp - r1), abs(ltp - s1)) / chop_range
+            if proximity_pct > 0.25:
+                score += 1; flags.append(f"✅ Clear of S1-R1 midpoint — directional move")
+            else:
+                flags.append("⚠️ Inside pivot chop zone — wait for breakout")
+
+        # T6: Time window
+        now = datetime.now()
+        m   = now.hour * 60 + now.minute
+        if (9*60+45 <= m <= 11*60+30) or (13*60+45 <= m <= 15*60):
+            score += 1; flags.append(f"✅ Time: {now.strftime('%H:%M')} — prime F&O window")
+        else:
+            flags.append(f"⚠️ Time: {now.strftime('%H:%M')} — outside prime window")
+
+        return score, flags
+
+    @staticmethod
+    def generate_signal(
+        kl:        "KiteLayer",
+        idx_key:   str,
+        idx_data:  dict,
+        oc_data:   dict,
+        vix:       float,
+    ) -> Optional[dict]:
+        """
+        Generate a direct NIFTY/BANKNIFTY/FINNIFTY intraday options signal.
+        Returns None if setup quality < 4/7 (low probability — skip).
+        """
+        if not idx_data or idx_data.get("error"):
+            return None
+
+        ltp = float(idx_data.get("ltp", 0))
+        if ltp < 100:
+            return None
+
+        trend = NiftyOptionsEngine.get_trend(idx_data)
+        if trend == "SIDEWAYS":
+            return None
+
+        direction = "CALL" if trend == "BULLISH" else "PUT"
+
+        # Score the setup
+        setup_score, setup_flags = NiftyOptionsEngine.score_setup(
+            idx_data, oc_data, vix, direction
+        )
+        if setup_score < 4:
+            return None  # Low confidence — skip
+
+        # Strike selection: ATM, slight OTM for leverage
+        atm    = OptionEngine.get_atm_strike(ltp, idx_key)
+        step   = OptionEngine._STEPS.get(idx_key, 50)
+        strike = atm + step if direction == "CALL" else atm - step
+
+        # Fetch real premium
+        ot = "CE" if direction == "CALL" else "PE"
+        real_ltp, nfo_sym, exp_label = OptionEngine.fetch_real_ltp(kl, idx_key, strike, ot)
+        entry = real_ltp if real_ltp else OptionEngine.estimate_premium(ltp, idx_key, vix)
+        is_live = real_ltp is not None
+
+        # Premium filter
+        premium_ok = NiftyOptionsEngine.PREMIUM_MIN <= entry <= NiftyOptionsEngine.PREMIUM_MAX
+        if not premium_ok and is_live:
+            setup_flags.append(
+                f"⚠️ Premium ₹{entry:.0f} outside ideal range "
+                f"(₹{NiftyOptionsEngine.PREMIUM_MIN}–₹{NiftyOptionsEngine.PREMIUM_MAX})"
+            )
+
+        # Underlying SL/TP from pivot levels
+        r1 = float(idx_data.get("r1", ltp * 1.01))
+        s1 = float(idx_data.get("s1", ltp * 0.99))
+        und_sl = s1 if direction == "CALL" else r1
+        und_tp = r1 if direction == "CALL" else s1
+
+        # Option trade levels
+        levels = OptionEngine.compute_trade_levels(entry, ltp, und_sl, und_tp)
+
+        # IV assessment
+        iv_level, iv_flag = OptionEngine.iv_assessment(entry, ltp, vix)
+
+        # Why this trade
+        reasons = []
+        above = idx_data.get("above_pivot", True)
+        if direction == "CALL":
+            if above:     reasons.append("✔ Above PP")
+            if ltp > r1:  reasons.append("✔ Above R1 — bullish breakout")
+        else:
+            if not above: reasons.append("✔ Below PP")
+            if ltp < s1:  reasons.append("✔ Below S1 — bearish breakdown")
+        pcr = float(oc_data.get("pcr", 1.0) or 1.0)
+        if pcr >= 0.85: reasons.append("✔ OI buildup (PCR bullish)")
+        if vix < 15:    reasons.append("✔ Low VIX — cheap premium")
+
+        actionable = setup_score >= 5 and iv_level != "HIGH" and premium_ok
+
+        return {
+            "symbol":         idx_key,
+            "type":           "INDEX_INTRADAY",
+            "direction":      direction,
+            "option_type":    ot,
+            "strike":         strike,
+            "nfo_symbol":     nfo_sym,
+            "expiry":         exp_label,
+            "ltp":            round(ltp, 2),
+            "entry_option":   round(entry, 1),
+            "premium_live":   is_live,
+            "sl_option":      levels["sl"],
+            "t1_option":      levels["t1"],
+            "t2_option":      levels["t2"],
+            "t3_option":      levels["t3"],
+            "sl_pct":         levels["sl_pct"],
+            "t1_pct":         levels["t1_pct"],
+            "t2_pct":         levels["t2_pct"],
+            "t3_pct":         levels["t3_pct"],
+            "rr":             levels["rr"],
+            "iv_level":       iv_level,
+            "iv_flag":        iv_flag,
+            "setup_score":    setup_score,
+            "setup_flags":    setup_flags,
+            "reasons":        reasons,
+            "premium_ok":     premium_ok,
+            "action_flag":    "🟢 ACTIONABLE" if actionable else "🟡 REVIEW",
+            "trend":          trend,
+        }
+
+
+# ═════════════════════════════════════════════════════════════
+# ███  TOP MOVERS ENGINE  █████████████████████████████████████
+# ─────────────────────────────────────────────────────────────
+# Identifies today's highest-velocity movers in real time.
+# Categories:
+#   🔥 Explosive  — gap/move >10%
+#   🚀 Strong     — gap/move 5-10%
+#   ⚡ Momentum   — move 3-5% intraday (no gap)
+#   🔄 Reversal   — move after prior-day extreme (exhaustion)
+#   📊 Volume     — volume 3x average (accumulation signal)
+# ═════════════════════════════════════════════════════════════
+class TopMoversEngine:
+
+    @staticmethod
+    def compute(quote_data: dict, signals: list) -> dict:
+        """
+        Build today's movers from live quote_data.
+        Returns categorised lists for the UI.
+        """
+        # Build signal map for score lookup
+        sig_map = {s["symbol"]: s for s in (signals or [])}
+
+        gainers  = []
+        losers   = []
+        momentum = []
+        volume   = []
+        reversal = []
+
+        for sym, q in quote_data.items():
+            ltp        = float(q.get("ltp", 0))
+            prev       = float(q.get("prev_close", 0))
+            op         = float(q.get("open", 0))
+            vol        = int(q.get("volume", 0))
+            if not prev or ltp < 10:
+                continue
+
+            chg_pct  = (ltp - prev) / prev * 100
+            gap_pct  = (op  - prev) / prev * 100 if prev else 0
+            intra    = (ltp - op)   / op   * 100 if op   else 0
+
+            base = {
+                "symbol":    sym,
+                "ltp":       round(ltp, 2),
+                "chg_pct":   round(chg_pct, 2),
+                "gap_pct":   round(gap_pct, 2),
+                "intra_pct": round(intra, 2),
+                "volume":    vol,
+                "score":     sig_map.get(sym, {}).get("score", 0),
+                "signal":    sig_map.get(sym, {}).get("signal", ""),
+            }
+
+            # Gainers / losers
+            if chg_pct >= 2:
+                cat = "🔥 Explosive" if chg_pct >= 10 else "🚀 Strong" if chg_pct >= 5 else "📈 Up"
+                gainers.append({**base, "category": cat})
+            elif chg_pct <= -2:
+                cat = "💥 Crash" if chg_pct <= -10 else "📉 Weak" if chg_pct <= -5 else "🔻 Down"
+                losers.append({**base, "category": cat})
+
+            # Momentum — intraday surge without gap
+            if gap_pct < 2 and intra >= 3:
+                momentum.append({**base, "category": "⚡ Intraday Momentum"})
+
+            # Volume surge
+            if vol > 5_000_000 and chg_pct > 0:
+                volume.append({**base, "category": "📊 Volume Surge"})
+
+            # Reversal candidates — stock moved >8% and shows exhaustion
+            if abs(chg_pct) >= 8 and chg_pct < 0 and gap_pct > 5:
+                reversal.append({**base, "category": "🔄 Gap-Fill Reversal"})
+            elif abs(chg_pct) >= 8 and chg_pct > 0 and intra < -2:
+                reversal.append({**base, "category": "🔄 Exhaustion Short"})
+
+        # Sort and cap each category
+        gainers.sort(key=lambda x: x["chg_pct"], reverse=True)
+        losers.sort(key=lambda x: x["chg_pct"])
+        momentum.sort(key=lambda x: x["intra_pct"], reverse=True)
+        volume.sort(key=lambda x: x["volume"], reverse=True)
+        reversal.sort(key=lambda x: abs(x["chg_pct"]), reverse=True)
+
+        return {
+            "gainers":  gainers[:20],
+            "losers":   losers[:20],
+            "momentum": momentum[:15],
+            "volume":   volume[:15],
+            "reversal": reversal[:10],
+        }
+
+    @staticmethod
+    def get_high_probability(movers: dict, signals: list) -> list:
+        """
+        Cross-reference top movers with scored signals to surface
+        'high-probability' setups — stocks that are BOTH moving fast
+        AND have strong technical scores.
+        """
+        sig_map  = {s["symbol"]: s for s in (signals or [])}
+        results  = []
+        seen     = set()
+
+        for cat_key in ["gainers", "momentum"]:
+            for m in movers.get(cat_key, []):
+                sym = m["symbol"]
+                if sym in seen:
+                    continue
+                sig = sig_map.get(sym)
+                if not sig:
+                    continue
+                score = sig.get("score", 0)
+                if score < 13:  # at least BUY quality
+                    continue
+                seen.add(sym)
+                results.append({
+                    **m,
+                    "score":       score,
+                    "signal":      sig.get("signal", ""),
+                    "sl":          sig.get("sl", 0),
+                    "tp":          sig.get("tp", 0),
+                    "vol_surge":   sig.get("vol_surge", False),
+                    "above_vwap":  sig.get("above_vwap", False),
+                    "breakdown":   sig.get("breakdown", {}),
+                    "category":    "⚡ High Probability" if score >= 20 else "🎯 BUY Candidate",
+                })
+                if len(results) >= 10:
+                    break
+
+        results.sort(key=lambda x: x["score"], reverse=True)
+        return results
+
+
+# ═════════════════════════════════════════════════════════════
+# ███  LIVE INDICES REFRESHER  ████████████████████████████████
+# ─────────────────────────────────────────────────────────────
+# Lightweight refresh of index LTP + pivot every 5 seconds
+# using kite.ltp() — far cheaper than historical_data().
+# Updates STATE["indices"] in-place without triggering full scan.
+# ═════════════════════════════════════════════════════════════
+class LiveIndexRefresher:
+
+    INDEX_TOKENS = {
+        "NIFTY":     "NSE:NIFTY 50",
+        "BANKNIFTY": "NSE:NIFTY BANK",
+        "FINNIFTY":  "NSE:NIFTY FIN SERVICE",
+        "MIDCAP":    "NSE:NIFTY MIDCAP 150",
+    }
+
+    @staticmethod
+    def refresh(kl: "KiteLayer", current_indices: dict) -> dict:
+        """
+        Fetch live LTP for all 4 indices and update only the live fields.
+        Pivot levels are preserved from the last full scan.
+        Returns updated indices dict.
+        """
+        if kl is None:
+            return current_indices
+
+        updated = dict(current_indices)
+        try:
+            keys = list(LiveIndexRefresher.INDEX_TOKENS.values())
+            data = kl._k.ltp(keys)
+            for idx_key, nse_sym in LiveIndexRefresher.INDEX_TOKENS.items():
+                if nse_sym not in data:
+                    continue
+                ltp = float(data[nse_sym]["last_price"])
+                if idx_key not in updated or not updated[idx_key]:
+                    updated[idx_key] = {}
+                prev = updated[idx_key].get("ltp", ltp)
+                if prev:
+                    chg = (ltp - prev) / prev * 100
+                    updated[idx_key]["change_pct"] = round(chg, 2)
+                updated[idx_key]["ltp"] = round(ltp, 2)
+                updated[idx_key]["live_refreshed"] = datetime.now().strftime("%H:%M:%S")
+
+                # Update trend based on new LTP vs pivot
+                pivot = float(updated[idx_key].get("pivot", ltp))
+                r1    = float(updated[idx_key].get("r1",    ltp))
+                s1    = float(updated[idx_key].get("s1",    ltp))
+                above = ltp > pivot
+                updated[idx_key]["above_pivot"] = above
+                if ltp > r1:   updated[idx_key]["trend"] = "BULL"
+                elif ltp < s1: updated[idx_key]["trend"] = "BEAR"
+                else:          updated[idx_key]["trend"] = "SIDEWAYS"
+
+        except Exception as e:
+            log.warning(f"  [LiveRefresh] Index LTP error: {e}")
+
+        return updated
