@@ -46,6 +46,12 @@ CFG = {
     "VIX_MAX": 20,
     "MIN_SCORE": 13,
     "GAP_UP_MIN_PCT": 2.0,  # Minimum gap-up percentage to alert
+    
+    # Index instrument tokens (NSE)
+    "NIFTY_TOKEN": 256265,      # NIFTY 50
+    "BANKNIFTY_TOKEN": 260105,  # NIFTY BANK
+    "FINNIFTY_TOKEN": 257801,   # NIFTY FIN SERVICE
+    "MIDCAP_TOKEN": 288009,     # NIFTY MIDCAP 100
 }
 
 
@@ -196,6 +202,29 @@ class KiteLayer:
         except Exception as e:
             log.error(f"[Kite] Margins error: {e}")
             return 0.0
+    
+    def get_ohlcv(self, token: int, days: int = 400) -> pd.DataFrame:
+        """Fetch OHLCV data for an instrument token."""
+        try:
+            to_date = datetime.now()
+            from_date = to_date - timedelta(days=days)
+            
+            data = self._k.historical_data(
+                instrument_token=token,
+                from_date=from_date,
+                to_date=to_date,
+                interval="day"
+            )
+            
+            df = pd.DataFrame(data)
+            if not df.empty:
+                df['date'] = pd.to_datetime(df['date'])
+                df = df.sort_values('date')
+            return df
+            
+        except Exception as e:
+            log.error(f"[Kite] OHLCV error for token {token}: {e}")
+            return pd.DataFrame()
 
 
 # ═════════════════════════════════════════════════════════════
@@ -242,6 +271,16 @@ class NSEClient:
             "dii_net": -800.0,
             "date": datetime.now().strftime("%Y-%m-%d")
         }
+    
+    def get_fii_dii(self) -> dict:
+        """Alias for get_fii_dii_data."""
+        return self.get_fii_dii_data()
+    
+    def get_india_vix(self) -> Optional[float]:
+        """Fetch India VIX value."""
+        # Mock data - in production, fetch from NSE
+        # Returns None to trigger fallback to Kite
+        return None
     
     def get_option_chain_pcr(self, symbol: str) -> dict:
         """Fetch option chain PCR (Put-Call Ratio) data."""
@@ -355,6 +394,11 @@ class UniverseManager:
 # ═════════════════════════════════════════════════════════════
 class TechnicalEngine:
     """Calculate technical indicators and scores."""
+    
+    @staticmethod
+    def compute(df: pd.DataFrame) -> pd.DataFrame:
+        """Alias for calculate_indicators - computes all technical indicators."""
+        return TechnicalEngine.calculate_indicators(df)
     
     @staticmethod
     def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -490,6 +534,88 @@ class MarketRegime:
             "fii_net": fii_dii.get("fii_net", 0),
             "dii_net": fii_dii.get("dii_net", 0),
         }
+    
+    @staticmethod
+    def check(nifty_df: pd.DataFrame, vix: float, 
+              banknifty_df: pd.DataFrame = None,
+              finnifty_df: pd.DataFrame = None,
+              midcap_df: pd.DataFrame = None,
+              pcr: float = None) -> tuple:
+        """
+        Check market regime across multiple indices.
+        Returns: (score, flags, regime_ok, label, confidence)
+        """
+        score = 0
+        flags = []
+        
+        # VIX check (0-2 points)
+        if vix is not None:
+            if vix < 15:
+                score += 2
+                flags.append("LOW_VIX")
+            elif vix < 20:
+                score += 1
+                flags.append("MODERATE_VIX")
+            else:
+                flags.append("HIGH_VIX")
+        
+        # Nifty trend check (0-2 points)
+        if not nifty_df.empty and len(nifty_df) > 50:
+            last_close = nifty_df.iloc[-1]['close']
+            ema50 = nifty_df.iloc[-1].get('ema50', last_close)
+            
+            if last_close > ema50:
+                score += 2
+                flags.append("NIFTY_BULLISH")
+            elif last_close > ema50 * 0.98:
+                score += 1
+                flags.append("NIFTY_NEUTRAL")
+            else:
+                flags.append("NIFTY_BEARISH")
+        
+        # Bank Nifty alignment (0-1 point)
+        if banknifty_df is not None and not banknifty_df.empty and len(banknifty_df) > 50:
+            last_close = banknifty_df.iloc[-1]['close']
+            ema50 = banknifty_df.iloc[-1].get('ema50', last_close)
+            if last_close > ema50:
+                score += 1
+                flags.append("BANKNIFTY_ALIGNED")
+        
+        # PCR check (0-1 point)
+        if pcr is not None:
+            if 0.8 < pcr < 1.3:
+                score += 1
+                flags.append("PCR_BALANCED")
+            elif pcr > 1.3:
+                flags.append("PCR_BULLISH")
+            else:
+                flags.append("PCR_BEARISH")
+        
+        # Mid cap participation (0-1 point)
+        if midcap_df is not None and not midcap_df.empty and len(midcap_df) > 20:
+            last_close = midcap_df.iloc[-1]['close']
+            ma20 = midcap_df['close'].rolling(20).mean().iloc[-1]
+            if last_close > ma20:
+                score += 1
+                flags.append("MIDCAP_STRONG")
+        
+        # Determine regime label and confidence
+        if score >= 6:
+            label = "BULLISH"
+            confidence = 80 + (score - 6) * 5
+        elif score >= 4:
+            label = "SIDEWAYS BULLISH"
+            confidence = 60 + (score - 4) * 10
+        elif score >= 2:
+            label = "SIDEWAYS"
+            confidence = 40 + (score - 2) * 10
+        else:
+            label = "BEARISH"
+            confidence = max(20, score * 10)
+        
+        regime_ok = score >= 3
+        
+        return (score, flags, regime_ok, label, min(confidence, 95))
 
 
 # ═════════════════════════════════════════════════════════════
@@ -542,17 +668,203 @@ class FibonacciEngine:
 class PivotEngine:
     @staticmethod
     def calculate_pivots(data: dict) -> dict:
-        return {"r1": 0, "s1": 0, "pp": 0}
+        """Calculate pivot points from OHLC data."""
+        high = data.get("high", 0)
+        low = data.get("low", 0)
+        close = data.get("close", 0)
+        
+        if not all([high, low, close]):
+            return {"r1": 0, "s1": 0, "pp": 0, "r2": 0, "s2": 0}
+        
+        pp = (high + low + close) / 3
+        r1 = (2 * pp) - low
+        s1 = (2 * pp) - high
+        r2 = pp + (high - low)
+        s2 = pp - (high - low)
+        
+        return {
+            "pp": round(pp, 2),
+            "r1": round(r1, 2),
+            "s1": round(s1, 2),
+            "r2": round(r2, 2),
+            "s2": round(s2, 2),
+        }
+    
+    @staticmethod
+    def compute_all(nifty_df=None, banknifty_df=None, finnifty_df=None, midcap_df=None) -> dict:
+        """Compute pivot levels for all indices."""
+        result = {}
+        
+        def _compute_index(df, key):
+            if df is None or df.empty:
+                return {
+                    "ltp": 0, "pp": 0, "r1": 0, "s1": 0, "r2": 0, "s2": 0,
+                    "change_pct": 0, "high": 0, "low": 0, "close": 0
+                }
+            
+            last = df.iloc[-1]
+            prev_close = df.iloc[-2]['close'] if len(df) > 1 else last['close']
+            
+            pivots = PivotEngine.calculate_pivots({
+                "high": last['high'],
+                "low": last['low'],
+                "close": prev_close
+            })
+            
+            change_pct = 0
+            if prev_close > 0:
+                change_pct = ((last['close'] - prev_close) / prev_close) * 100
+            
+            return {
+                "ltp": round(last['close'], 2),
+                "change_pct": round(change_pct, 2),
+                "high": round(last['high'], 2),
+                "low": round(last['low'], 2),
+                "close": round(last['close'], 2),
+                **pivots
+            }
+        
+        result["NIFTY"] = _compute_index(nifty_df, "NIFTY")
+        result["BANKNIFTY"] = _compute_index(banknifty_df, "BANKNIFTY")
+        result["FINNIFTY"] = _compute_index(finnifty_df, "FINNIFTY")
+        result["MIDCAP"] = _compute_index(midcap_df, "MIDCAP")
+        
+        return result
 
 class OptionEngine:
     @staticmethod
     def analyze() -> List[dict]:
         return []
+    
+    @staticmethod
+    def build_signal(kl, underlying: str, ltp: float, direction: str,
+                    underlying_sl: float, underlying_tp: float, vix: float,
+                    oc_data: dict, equity_score: int = 0, equity_signal: str = "",
+                    pivot_data: dict = None) -> dict:
+        """Build option signal with strike selection and Greeks estimation."""
+        
+        # Mock implementation - returns a basic signal structure
+        # In production, this would:
+        # 1. Calculate optimal strike price (ATM/OTM)
+        # 2. Fetch real option chain data
+        # 3. Calculate Greeks (delta, theta, vega)
+        # 4. Determine lot size and risk
+        
+        # Simple ATM strike calculation
+        if direction == "CALL":
+            strike = int(ltp / 100) * 100  # Round to nearest 100
+            strike_label = f"{underlying} {strike} CE"
+        else:
+            strike = int(ltp / 100) * 100
+            strike_label = f"{underlying} {strike} PE"
+        
+        # Mock option premium
+        option_premium = ltp * 0.02  # ~2% of underlying
+        
+        return {
+            "underlying": underlying,
+            "underlying_ltp": ltp,
+            "direction": direction,
+            "strike": strike,
+            "strike_label": strike_label,
+            "premium": round(option_premium, 2),
+            "underlying_sl": underlying_sl,
+            "underlying_tp": underlying_tp,
+            "signal": direction,
+            "vix": vix,
+            "equity_score": equity_score,
+            "equity_signal": equity_signal,
+        }
 
 class NiftyOptionsEngine:
     @staticmethod
     def scan_live() -> List[dict]:
         return []
+    
+    @staticmethod
+    def get_trend(idx_data: dict) -> str:
+        """Determine trend from index data."""
+        if not idx_data:
+            return "UNKNOWN"
+        
+        ltp = idx_data.get("ltp", 0)
+        r1 = idx_data.get("r1", 0)
+        s1 = idx_data.get("s1", 0)
+        pp = idx_data.get("pp", 0)
+        
+        if not all([ltp, pp]):
+            return "UNKNOWN"
+        
+        if ltp > pp and ltp > r1:
+            return "BULLISH"
+        elif ltp < pp and ltp < s1:
+            return "BEARISH"
+        else:
+            return "SIDEWAYS"
+    
+    @staticmethod
+    def generate_signal(kl, idx_key: str, idx_data: dict, oc_data: dict, vix: float) -> Optional[dict]:
+        """Generate F&O signal for an index."""
+        
+        if not idx_data:
+            return None
+        
+        ltp = idx_data.get("ltp", 0)
+        if ltp <= 0:
+            return None
+        
+        # Get trend
+        trend = NiftyOptionsEngine.get_trend(idx_data)
+        
+        # Only generate signals for clear trends
+        if trend == "SIDEWAYS" or trend == "UNKNOWN":
+            return None
+        
+        # Get pivot levels
+        r1 = idx_data.get("r1", 0)
+        s1 = idx_data.get("s1", 0)
+        pp = idx_data.get("pp", 0)
+        
+        # Determine direction
+        direction = "CALL" if trend == "BULLISH" else "PUT"
+        
+        # Set targets
+        if direction == "CALL":
+            sl = s1 if s1 > 0 else ltp * 0.98
+            tp = r1 if r1 > 0 else ltp * 1.02
+        else:
+            sl = r1 if r1 > 0 else ltp * 1.02
+            tp = s1 if s1 > 0 else ltp * 0.98
+        
+        # Calculate strike
+        strike = int(ltp / 100) * 100
+        strike_label = f"{idx_key} {strike} {'CE' if direction == 'CALL' else 'PE'}"
+        
+        # Mock premium
+        premium = ltp * 0.015
+        
+        # Calculate confidence based on trend strength
+        change_pct = idx_data.get("change_pct", 0)
+        confidence = min(95, 60 + abs(change_pct) * 5)
+        
+        return {
+            "symbol": idx_key,
+            "type": "INDEX",
+            "underlying_ltp": ltp,
+            "direction": direction,
+            "trend": trend,
+            "strike": strike,
+            "strike_label": strike_label,
+            "premium": round(premium, 2),
+            "sl": round(sl, 2),
+            "tp": round(tp, 2),
+            "vix": vix,
+            "confidence": round(confidence, 1),
+            "pp": pp,
+            "r1": r1,
+            "s1": s1,
+            "pcr": oc_data.get("pcr", 1.0),
+        }
 
 class TopMoversEngine:
     @staticmethod
