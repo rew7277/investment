@@ -207,7 +207,7 @@ def run_full_scan():
         if kl is None:
             kl = init_kite()
         if universe is None:
-            universe = UniverseManager(kl)
+            universe = UniverseManager(nse, kl)
 
         # ─────────────────────────────────────────────────────
         # STEP 1: Get Full NSE Universe

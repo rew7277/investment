@@ -32,6 +32,7 @@ CFG = {
     "ATR_PERIOD": 14,
     "ATR_SL_MULTIPLIER": 2.0,
     "PROFIT_TARGET_RR": 2.5,
+    "CAPITAL": 1000000,  # Default capital for paper trading
     
     # Technical parameters
     "EMA_PERIOD": 50,
@@ -44,6 +45,7 @@ CFG = {
     "BREAKOUT_TOLERANCE": 0.02,
     "VIX_MAX": 20,
     "MIN_SCORE": 13,
+    "GAP_UP_MIN_PCT": 2.0,  # Minimum gap-up percentage to alert
 }
 
 
@@ -169,6 +171,31 @@ class KiteLayer:
             log.error(f"[Kite] Failed to load stocks: {e}")
             # Return curated list as fallback
             return NSEClient().get_all_stocks()
+    
+    def get_batch_quotes(self, symbols: List[str], batch_size: int = 500) -> dict:
+        """Get quotes for a list of symbols in batches."""
+        all_quotes = {}
+        
+        # Process in batches
+        for i in range(0, len(symbols), batch_size):
+            batch = symbols[i:i + batch_size]
+            try:
+                keys = [f"NSE:{s}" for s in batch]
+                quotes = self._k.quote(keys)
+                all_quotes.update(quotes)
+            except Exception as e:
+                log.error(f"[Kite] Batch quotes error (batch {i//batch_size + 1}): {e}")
+        
+        return all_quotes
+    
+    def get_available_capital(self) -> float:
+        """Get available capital from margins."""
+        try:
+            margins = self._k.margins("equity")
+            return float(margins.get("available", {}).get("live_balance", 0))
+        except Exception as e:
+            log.error(f"[Kite] Margins error: {e}")
+            return 0.0
 
 
 # ═════════════════════════════════════════════════════════════
@@ -215,6 +242,22 @@ class NSEClient:
             "dii_net": -800.0,
             "date": datetime.now().strftime("%Y-%m-%d")
         }
+    
+    def get_option_chain_pcr(self, symbol: str) -> dict:
+        """Fetch option chain PCR (Put-Call Ratio) data."""
+        # Mock data - in production, fetch from NSE option chain API
+        return {
+            "pcr": 1.2,
+            "calls_oi": 15000000,
+            "puts_oi": 18000000,
+            "symbol": symbol,
+            "timestamp": datetime.now().isoformat()
+        }
+    
+    def prefetch_scan_data(self):
+        """Prefetch any necessary data before scan."""
+        # Placeholder for any pre-scan data fetching
+        pass
 
 
 # ═════════════════════════════════════════════════════════════
@@ -223,9 +266,11 @@ class NSEClient:
 class UniverseManager:
     """Manages the stock universe."""
     
-    def __init__(self, nse_client: NSEClient):
+    def __init__(self, nse_client: NSEClient, kite_layer=None):
         self.nse = nse_client
+        self.kite = kite_layer
         self.universe = []
+        self.instruments_df = None
     
     def load_universe(self) -> List[str]:
         """Load the trading universe."""
@@ -233,11 +278,76 @@ class UniverseManager:
         log.info(f"[Universe] Loaded {len(self.universe)} stocks")
         return self.universe
     
-    def get_universe(self) -> List[str]:
-        """Get current universe."""
-        if not self.universe:
-            self.load_universe()
-        return self.universe
+    def get_universe(self) -> pd.DataFrame:
+        """Get current universe as DataFrame with instrument details."""
+        if self.instruments_df is None and self.kite:
+            # Get instruments from Kite
+            try:
+                instruments = pd.DataFrame(self.kite._k.instruments("NSE"))
+                # Filter for equity stocks only
+                equity = instruments[instruments["segment"] == "NSE"]
+                equity = equity[equity["instrument_type"] == "EQ"]
+                self.instruments_df = equity[["tradingsymbol", "instrument_token", "name"]].copy()
+                self.instruments_df.rename(columns={"tradingsymbol": "symbol"}, inplace=True)
+            except Exception as e:
+                log.error(f"[Universe] Failed to load instruments: {e}")
+                # Fallback to simple list
+                if not self.universe:
+                    self.load_universe()
+                self.instruments_df = pd.DataFrame({"symbol": self.universe})
+        
+        if self.instruments_df is None:
+            if not self.universe:
+                self.load_universe()
+            self.instruments_df = pd.DataFrame({"symbol": self.universe})
+        
+        return self.instruments_df
+    
+    def filter_for_deep_scan(self, quote_data: dict) -> List[dict]:
+        """Filter stocks for deep technical analysis based on initial screening."""
+        candidates = []
+        
+        for key, quote in quote_data.items():
+            symbol = key.replace("NSE:", "")
+            
+            # Extract quote data
+            ltp = quote.get("last_price", 0)
+            if ltp <= 0:
+                continue
+            
+            volume = quote.get("volume", 0)
+            avg_volume = quote.get("average_price", 0)  # Using as proxy
+            open_price = quote.get("ohlc", {}).get("open", 0)
+            prev_close = quote.get("ohlc", {}).get("close", 0)
+            
+            # Calculate gap %
+            gap_pct = 0
+            if prev_close > 0:
+                gap_pct = ((open_price - prev_close) / prev_close) * 100
+            
+            # Calculate volume surge
+            vol_surge = False
+            if avg_volume > 0 and volume > 0:
+                vol_surge = volume > (avg_volume * 1.5)
+            
+            # Include if gap-up OR high volume OR significant price change
+            chg_pct = quote.get("net_change", 0)
+            
+            if gap_pct >= 2.0 or vol_surge or abs(chg_pct) >= 3.0 or volume > 100000:
+                candidates.append({
+                    "symbol": symbol,
+                    "ltp": ltp,
+                    "volume": volume,
+                    "gap_pct": gap_pct,
+                    "chg_pct": chg_pct,
+                    "vol_surge": vol_surge
+                })
+        
+        # Sort by gap % and volume
+        candidates.sort(key=lambda x: (x.get("gap_pct", 0), x.get("volume", 0)), reverse=True)
+        
+        # Return top 200 candidates for deep analysis
+        return candidates[:200]
 
 
 # ═════════════════════════════════════════════════════════════
