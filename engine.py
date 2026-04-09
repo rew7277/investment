@@ -425,12 +425,13 @@ class UniverseManager:
         EXCLUDE_SUFFIXES = (
             "-BE", "-BL", "-BZ", "-IL", "-SM", "-GS",
             "NIFTY", "SENSEX", "BANKNIFTY", "FINNIFTY",
+            "INAV",   # ETF Indicative NAV — open=0 during market hours → fake -100% gap
         )
         df = self.get_universe()
         token_map = dict(zip(df["symbol"], df["token"]))
         candidates = []
         for sym, q in quote_data.items():
-            # Skip index derivatives, bond ETFs, illiquid instruments
+            # Skip index derivatives, bond ETFs, illiquid instruments, INAV symbols
             if any(sym.upper().endswith(sfx) or sym.upper().startswith(sfx)
                    for sfx in EXCLUDE_SUFFIXES):
                 continue
@@ -439,6 +440,10 @@ class UniverseManager:
             volume     = q.get("volume", 0)
             open_p     = q.get("open", 0)
             if not prev_close or ltp < CFG["MIN_PRICE"]:
+                continue
+            # Guard: open=0 means the instrument hasn't traded today (INAV, illiquid, halted)
+            # gap_pct = (0 - prev) / prev = -100% which is completely bogus — skip it
+            if open_p <= 0:
                 continue
             gap_pct    = (open_p - prev_close) / prev_close * 100 if prev_close else 0
             change_pct = (ltp - prev_close) / prev_close * 100 if prev_close else 0
@@ -1973,8 +1978,12 @@ class OptionEngine:
                 if data and key in data:
                     ltp = float(data[key]["last_price"])
                     if ltp > 0:
-                        # label: "13 Apr (weekly)" or "24 Apr (monthly)"
-                        exp_label = f"{expiry.strftime('%d %b')} {'(weekly)' if sym==weekly_sym else '(monthly)'}"
+                        # BUG FIX: use the CORRECT expiry date for the label.
+                        # When monthly symbol is matched, show monthly_expiry date (last Thu of month),
+                        # NOT the weekly expiry date — previously both showed the weekly date.
+                        label_date = expiry if sym == weekly_sym else monthly_expiry
+                        exp_label  = (f"{label_date.strftime('%d %b')} "
+                                      f"{'(weekly)' if sym == weekly_sym else '(monthly)'}")
                         log.info(f"  [Option] Real LTP: {sym} = ₹{ltp:.1f}")
                         return ltp, sym, exp_label
             except Exception as e:
@@ -2520,16 +2529,22 @@ class TopMoversEngine:
         reversal = []
 
         for sym, q in quote_data.items():
+            # Skip ETF Indicative NAV symbols — open=0 during market hours → -100% fake gap
+            if sym.upper().endswith("INAV"):
+                continue
             ltp        = float(q.get("ltp", 0))
             prev       = float(q.get("prev_close", 0))
             op         = float(q.get("open", 0))
             vol        = int(q.get("volume", 0))
             if not prev or ltp < 10:
                 continue
+            # Guard: if open=0 the instrument hasn't traded today — gap calc is meaningless
+            if op <= 0:
+                continue
 
             chg_pct  = (ltp - prev) / prev * 100
-            gap_pct  = (op  - prev) / prev * 100 if prev else 0
-            intra    = (ltp - op)   / op   * 100 if op   else 0
+            gap_pct  = (op  - prev) / prev * 100   # op > 0 guaranteed by guard above
+            intra    = (ltp - op)   / op   * 100
 
             base = {
                 "symbol":    sym,
