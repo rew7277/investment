@@ -2279,21 +2279,24 @@ class OptionEngine:
         if entry < 5.0:
             sl_c = max(round(entry * 0.50, 1), 0.05)
             return {
-                "sl":            sl_c,
-                "t1":            round(entry * 1.30, 1),
-                "t2":            round(entry * 1.70, 1),
-                "t3":            round(entry * 2.00, 1),
-                "sl_pct":        -50.0,
-                "t1_pct":         30.0,
-                "t2_pct":         70.0,
-                "t3_pct":        100.0,
-                "rr":            round((entry * 2.00 - entry) / (entry - sl_c), 1),
-                "mono_factor":    1.0,
-                "iv_factor":      1.0,
-                "gamma_boost":    False,
-                "strong_move":    False,
-                "cheap_premium":  True,
-                "trend_strength": trend_strength,
+                "sl":             sl_c,
+                "t1":             round(entry * 1.30, 1),
+                "t2":             round(entry * 1.70, 1),
+                "t3":             round(entry * 2.00, 1),
+                "sl_pct":         -50.0,
+                "t1_pct":          30.0,
+                "t2_pct":          70.0,
+                "t3_pct":         100.0,
+                "rr":             round((entry * 2.00 - entry) / (entry - sl_c), 1),
+                "mono_factor":     1.0,
+                "iv_factor":       1.0,
+                "gamma_boost":     False,
+                "strong_move":     False,
+                "cheap_premium":   True,
+                "trend_strength":  trend_strength,
+                "sl_floor_pct":    50.0,   # cheap guard uses 50% SL
+                "min_move_ok":     True,   # 30% T1 is always tradable
+                "skip_reason":     "",
             }
 
         # ── Step 1: Underlying move in % ───────────────────────────
@@ -2351,9 +2354,21 @@ class OptionEngine:
         else:
             iv_factor = 1.00
 
+        # ── FIX: Dynamic SL floor (IV + DTE aware) ────────────────
+        # Fixed 20% SL is wrong when:
+        #   • High IV  → premiums swing ±30% on noise alone
+        #   • DTE ≤ 2  → gamma risk means fast adverse moves
+        # Rule: wider SL for high-IV / near-expiry; tight for calm monthly
+        if iv_percentile > 80 or dte <= 2:
+            sl_floor = 0.30          # 30%: high IV or expiry-day gamma
+        elif iv_percentile > 60 or dte <= 3:
+            sl_floor = 0.25          # 25%: elevated IV or 2-3 DTE
+        else:
+            sl_floor = 0.20          # 20%: normal weekly / monthly
+
         # ── Step 3: Map underlying % → option % ───────────────────
         opt_sl_pct = min(underlying_risk_pct * sensitivity * 0.60, 0.35)
-        opt_sl_pct = max(opt_sl_pct, 0.20)
+        opt_sl_pct = max(opt_sl_pct, sl_floor)
 
         opt_t1_raw = underlying_gain_pct * 0.40 * sensitivity * iv_factor
         opt_t2_raw = underlying_gain_pct * 0.70 * sensitivity * iv_factor
@@ -2393,6 +2408,16 @@ class OptionEngine:
         elif rr < 1.5 and risk > 0:
             t3 = round(entry + 1.5 * risk, 1);  rr = 1.5
 
+        # ── FIX: Minimum movement gate ─────────────────────────────
+        # T1 < 15% = brokerage + spread eats the entire profit.
+        # Flag it; callers should skip or warn the user.
+        MIN_T1_PCT = 0.15
+        min_move_ok = opt_t1_pct >= MIN_T1_PCT
+        skip_reason = (
+            f"⛔ T1 only +{opt_t1_pct*100:.1f}% — brokerage/spread will eat profit "
+            f"(need ≥{MIN_T1_PCT*100:.0f}%)" if not min_move_ok else ""
+        )
+
         return {
             "sl":             sl,
             "t1":             t1,
@@ -2410,6 +2435,9 @@ class OptionEngine:
             "strong_move":    strong_move,
             "cheap_premium":  False,
             "trend_strength": trend_strength,
+            "sl_floor_pct":   round(sl_floor * 100, 0),    # dynamic SL floor used
+            "min_move_ok":    min_move_ok,                  # False → skip trade
+            "skip_reason":    skip_reason,
         }
 
     # ── Time-of-day filter ────────────────────────────────────
@@ -2728,12 +2756,17 @@ class OptionEngine:
             pivot_ref = f"Near {near} ₹{near_p:,.0f}"
 
         # Trade note: actionability + caveats
+        _min_move_ok = levels.get("min_move_ok", True)
+        _skip_reason = levels.get("skip_reason", "")
         action_flag = (
-            "🟢 ACTIONABLE"           if (setup_pts >= 3 and iv_level != "HIGH" and time_ok and liq_ok)
-            else "🔴 ILLIQUID — SKIP" if not liq_ok
+            "🔴 ILLIQUID — SKIP"         if not liq_ok
+            else "🔴 SKIP — tiny move"   if not _min_move_ok
+            else "🟢 ACTIONABLE"         if (setup_pts >= 3 and iv_level != "HIGH" and time_ok and liq_ok)
             else "🟡 REVIEW BEFORE ENTRY" if setup_pts >= 2
             else "🔴 SKIP — low confluence"
         )
+        if not _min_move_ok and _skip_reason:
+            setup_flags.append(_skip_reason)
 
         return {
             # Core identity
@@ -2766,6 +2799,9 @@ class OptionEngine:
             "strong_move":     levels.get("strong_move",    False),
             "cheap_premium":   levels.get("cheap_premium",  False),
             "trend_strength":  levels.get("trend_strength", "normal"),
+            "sl_floor_pct":    levels.get("sl_floor_pct",   20.0),
+            "min_move_ok":     levels.get("min_move_ok",    True),
+            "skip_reason":     levels.get("skip_reason",    ""),
 
             # Underlying anchors
             "equity_sl":       round(underlying_sl, 2),
@@ -3215,10 +3251,12 @@ class NiftyOptionsEngine:
             iv_level != "HIGH" and
             premium_ok and
             liq_ok and
+            levels.get("min_move_ok", True) and
             mkt_type == "TRENDING" and
             time_ok and
             (not greeks_available or abs(theta) <= theta_max)
         )
+        _skip_reason = levels.get("skip_reason", "")
 
         return {
             # Identity
@@ -3249,6 +3287,9 @@ class NiftyOptionsEngine:
             "strong_move":    levels.get("strong_move",    False),
             "cheap_premium":  levels.get("cheap_premium",  False),
             "trend_strength": levels.get("trend_strength", "normal"),
+            "sl_floor_pct":   levels.get("sl_floor_pct",  20.0),
+            "min_move_ok":    levels.get("min_move_ok",    True),
+            "skip_reason":    levels.get("skip_reason",    ""),
 
             # Greeks (from ATM quote — most reliable)
             "delta":      atm_data.get("delta",  0.0),
@@ -3279,7 +3320,8 @@ class NiftyOptionsEngine:
             # Exit rules (UPGRADE 4)
             "exit_rules":    exit_rules,
 
-            "action_flag":   ("🔴 ILLIQUID — SKIP" if not liq_ok
+            "action_flag":   ("🔴 ILLIQUID — SKIP"       if not liq_ok
+                              else "🔴 SKIP — tiny move"  if not levels.get("min_move_ok", True)
                               else "🔴 SKIP — outside trading window" if not time_ok
                               else "🟢 ACTIONABLE" if actionable
                               else "🟡 REVIEW"),
