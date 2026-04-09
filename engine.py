@@ -425,13 +425,12 @@ class UniverseManager:
         EXCLUDE_SUFFIXES = (
             "-BE", "-BL", "-BZ", "-IL", "-SM", "-GS",
             "NIFTY", "SENSEX", "BANKNIFTY", "FINNIFTY",
-            "INAV",   # ETF Indicative NAV — open=0 during market hours → fake -100% gap
         )
         df = self.get_universe()
         token_map = dict(zip(df["symbol"], df["token"]))
         candidates = []
         for sym, q in quote_data.items():
-            # Skip index derivatives, bond ETFs, illiquid instruments, INAV symbols
+            # Skip index derivatives, bond ETFs, illiquid instruments
             if any(sym.upper().endswith(sfx) or sym.upper().startswith(sfx)
                    for sfx in EXCLUDE_SUFFIXES):
                 continue
@@ -440,10 +439,6 @@ class UniverseManager:
             volume     = q.get("volume", 0)
             open_p     = q.get("open", 0)
             if not prev_close or ltp < CFG["MIN_PRICE"]:
-                continue
-            # Guard: open=0 means the instrument hasn't traded today (INAV, illiquid, halted)
-            # gap_pct = (0 - prev) / prev = -100% which is completely bogus — skip it
-            if open_p <= 0:
                 continue
             gap_pct    = (open_p - prev_close) / prev_close * 100 if prev_close else 0
             change_pct = (ltp - prev_close) / prev_close * 100 if prev_close else 0
@@ -598,21 +593,106 @@ class NSEClient:
         return res
 
     def get_option_chain_pcr(self, symbol: str = "NIFTY") -> dict:
+        """
+        Fetches NSE option chain and computes:
+          - PCR (Put-Call Ratio by OI)
+          - Max Pain strike (strike where total option loss for buyers is maximum)
+          - ATM IV (implied volatility at the ATM strike — proxy for current option expensiveness)
+          - IV Percentile bucket: LOW / FAIR / HIGH / VERY_HIGH
+        Max Pain logic: for each strike, compute total loss = sum over all other strikes of
+        their OI × max(0, strike_i – strike_j) for calls, max(0, strike_j – strike_i) for puts.
+        The strike with minimum total loss = Max Pain.
+        """
         endpoint = "option-chain-indices" if symbol in ["NIFTY", "BANKNIFTY", "FINNIFTY"] \
                    else "option-chain-equities"
         data = self._get(endpoint, {"symbol": symbol})
-        res  = {"pcr": 1.0, "bullish_oi": False, "total_ce_oi": 0, "total_pe_oi": 0}
+        res  = {
+            "pcr":          1.0,
+            "bullish_oi":   False,
+            "total_ce_oi":  0,
+            "total_pe_oi":  0,
+            "max_pain":     0.0,
+            "atm_iv":       0.0,
+            "iv_bucket":    "UNKNOWN",   # LOW / FAIR / HIGH / VERY_HIGH
+            "spot":         0.0,
+        }
         try:
-            if data and "filtered" in data:
-                ce_oi = sum(r["CE"].get("openInterest", 0) for r in data["filtered"]["data"] if "CE" in r)
-                pe_oi = sum(r["PE"].get("openInterest", 0) for r in data["filtered"]["data"] if "PE" in r)
-                if ce_oi:
-                    res.update({
-                        "pcr":         round(pe_oi / ce_oi, 2),
-                        "bullish_oi":  (pe_oi / ce_oi) >= CFG["PCR_BULLISH_MIN"],
-                        "total_ce_oi": ce_oi,
-                        "total_pe_oi": pe_oi,
-                    })
+            if not (data and "filtered" in data):
+                return res
+
+            rows     = data["filtered"]["data"]
+            ce_oi    = sum(r["CE"].get("openInterest", 0) for r in rows if "CE" in r)
+            pe_oi    = sum(r["PE"].get("openInterest", 0) for r in rows if "PE" in r)
+            if ce_oi:
+                res.update({
+                    "pcr":         round(pe_oi / ce_oi, 2),
+                    "bullish_oi":  (pe_oi / ce_oi) >= CFG["PCR_BULLISH_MIN"],
+                    "total_ce_oi": ce_oi,
+                    "total_pe_oi": pe_oi,
+                })
+
+            # ── Max Pain calculation ───────────────────────────
+            # Build {strike: (ce_oi, pe_oi)} map
+            oi_map = {}
+            for r in rows:
+                strike = r.get("strikePrice", 0)
+                if not strike:
+                    continue
+                oi_map[strike] = (
+                    r["CE"].get("openInterest", 0) if "CE" in r else 0,
+                    r["PE"].get("openInterest", 0) if "PE" in r else 0,
+                )
+            if oi_map:
+                strikes   = sorted(oi_map.keys())
+                min_loss  = float("inf")
+                max_pain  = strikes[len(strikes)//2]
+                for test_strike in strikes:
+                    # Call loss: calls below test_strike are in-the-money
+                    call_loss = sum(
+                        oi_map[s][0] * max(0, test_strike - s)
+                        for s in strikes
+                    )
+                    # Put loss: puts above test_strike are in-the-money
+                    put_loss = sum(
+                        oi_map[s][1] * max(0, s - test_strike)
+                        for s in strikes
+                    )
+                    total = call_loss + put_loss
+                    if total < min_loss:
+                        min_loss = total
+                        max_pain = test_strike
+                res["max_pain"] = float(max_pain)
+                log.info(f"  [NSE] {symbol} Max Pain = ₹{max_pain:,.0f}")
+
+            # ── ATM IV extraction ──────────────────────────────
+            # Spot price from records header
+            try:
+                spot = float(data.get("records", {}).get("underlyingValue", 0))
+                res["spot"] = spot
+                if spot and oi_map:
+                    # Find the strike closest to spot
+                    atm_strike = min(oi_map.keys(), key=lambda s: abs(s - spot))
+                    atm_row = next(
+                        (r for r in rows if r.get("strikePrice") == atm_strike), {}
+                    )
+                    # CE IV is usually the reference for ATM
+                    atm_iv = float(
+                        (atm_row.get("CE") or {}).get("impliedVolatility", 0) or
+                        (atm_row.get("PE") or {}).get("impliedVolatility", 0) or 0
+                    )
+                    res["atm_iv"] = round(atm_iv, 1)
+                    # IV bucket — calibrated to NIFTY historical IV bands
+                    # IV < 12 = cheap (historical low), 12-16 = fair, 16-22 = high, >22 = very high
+                    if   atm_iv <= 0:   bucket = "UNKNOWN"
+                    elif atm_iv < 12:   bucket = "LOW"
+                    elif atm_iv < 17:   bucket = "FAIR"
+                    elif atm_iv < 22:   bucket = "HIGH"
+                    else:               bucket = "VERY_HIGH"
+                    res["iv_bucket"] = bucket
+                    log.info(f"  [NSE] {symbol} ATM IV = {atm_iv:.1f}% ({bucket}) | ATM strike = {atm_strike}")
+            except Exception as _ie:
+                log.warning(f"  [NSE] ATM IV parse: {_ie}")
+
         except Exception as e:
             log.warning(f"  [NSE] PCR parse: {e}")
         return res
@@ -1978,9 +2058,8 @@ class OptionEngine:
                 if data and key in data:
                     ltp = float(data[key]["last_price"])
                     if ltp > 0:
-                        # BUG FIX: use the CORRECT expiry date for the label.
-                        # When monthly symbol is matched, show monthly_expiry date (last Thu of month),
-                        # NOT the weekly expiry date — previously both showed the weekly date.
+                        # Use correct date for label: weekly date for weekly sym,
+                        # monthly_expiry (last Thu of month) for monthly sym
                         label_date = expiry if sym == weekly_sym else monthly_expiry
                         exp_label  = (f"{label_date.strftime('%d %b')} "
                                       f"{'(weekly)' if sym == weekly_sym else '(monthly)'}")
@@ -2293,27 +2372,87 @@ class OptionEngine:
 # Called every 5 sec by live index refresh loop.
 # ═════════════════════════════════════════════════════════════
 class NiftyOptionsEngine:
+    """
+    3-Layer Confirmation Model (upgraded):
+      Layer 0 — Market Classification (NEW)
+               SIDEWAYS / VOLATILE → hard block on direction buying
+      Layer 1 — Trend (pivot + EMA proxy)
+      Layer 2 — Setup Quality Score (8 pts: added IV bucket + Max Pain gate)
+      Layer 3 — Premium validation (live Kite LTP + range filter)
 
-    # Premium filter — ideal zone for intraday (risk-reward sweet spot)
+    Why this matters:
+      Old engine: PCR > 0.85 → "OI buildup bullish" → buy CE. ❌
+      This is only correct in TRENDING markets. In SIDEWAYS / HIGH-IV
+      environments, PCR can be 0.85 and premiums still decay → losses.
+
+    New logic:
+      SIDEWAYS  (PCR 0.9–1.1 AND spot within 150 pts of Max Pain) → NO TRADE
+      VOLATILE  (VIX > 25)                                         → NO TRADE
+      HIGH IV   (ATM IV bucket = HIGH or VERY_HIGH)               → NO TRADE (buying)
+      TRENDING  + IV FAIR/LOW + score ≥ 5                         → BUY CE/PE
+    """
+
     PREMIUM_MIN = 80
-    PREMIUM_MAX = 350
+    PREMIUM_MAX = 400   # widened slightly — high-IV markets have larger ATM premiums
 
+    # ── Layer 0: Market Classification ───────────────────────
+    @staticmethod
+    def classify_market(
+        pcr:       float,
+        spot:      float,
+        max_pain:  float,
+        vix:       float,
+        r1:        float,
+        s1:        float,
+        iv_bucket: str = "UNKNOWN",
+    ) -> Tuple[str, str]:
+        """
+        Returns (market_type, reason_string).
+        market_type: "TRENDING" | "SIDEWAYS" | "VOLATILE"
+
+        Decision table:
+          VIX > 25                              → VOLATILE
+          PCR 0.90–1.10 AND near Max Pain       → SIDEWAYS
+          PCR 0.90–1.10 AND inside S1-R1 range  → SIDEWAYS
+          IV bucket HIGH/VERY_HIGH              → flag (not block here — handled in generate_signal)
+          Else                                  → TRENDING
+        """
+        # Gate 1: extreme fear / volatility
+        if vix > 25:
+            return "VOLATILE", f"VIX {vix:.1f} > 25 — extreme fear, option premium extremely expensive"
+
+        pcr_neutral    = 0.90 <= pcr <= 1.10
+        near_max_pain  = max_pain > 0 and abs(spot - max_pain) <= 150
+        inside_range   = (s1 > 0 and r1 > 0) and (s1 < spot < r1)
+
+        if pcr_neutral and near_max_pain:
+            return "SIDEWAYS", (
+                f"PCR {pcr:.2f} (neutral 0.9–1.1) AND spot ₹{spot:,.0f} "
+                f"within ₹{abs(spot-max_pain):.0f} of Max Pain ₹{max_pain:,.0f} — "
+                f"market gravitating to Max Pain, avoid directional buying"
+            )
+        if pcr_neutral and inside_range:
+            return "SIDEWAYS", (
+                f"PCR {pcr:.2f} (neutral) AND LTP inside S1(₹{s1:,.0f})–R1(₹{r1:,.0f}) — "
+                f"no breakout confirmation, range-bound chop"
+            )
+
+        return "TRENDING", (
+            f"PCR {pcr:.2f} shows directional bias — "
+            f"{'bearish OI' if pcr < 0.85 else 'bullish OI'} confirmed"
+        )
+
+    # ── Layer 1: Trend ────────────────────────────────────────
     @staticmethod
     def get_trend(idx_data: dict) -> str:
-        """
-        Derive trend from index snapshot (pivot data).
-        BULLISH : LTP above R1 and above PP
-        BEARISH : LTP below S1 and below PP
-        SIDEWAYS: between S1 and R1
-        """
         ltp   = float(idx_data.get("ltp",   0))
         r1    = float(idx_data.get("r1",    ltp * 1.01))
         s1    = float(idx_data.get("s1",    ltp * 0.99))
         above = idx_data.get("above_pivot", True)
-        if ltp > r1:             return "BULLISH"
-        if ltp < s1:             return "BEARISH"
-        if above and ltp > (s1 + r1) / 2: return "BULLISH"
-        if not above:            return "BEARISH"
+        if ltp > r1:                           return "BULLISH"
+        if ltp < s1:                           return "BEARISH"
+        if above and ltp > (s1 + r1) / 2:     return "BULLISH"
+        if not above:                          return "BEARISH"
         return "SIDEWAYS"
 
     @staticmethod
@@ -2321,6 +2460,7 @@ class NiftyOptionsEngine:
         rng = h - l
         return abs(c - o) / rng if rng > 0 else 0
 
+    # ── Layer 2: Setup Quality Score (0–8) ───────────────────
     @staticmethod
     def score_setup(
         idx_data:  dict,
@@ -2329,79 +2469,119 @@ class NiftyOptionsEngine:
         direction: str,
     ) -> Tuple[int, List[str]]:
         """
-        7-point setup quality score for direct NIFTY option trades.
+        8-point setup quality score (was 7, +1 for IV bucket gate).
         Returns (score, reason_flags).
+
+        Points:
+          T1: Pivot alignment        0–2
+          T2: Distance from PP       0–1
+          T3: PCR directional        0–1 (stricter: now requires clear PCR)
+          T4: VIX level              0–1
+          T5: Outside chop zone      0–1
+          T6: Time window            0–1
+          T7: IV bucket (NEW)        0–1  (FAIR/LOW = +1; HIGH/VERY_HIGH = 0 and penalises total)
         """
         score = 0
         flags = []
-        ltp   = float(idx_data.get("ltp", 0))
-        r1    = float(idx_data.get("r1",  ltp * 1.01))
-        s1    = float(idx_data.get("s1",  ltp * 0.99))
-        pp    = float(idx_data.get("pivot", ltp))
-        above = idx_data.get("above_pivot", True)
+        ltp   = float(idx_data.get("ltp",    0))
+        r1    = float(idx_data.get("r1",     ltp * 1.01))
+        s1    = float(idx_data.get("s1",     ltp * 0.99))
+        pp    = float(idx_data.get("pivot",  ltp))
+        above = idx_data.get("above_pivot",  True)
+        pcr   = float(oc_data.get("pcr",     1.0) or 1.0)
 
-        # T1: VWAP + pivot alignment
+        # T1: Pivot alignment (2 pts)
         if direction == "CALL" and above:
             score += 2; flags.append("✅ CALL: LTP above PP — bullish bias confirmed")
         elif direction == "PUT" and not above:
             score += 2; flags.append("✅ PUT: LTP below PP — bearish bias confirmed")
         else:
-            flags.append("⚠️ Direction conflicts with pivot bias")
+            flags.append("⚠️ Direction conflicts with pivot bias — reduced conviction")
 
         # T2: Distance from PP (momentum confirmation)
         dist_r = abs(ltp - pp) / pp if pp else 0
-        if dist_r > 0.003:
+        if dist_r > 0.004:   # raised from 0.003 — requires more momentum
             score += 1; flags.append(f"✅ Momentum: {dist_r*100:.2f}% from PP — directional conviction")
         else:
-            flags.append(f"⚠️ Only {dist_r*100:.2f}% from PP — chop zone, wait")
+            flags.append(f"⚠️ Only {dist_r*100:.2f}% from PP — inside chop zone, wait for break")
 
-        # T3: OI confirmation
-        pcr = float(oc_data.get("pcr", 1.0) or 1.0)
-        if direction == "CALL" and pcr >= 0.85:
-            score += 1; flags.append(f"✅ OI: PCR {pcr:.2f} — put writers active (CALL favoured)")
-        elif direction == "PUT" and pcr <= 0.80:
-            score += 1; flags.append(f"✅ OI: PCR {pcr:.2f} — call writers active (PUT favoured)")
+        # T3: PCR directional confirmation (stricter thresholds)
+        if direction == "CALL" and pcr >= 1.15:
+            score += 1; flags.append(f"✅ PCR {pcr:.2f} — strong put writing, bulls in control")
+        elif direction == "CALL" and pcr >= 0.90:
+            flags.append(f"⚠️ PCR {pcr:.2f} — neutral, CALL not strongly confirmed by OI")
+        elif direction == "PUT" and pcr <= 0.75:
+            score += 1; flags.append(f"✅ PCR {pcr:.2f} — strong call writing, bears in control")
+        elif direction == "PUT" and pcr <= 0.90:
+            flags.append(f"⚠️ PCR {pcr:.2f} — neutral, PUT not strongly confirmed by OI")
         else:
-            flags.append(f"⚠️ OI: PCR {pcr:.2f} — not strongly confirming {direction}")
+            flags.append(f"❌ PCR {pcr:.2f} — OI conflicts with {direction} direction")
 
-        # T4: VIX filter
-        if vix < 20:
-            score += 1; flags.append(f"✅ VIX {vix:.1f} — calm environment, premium reasonable")
+        # T4: VIX environment
+        if vix < 15:
+            score += 1; flags.append(f"✅ VIX {vix:.1f} — very calm, cheap premium, ideal for buying")
+        elif vix < 20:
+            score += 1; flags.append(f"✅ VIX {vix:.1f} — calm, reasonable premium")
         elif vix < 25:
-            flags.append(f"⚠️ VIX {vix:.1f} — elevated, premium expensive — reduce size")
+            flags.append(f"⚠️ VIX {vix:.1f} — elevated premium, reduce position size by 30%")
         else:
-            flags.append(f"❌ VIX {vix:.1f} — too high, option buying risky")
+            flags.append(f"❌ VIX {vix:.1f} — very expensive premium, option buying high risk")
 
-        # T5: Not inside S1-R1 chop zone
+        # T5: Outside S1-R1 chop zone
         chop_range = r1 - s1
         if chop_range > 0:
-            proximity_pct = min(abs(ltp - r1), abs(ltp - s1)) / chop_range
-            if proximity_pct > 0.25:
-                score += 1; flags.append(f"✅ Clear of S1-R1 midpoint — directional move")
+            prox = min(abs(ltp - r1), abs(ltp - s1)) / chop_range
+            if prox > 0.30:
+                score += 1; flags.append(f"✅ Breakout: {prox*100:.0f}% clear of S1-R1 midpoint")
             else:
-                flags.append("⚠️ Inside pivot chop zone — wait for breakout")
+                flags.append("⚠️ Too close to pivot midpoint — wait for breakout confirmation")
 
         # T6: Time window
         now = datetime.now()
         m   = now.hour * 60 + now.minute
         if (9*60+45 <= m <= 11*60+30) or (13*60+45 <= m <= 15*60):
-            score += 1; flags.append(f"✅ Time: {now.strftime('%H:%M')} — prime F&O window")
+            score += 1; flags.append(f"✅ Time {now.strftime('%H:%M')} — prime F&O window")
         else:
-            flags.append(f"⚠️ Time: {now.strftime('%H:%M')} — outside prime window")
+            flags.append(f"⚠️ Time {now.strftime('%H:%M')} — outside prime window (9:45–11:30 or 1:45–3:00)")
+
+        # T7: IV Bucket — NEW gate
+        iv_bucket = oc_data.get("iv_bucket", "UNKNOWN")
+        atm_iv    = oc_data.get("atm_iv",    0.0)
+        if iv_bucket in ("LOW", "FAIR"):
+            score += 1
+            flags.append(f"✅ IV {atm_iv:.1f}% ({iv_bucket}) — premium not expensive, good to buy")
+        elif iv_bucket == "HIGH":
+            flags.append(f"⚠️ IV {atm_iv:.1f}% (HIGH) — premium inflated, risk of IV crush on reversal")
+        elif iv_bucket == "VERY_HIGH":
+            # Actively penalise — HIGH IV kills option buyers even when direction is right
+            score = max(0, score - 1)
+            flags.append(f"❌ IV {atm_iv:.1f}% (VERY HIGH) — premium severely overpriced, "
+                         f"score penalised -1; avoid buying, consider spreads")
+        else:
+            flags.append(f"⚠️ IV unknown — cannot assess premium fairness (VIX proxy used)")
 
         return score, flags
 
+    # ── Layer 3: Signal Builder ────────────────────────────────
     @staticmethod
     def generate_signal(
-        kl:        "KiteLayer",
-        idx_key:   str,
-        idx_data:  dict,
-        oc_data:   dict,
-        vix:       float,
+        kl:       "KiteLayer",
+        idx_key:  str,
+        idx_data: dict,
+        oc_data:  dict,
+        vix:      float,
     ) -> Optional[dict]:
         """
-        Generate a direct NIFTY/BANKNIFTY/FINNIFTY intraday options signal.
-        Returns None if setup quality < 4/7 (low probability — skip).
+        Generate a NIFTY/BANKNIFTY/FINNIFTY intraday options signal.
+
+        3-layer gate (in order — any failure returns None with reason):
+          L0: Market classification — SIDEWAYS/VOLATILE → hard block
+          L1: Trend direction — SIDEWAYS trend → skip
+          L2: Setup score ≥ 5/8 required (was 4/7)
+              HIGH IV bucket → requires score ≥ 6 (higher bar)
+              VERY_HIGH IV  → hard block (never buy)
+
+        Returns None for no-trade setups (with reason logged).
         """
         if not idx_data or idx_data.get("error"):
             return None
@@ -2410,64 +2590,95 @@ class NiftyOptionsEngine:
         if ltp < 100:
             return None
 
+        pcr      = float(oc_data.get("pcr",      1.0) or 1.0)
+        max_pain = float(oc_data.get("max_pain",  0.0))
+        r1       = float(idx_data.get("r1",       ltp * 1.01))
+        s1       = float(idx_data.get("s1",       ltp * 0.99))
+        iv_bucket = oc_data.get("iv_bucket", "UNKNOWN")
+
+        # ── Layer 0: Market Classification ────────────────────
+        mkt_type, mkt_reason = NiftyOptionsEngine.classify_market(
+            pcr, ltp, max_pain, vix, r1, s1, iv_bucket
+        )
+        if mkt_type in ("SIDEWAYS", "VOLATILE"):
+            log.info(f"  [FnO] {idx_key} skipped — {mkt_type}: {mkt_reason}")
+            return None   # Hard block — no directional trade
+
+        # ── Hard block: VERY_HIGH IV — never buy options ──────
+        if iv_bucket == "VERY_HIGH":
+            atm_iv = oc_data.get("atm_iv", 0)
+            log.info(f"  [FnO] {idx_key} skipped — VERY HIGH IV ({atm_iv:.1f}%): premium crush risk")
+            return None
+
+        # ── Layer 1: Trend direction ───────────────────────────
         trend = NiftyOptionsEngine.get_trend(idx_data)
         if trend == "SIDEWAYS":
+            log.info(f"  [FnO] {idx_key} skipped — pivot shows SIDEWAYS (LTP between S1 and R1)")
             return None
 
         direction = "CALL" if trend == "BULLISH" else "PUT"
 
-        # Score the setup
+        # ── Layer 2: Setup quality score ───────────────────────
         setup_score, setup_flags = NiftyOptionsEngine.score_setup(
             idx_data, oc_data, vix, direction
         )
-        if setup_score < 4:
-            return None  # Low confidence — skip
 
-        # Strike selection: ATM, slight OTM for leverage
-        atm    = OptionEngine.get_atm_strike(ltp, idx_key)
-        step   = OptionEngine._STEPS.get(idx_key, 50)
-        strike = atm + step if direction == "CALL" else atm - step
+        # Score threshold: HIGH IV demands higher bar (6/8 vs 5/8)
+        min_score = 6 if iv_bucket == "HIGH" else 5
+        if setup_score < min_score:
+            log.info(f"  [FnO] {idx_key} skipped — score {setup_score}/{min_score} needed "
+                     f"(IV={iv_bucket})")
+            return None
 
-        # Fetch real premium
+        # ── Layer 3: Strike selection + live premium ───────────
+        atm   = OptionEngine.get_atm_strike(ltp, idx_key)
+        step  = OptionEngine._STEPS.get(idx_key, 50)
+
+        # Strike logic: in strong trends use OTM for leverage;
+        # in borderline setups (score exactly at threshold) use ATM for safety
+        strong_trend = setup_score >= 7
+        strike = (atm + step if direction == "CALL" else atm - step) if strong_trend else atm
+
         ot = "CE" if direction == "CALL" else "PE"
         real_ltp, nfo_sym, exp_label = OptionEngine.fetch_real_ltp(kl, idx_key, strike, ot)
-        entry = real_ltp if real_ltp else OptionEngine.estimate_premium(ltp, idx_key, vix)
+        entry   = real_ltp if real_ltp else OptionEngine.estimate_premium(ltp, idx_key, vix)
         is_live = real_ltp is not None
 
-        # Premium filter
+        # Premium range filter
         premium_ok = NiftyOptionsEngine.PREMIUM_MIN <= entry <= NiftyOptionsEngine.PREMIUM_MAX
         if not premium_ok and is_live:
             setup_flags.append(
                 f"⚠️ Premium ₹{entry:.0f} outside ideal range "
-                f"(₹{NiftyOptionsEngine.PREMIUM_MIN}–₹{NiftyOptionsEngine.PREMIUM_MAX})"
+                f"₹{NiftyOptionsEngine.PREMIUM_MIN}–₹{NiftyOptionsEngine.PREMIUM_MAX}"
             )
 
         # Underlying SL/TP from pivot levels
-        r1 = float(idx_data.get("r1", ltp * 1.01))
-        s1 = float(idx_data.get("s1", ltp * 0.99))
         und_sl = s1 if direction == "CALL" else r1
         und_tp = r1 if direction == "CALL" else s1
 
         # Option trade levels
-        levels = OptionEngine.compute_trade_levels(entry, ltp, und_sl, und_tp)
-
-        # IV assessment
+        levels   = OptionEngine.compute_trade_levels(entry, ltp, und_sl, und_tp)
         iv_level, iv_flag = OptionEngine.iv_assessment(entry, ltp, vix)
 
-        # Why this trade
-        reasons = []
+        # Build reasons (UI card bullets)
+        reasons = [f"✔ Market: {mkt_type} — {mkt_reason[:60]}"]
         above = idx_data.get("above_pivot", True)
         if direction == "CALL":
-            if above:     reasons.append("✔ Above PP")
-            if ltp > r1:  reasons.append("✔ Above R1 — bullish breakout")
+            if above:     reasons.append("✔ Above PP — bullish pivot bias")
+            if ltp > r1:  reasons.append("✔ Above R1 — confirmed breakout")
         else:
-            if not above: reasons.append("✔ Below PP")
-            if ltp < s1:  reasons.append("✔ Below S1 — bearish breakdown")
-        pcr = float(oc_data.get("pcr", 1.0) or 1.0)
-        if pcr >= 0.85: reasons.append("✔ OI buildup (PCR bullish)")
-        if vix < 15:    reasons.append("✔ Low VIX — cheap premium")
+            if not above: reasons.append("✔ Below PP — bearish pivot bias")
+            if ltp < s1:  reasons.append("✔ Below S1 — confirmed breakdown")
+        if pcr >= 1.15:   reasons.append(f"✔ OI buildup (PCR {pcr:.2f} — bullish)")
+        elif pcr <= 0.75: reasons.append(f"✔ OI buildup (PCR {pcr:.2f} — bearish)")
+        if max_pain > 0:
+            dist = abs(ltp - max_pain)
+            reasons.append(f"✔ Max Pain ₹{max_pain:,.0f} — spot ₹{dist:.0f} away (safe)")
+        if vix < 15:      reasons.append("✔ Low VIX — cheap premium")
 
-        actionable = setup_score >= 5 and iv_level != "HIGH" and premium_ok
+        atm_iv   = oc_data.get("atm_iv", 0)
+        actionable = (setup_score >= min_score and iv_level != "HIGH"
+                      and premium_ok and mkt_type == "TRENDING")
 
         return {
             "symbol":         idx_key,
@@ -2491,6 +2702,11 @@ class NiftyOptionsEngine:
             "rr":             levels["rr"],
             "iv_level":       iv_level,
             "iv_flag":        iv_flag,
+            "iv_bucket":      iv_bucket,
+            "atm_iv":         atm_iv,
+            "market_type":    mkt_type,
+            "market_reason":  mkt_reason,
+            "max_pain":       max_pain,
             "setup_score":    setup_score,
             "setup_flags":    setup_flags,
             "reasons":        reasons,
@@ -2529,22 +2745,16 @@ class TopMoversEngine:
         reversal = []
 
         for sym, q in quote_data.items():
-            # Skip ETF Indicative NAV symbols — open=0 during market hours → -100% fake gap
-            if sym.upper().endswith("INAV"):
-                continue
             ltp        = float(q.get("ltp", 0))
             prev       = float(q.get("prev_close", 0))
             op         = float(q.get("open", 0))
             vol        = int(q.get("volume", 0))
             if not prev or ltp < 10:
                 continue
-            # Guard: if open=0 the instrument hasn't traded today — gap calc is meaningless
-            if op <= 0:
-                continue
 
             chg_pct  = (ltp - prev) / prev * 100
-            gap_pct  = (op  - prev) / prev * 100   # op > 0 guaranteed by guard above
-            intra    = (ltp - op)   / op   * 100
+            gap_pct  = (op  - prev) / prev * 100 if prev else 0
+            intra    = (ltp - op)   / op   * 100 if op   else 0
 
             base = {
                 "symbol":    sym,
