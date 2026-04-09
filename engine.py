@@ -201,6 +201,14 @@ CFG = {
     "DELTA_ATM_MAX":    0.65,   # and ≤ 0.65 (not ITM; liquidity drops)
     "IV_HIGH_BLOCK":    25.0,   # ATM IV% above which we block directional buying
     "IV_FAIR_WARN":     18.0,   # ATM IV% above which we warn / reduce size
+
+    # ── Liquidity thresholds (UPGRADE 3) ─────────────────────
+    # Index options (NIFTY / BANKNIFTY / FINNIFTY)
+    "LIQ_INDEX_OI_MIN":  100_000,   # minimum open interest (contracts)
+    "LIQ_INDEX_VOL_MIN":   5_000,   # minimum today's volume  (contracts)
+    # Stock options
+    "LIQ_STOCK_OI_MIN":   10_000,
+    "LIQ_STOCK_VOL_MIN":   1_000,
 }
 
 
@@ -2232,52 +2240,176 @@ class OptionEngine:
     def compute_trade_levels(entry: float,
                              underlying_ltp: float,
                              underlying_sl: float,
-                             underlying_tp: float) -> dict:
+                             underlying_tp: float,
+                             dte: int = 7,
+                             strike: float = 0.0,
+                             iv_percentile: float = 0.0,
+                             setup_score: int = 5,
+                             spot_move_pct: float = 0.0,
+                             trend_strength: str = "normal") -> dict:
         """
-        Professional option trade levels derived from underlying structure.
+        Realistic NSE option trade levels using an empirical % → % model.
 
-        SL logic (3-layer):
-          Layer 1 — Delta-weighted: underlying_risk × 0.5 (ATM delta)
-          Layer 2 — % cap: never lose >35% of premium (IV crush / whipsaw guard)
-          Final SL = whichever gives HIGHER exit price (tighter stop)
-
-        Target logic:
-          T1 = when underlying covers 35% of SL→TP distance (+~30% on option)
-          T2 = when underlying covers 65% of SL→TP distance (+~60% on option)
-          T3 = when underlying hits TP level       (+~100% on option, max for intraday)
-          Also enforced as minimum % multipliers so targets are never trivial.
+        ══════════════════════════════════════════════════════════════
+        ROOT CAUSE FIX (v3):  % → % model (not raw delta pts)
+        FIX GAP 1  (v4):  Conditional floors — only when underlying
+                          move ≥ 0.8%.  Weak moves use raw output.
+        FIX GAP 2  (v4):  IV crush dampening via iv_percentile.
+                          >80th pct → ×0.70 | <30th pct → ×1.20
+        FIX GAP 3  (v4):  Moneyness factor — delta is NOT constant.
+                          ATM <1%: ×1.0 | near OTM 1–3%: ×0.7
+                          far OTM >3%: ×0.4
+        FIX GAP 4  (v4):  Cheap-premium guard — entry < ₹5.
+        FIX GAP 5  (v4):  Confidence scaling — setup_score/5.
+        UPGRADE 1  (v5):  Gamma spike boost — DTE ≤ 2 + spot_move_pct
+                          > 0.8% → sensitivity ×1.30 (nonlinear gamma).
+        UPGRADE 2  (v5):  Trend strength multiplier — "strong" trend
+                          extends t3_cap ×1.20; "weak" shrinks ×0.85.
+                          Prevents early exit on continuation moves.
+        ══════════════════════════════════════════════════════════════
         """
-        if entry <= 0:
+        if entry <= 0 or underlying_ltp <= 0:
             return {"sl": 0, "t1": 0, "t2": 0, "t3": 0,
                     "sl_pct": 0, "t1_pct": 0, "t2_pct": 0, "t3_pct": 0,
-                    "rr": 0}
-        delta          = 0.50
-        underlying_risk = max(abs(underlying_ltp - underlying_sl), 1.0)
-        underlying_move = max(abs(underlying_tp  - underlying_ltp),  1.0)
+                    "rr": 0, "mono_factor": 1.0, "iv_factor": 1.0,
+                    "gamma_boost": False, "strong_move": False,
+                    "cheap_premium": False, "trend_strength": trend_strength}
 
-        # SL
-        sl_delta = round(entry - delta * underlying_risk, 1)
-        sl_pct   = round(entry * 0.65, 1)            # hard floor: max 35% loss
-        sl       = max(sl_delta, sl_pct, 1.0)
+        # ── GAP 4: Cheap-premium guard ─────────────────────────────
+        if entry < 5.0:
+            sl_c = max(round(entry * 0.50, 1), 0.05)
+            return {
+                "sl":            sl_c,
+                "t1":            round(entry * 1.30, 1),
+                "t2":            round(entry * 1.70, 1),
+                "t3":            round(entry * 2.00, 1),
+                "sl_pct":        -50.0,
+                "t1_pct":         30.0,
+                "t2_pct":         70.0,
+                "t3_pct":        100.0,
+                "rr":            round((entry * 2.00 - entry) / (entry - sl_c), 1),
+                "mono_factor":    1.0,
+                "iv_factor":      1.0,
+                "gamma_boost":    False,
+                "strong_move":    False,
+                "cheap_premium":  True,
+                "trend_strength": trend_strength,
+            }
 
-        # Targets
-        t1 = max(round(entry + delta * underlying_move * 0.35, 1), round(entry * 1.30, 1))
-        t2 = max(round(entry + delta * underlying_move * 0.65, 1), round(entry * 1.60, 1))
-        t3 = max(round(entry + delta * underlying_move * 1.00, 1), round(entry * 2.00, 1))
+        # ── Step 1: Underlying move in % ───────────────────────────
+        underlying_risk_pct = abs(underlying_ltp - underlying_sl) / underlying_ltp
+        underlying_gain_pct = abs(underlying_tp  - underlying_ltp) / underlying_ltp
+        underlying_risk_pct = min(underlying_risk_pct, 0.08)
+        underlying_gain_pct = min(underlying_gain_pct, 0.05)
 
-        rr = round((t3 - entry) / (entry - sl), 1) if (entry - sl) > 0 else 0
-        # Enforce minimum R:R of 2.5 — bad setups disqualify themselves
-        if rr < 2.5 and (entry - sl) > 0:
-            # widen T3 to achieve minimum 2.5 R:R
-            t3 = round(entry + 2.5 * (entry - sl), 1)
-            rr = 2.5
+        # ── Step 2: Empirical sensitivity by DTE ───────────────────
+        if dte <= 1:
+            sensitivity = 15.0;  t3_cap = 1.00
+        elif dte <= 3:
+            sensitivity = 28.0;  t3_cap = 1.20
+        elif dte <= 7:
+            sensitivity = 22.0;  t3_cap = 1.00
+        else:
+            sensitivity = 14.0;  t3_cap = 0.90
+
+        # ── UPGRADE 1: Gamma spike boost ───────────────────────────
+        # Near expiry (DTE ≤ 2) gamma is nonlinear — a >0.8% spot move
+        # triggers a disproportionate premium jump.  Boost sensitivity
+        # by 1.30× to stop the model under-estimating these spikes.
+        gamma_boost = False
+        if dte <= 2 and abs(spot_move_pct) > 0.8:
+            sensitivity  *= 1.30
+            t3_cap       = min(t3_cap * 1.30, 1.50)   # extend cap too
+            gamma_boost   = True
+
+        # ── UPGRADE 2: Trend strength multiplier ───────────────────
+        # Allows T3 cap to breathe on continuation moves so the engine
+        # doesn't force premature exits on genuine trending days.
+        # "strong" → t3_cap × 1.20   "weak" → t3_cap × 0.85
+        if trend_strength == "strong":
+            t3_cap = min(t3_cap * 1.20, 1.50)
+        elif trend_strength == "weak":
+            t3_cap = t3_cap * 0.85
+
+        # ── GAP 3: Moneyness factor ────────────────────────────────
+        spot     = underlying_ltp if underlying_ltp > 0 else 1
+        _strike  = strike if strike > 0 else spot
+        moneyness = abs(_strike - spot) / spot
+        if moneyness < 0.01:
+            mono_factor = 1.0
+        elif moneyness < 0.03:
+            mono_factor = 0.7
+        else:
+            mono_factor = 0.4
+        sensitivity *= mono_factor
+
+        # ── GAP 2: IV crush dampening ──────────────────────────────
+        if iv_percentile > 80:
+            iv_factor = 0.70
+        elif iv_percentile < 30:
+            iv_factor = 1.20
+        else:
+            iv_factor = 1.00
+
+        # ── Step 3: Map underlying % → option % ───────────────────
+        opt_sl_pct = min(underlying_risk_pct * sensitivity * 0.60, 0.35)
+        opt_sl_pct = max(opt_sl_pct, 0.20)
+
+        opt_t1_raw = underlying_gain_pct * 0.40 * sensitivity * iv_factor
+        opt_t2_raw = underlying_gain_pct * 0.70 * sensitivity * iv_factor
+        opt_t3_raw = underlying_gain_pct * 1.00 * sensitivity * iv_factor
+
+        # ── GAP 1: Conditional floors ──────────────────────────────
+        strong_move = underlying_gain_pct >= 0.008
+        if strong_move:
+            opt_t1_pct = min(max(opt_t1_raw, 0.25), 0.40)
+            opt_t2_pct = min(max(opt_t2_raw, 0.45), 0.70)
+            opt_t3_pct = min(max(opt_t3_raw, 0.70), t3_cap)
+        else:
+            opt_t1_pct = min(opt_t1_raw, 0.40)
+            opt_t2_pct = min(opt_t2_raw, 0.70)
+            opt_t3_pct = min(opt_t3_raw, t3_cap)
+
+        # ── GAP 5: Confidence scaling ──────────────────────────────
+        confidence  = max(0.6, min(setup_score / 5.0, 1.0))
+        opt_t1_pct *= confidence
+        opt_t2_pct *= confidence
+        opt_t3_pct *= confidence
+
+        # ── Step 4: Compute price levels ──────────────────────────
+        sl = max(round(entry * (1.0 - opt_sl_pct), 2), 0.05)
+        if sl >= entry:
+            sl = round(entry * 0.80, 2)
+        t1 = round(entry * (1.0 + opt_t1_pct), 1)
+        t2 = round(entry * (1.0 + opt_t2_pct), 1)
+        t3 = round(entry * (1.0 + opt_t3_pct), 1)
+
+        # ── Step 5: Realistic R:R (cap 3.0×, floor 1.5×) ─────────
+        risk   = max(entry - sl, 0.01)
+        reward = t3 - entry
+        rr     = round(reward / risk, 1)
+        if rr > 3.0:
+            t3 = round(entry + 3.0 * risk, 1);  rr = 3.0
+        elif rr < 1.5 and risk > 0:
+            t3 = round(entry + 1.5 * risk, 1);  rr = 1.5
+
         return {
-            "sl":  sl,  "t1": t1,  "t2": t2,  "t3": t3,
-            "sl_pct":  round((sl - entry) / entry * 100, 1),
-            "t1_pct":  round((t1 - entry) / entry * 100, 1),
-            "t2_pct":  round((t2 - entry) / entry * 100, 1),
-            "t3_pct":  round((t3 - entry) / entry * 100, 1),
-            "rr": rr,
+            "sl":             sl,
+            "t1":             t1,
+            "t2":             t2,
+            "t3":             t3,
+            "sl_pct":         round((sl - entry) / entry * 100, 1),
+            "t1_pct":         round((t1 - entry) / entry * 100, 1),
+            "t2_pct":         round((t2 - entry) / entry * 100, 1),
+            "t3_pct":         round((t3 - entry) / entry * 100, 1),
+            "rr":             rr,
+            # ── diagnostics ───────────────────────────────────────
+            "mono_factor":    mono_factor,
+            "iv_factor":      iv_factor,
+            "gamma_boost":    gamma_boost,
+            "strong_move":    strong_move,
+            "cheap_premium":  False,
+            "trend_strength": trend_strength,
         }
 
     # ── Time-of-day filter ────────────────────────────────────
@@ -2301,6 +2433,144 @@ class OptionEngine:
         elif m <= 13*60+44: return False, "⚠️ Lunch chop (11:31–1:44) — avoid new entries"
         elif m <= 15*60+00: return True,  "✅ Prime window: 1:45–3:00 (afternoon trend)"
         else:               return False, "⛔ After 3:00 PM — avoid (closing noise)"
+
+    # ── UPGRADE 3: Liquidity trap gate ───────────────────────
+    @staticmethod
+    def liquidity_check(option_oi:     int,
+                        option_volume: int,
+                        entry:         float,
+                        underlying:    str = "") -> Tuple[bool, str]:
+        """
+        Reject illiquid options before entry — even a perfect signal
+        loses money when the bid-ask spread is 5–10% of premium.
+
+        Thresholds (empirically set for NSE F&O, reviewable in CFG):
+          Index options (NIFTY / BANKNIFTY / FINNIFTY):
+            OI     ≥ 100,000 contracts
+            Volume ≥   5,000 contracts
+          Stock options:
+            OI     ≥  10,000 contracts
+            Volume ≥   1,000 contracts
+
+        Additional guard: entry < ₹5 → always illiquid (lottery ticket).
+
+        Returns (is_liquid, flag_message).
+        """
+        INDEX_NAMES = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCAP",
+                       "NIFTYMIDCAP", "FINNIFTY"}
+        is_index = any(underlying.upper().startswith(n) for n in INDEX_NAMES)
+
+        if entry < 5.0:
+            return False, "❌ Liquidity: premium < ₹5 — lottery ticket, skip"
+
+        if is_index:
+            min_oi  = CFG.get("LIQ_INDEX_OI_MIN",  100_000)
+            min_vol = CFG.get("LIQ_INDEX_VOL_MIN",    5_000)
+        else:
+            min_oi  = CFG.get("LIQ_STOCK_OI_MIN",   10_000)
+            min_vol = CFG.get("LIQ_STOCK_VOL_MIN",    1_000)
+
+        if option_oi > 0 and option_oi < min_oi:
+            return (False,
+                    f"❌ Liquidity: OI {option_oi:,} < {min_oi:,} — illiquid, skip")
+        if option_volume > 0 and option_volume < min_vol:
+            return (False,
+                    f"❌ Liquidity: Vol {option_volume:,} < {min_vol:,} — illiquid, skip")
+
+        oi_str  = f"{option_oi:,}"  if option_oi  > 0 else "n/a"
+        vol_str = f"{option_volume:,}" if option_volume > 0 else "n/a"
+        return (True,
+                f"✅ Liquidity OK — OI {oi_str} | Vol {vol_str}")
+
+    # ── UPGRADE 4: Time-based exit rules ─────────────────────
+    @staticmethod
+    def compute_exit_rules(entry:  float,
+                           dte:    int,
+                           theta:  float = 0.0,
+                           t1:     float = 0.0) -> dict:
+        """
+        Generate post-entry exit rules to prevent theta decay from
+        silently killing a position.
+
+        Rules:
+          1. Time-stop (minutes from entry):
+               DTE ≤ 1: exit after 20 min if PnL < +10%  (expiry day)
+               DTE ≤ 3: exit after 30 min if PnL < +10%
+               DTE ≤ 7: exit after 45 min if PnL < +10%
+               DTE >7 : exit after 90 min if PnL < + 5%  (monthly)
+
+          2. Theta decay budget (daily ₹ loss from holding):
+               If |theta| > 0  → daily_decay = |theta|
+               Else            → estimated from entry: entry × 0.04 / DTE
+
+          3. Partial-exit at T1 rule:
+               If T1 hit → exit 50% qty, trail SL to entry for rest.
+
+          4. Max holding time (absolute):
+               Index options: 60 min past entry regardless of PnL
+               Monthly: 3 hours
+
+        Returns dict consumed by the UI and bot executor.
+        """
+        # ── Time-stop by DTE bucket ────────────────────────────────
+        if dte <= 1:
+            time_stop_min = 20;   pnl_threshold_pct = 10.0
+            max_hold_min  = 45
+        elif dte <= 3:
+            time_stop_min = 30;   pnl_threshold_pct = 10.0
+            max_hold_min  = 60
+        elif dte <= 7:
+            time_stop_min = 45;   pnl_threshold_pct = 10.0
+            max_hold_min  = 90
+        else:
+            time_stop_min = 90;   pnl_threshold_pct = 5.0
+            max_hold_min  = 180
+
+        # ── Daily theta decay budget ───────────────────────────────
+        if abs(theta) > 0:
+            daily_decay_rs = round(abs(theta), 2)
+        else:
+            # Rough estimate: 4% of premium per DTE per day
+            eff_dte = max(dte, 1)
+            daily_decay_rs = round(entry * 0.04 / eff_dte, 2)
+
+        # ── T1 partial exit price ──────────────────────────────────
+        t1_exit_price = t1 if t1 > entry else round(entry * 1.25, 1)
+
+        return {
+            # Time-stop: exit if held past this with no progress
+            "time_stop_minutes":     time_stop_min,
+            "time_stop_pnl_min_pct": pnl_threshold_pct,
+            "time_stop_flag":        (
+                f"⏱️ Exit if {time_stop_min} min elapsed "
+                f"and PnL < +{pnl_threshold_pct:.0f}% "
+                f"(theta decay killing position)"
+            ),
+
+            # Absolute max hold regardless of PnL
+            "max_hold_minutes":  max_hold_min,
+            "max_hold_flag":     (
+                f"⛔ Hard exit at {max_hold_min} min "
+                f"— DTE={dte} option cannot be held indefinitely"
+            ),
+
+            # Theta decay cost info
+            "daily_theta_decay": daily_decay_rs,
+            "theta_per_hour":    round(daily_decay_rs / 6.25, 2),  # 6.25h session
+            "theta_flag":        (
+                f"🕒 Theta cost ≈ ₹{daily_decay_rs}/day "
+                f"(₹{round(daily_decay_rs/6.25,2)}/hr)"
+            ),
+
+            # Partial exit at T1
+            "t1_partial_exit_price": t1_exit_price,
+            "t1_partial_exit_qty":   0.50,   # 50% of position
+            "t1_trail_sl_to":        entry,  # trail SL to cost for remainder
+            "t1_flag":               (
+                f"✂️ At T1 (₹{t1_exit_price}): exit 50% qty, "
+                f"trail SL → ₹{entry} (entry)"
+            ),
+        }
 
     # ── OI confirmation score ─────────────────────────────────
     @staticmethod
@@ -2371,13 +2641,42 @@ class OptionEngine:
         ot  = "CE" if direction == "CALL" else "PE"
         atm = OptionEngine.get_atm_strike(ltp, underlying)
 
-        # 1. Real option LTP from Kite
-        real_ltp, nfo_sym, exp_label = OptionEngine.fetch_real_ltp(kl, underlying, atm, ot)
-        entry     = real_ltp if real_ltp else OptionEngine.estimate_premium(ltp, underlying, vix)
-        is_live   = real_ltp is not None
+        # 1. Real option LTP from Kite (full fetch so we get expiry date for DTE)
+        prefer     = CFG.get("FNO_EXPIRY_PREF", "weekly")
+        _opt_d     = OptionEngine.fetch_option_data(kl, underlying, atm, ot, prefer) \
+                     if kl else {"ltp": 0.0, "is_live": False, "tradingsymbol": "",
+                                 "expiry_label": "—", "expiry": None, "expiry_type": prefer}
+        nfo_sym    = _opt_d["tradingsymbol"]
+        exp_label  = _opt_d["expiry_label"]
+        real_ltp   = _opt_d["ltp"] if _opt_d["is_live"] else None
+        entry      = real_ltp if real_ltp else OptionEngine.estimate_premium(ltp, underlying, vix)
+        is_live    = real_ltp is not None
 
-        # 2. Trade levels (structure-based)
-        levels    = OptionEngine.compute_trade_levels(entry, ltp, underlying_sl, underlying_tp)
+        # Compute DTE → drives sensitivity in compute_trade_levels
+        _expiry_raw = _opt_d.get("expiry")
+        if _expiry_raw:
+            try:
+                from datetime import date as _date
+                _today = datetime.now().date()
+                _exp   = _expiry_raw if isinstance(_expiry_raw, _date) else _expiry_raw.date()
+                dte    = max((_exp - _today).days, 1)
+            except Exception:
+                dte = 7 if _opt_d.get("expiry_type", "weekly") == "weekly" else 21
+        else:
+            dte = 7 if _opt_d.get("expiry_type", "weekly") == "weekly" else 21
+
+        # 2. Trade levels (structure-based, DTE-calibrated for realistic targets)
+        # iv_percentile proxy: maps VIX 10→0%, 20→50%, 30→100%
+        _iv_pct_proxy  = min(max((vix - 10) / 20 * 100, 0), 100)
+        # spot move % for gamma boost — use equity signal change as proxy
+        _spot_move     = abs(ltp - underlying_sl) / ltp * 100 if underlying_sl else 0.0
+        # trend_strength from equity score: ≥20 → strong, ≤12 → weak
+        _trend_str     = "strong" if equity_score >= 20 else ("weak" if equity_score <= 12 else "normal")
+        levels    = OptionEngine.compute_trade_levels(
+            entry, ltp, underlying_sl, underlying_tp,
+            dte=dte, strike=float(atm), iv_percentile=_iv_pct_proxy,
+            setup_score=equity_score, spot_move_pct=_spot_move,
+            trend_strength=_trend_str)
 
         # 3. IV assessment
         iv_level, iv_flag = OptionEngine.iv_assessment(entry, ltp, vix)
@@ -2387,6 +2686,11 @@ class OptionEngine:
 
         # 5. OI score
         oi_pts, oi_flags = OptionEngine.oi_score(oc_data, direction)
+
+        # 5b. UPGRADE 3: Liquidity check
+        opt_oi  = int(_opt_d.get("oi",     0))
+        opt_vol = int(_opt_d.get("volume", 0))
+        liq_ok, liq_flag = OptionEngine.liquidity_check(opt_oi, opt_vol, entry, underlying)
 
         # 6. Setup quality score (0–5)
         setup_pts = 0
@@ -2409,6 +2713,12 @@ class OptionEngine:
             setup_pts += 1; setup_flags.append("✅ OI: Confirming direction")
         else:
             setup_flags.append("⚠️ OI: Weak confirmation")
+        setup_flags.append(liq_flag)
+
+        # UPGRADE 4: Exit rules
+        _theta_est = _opt_d.get("theta", 0.0) if _opt_d else 0.0
+        exit_rules = OptionEngine.compute_exit_rules(
+            entry, dte, theta=_theta_est, t1=levels["t1"])
 
         # Pivot context
         pivot_ref = None
@@ -2418,9 +2728,12 @@ class OptionEngine:
             pivot_ref = f"Near {near} ₹{near_p:,.0f}"
 
         # Trade note: actionability + caveats
-        action_flag = "🟢 ACTIONABLE" if (setup_pts >= 3 and iv_level != "HIGH" and time_ok) \
-                      else "🟡 REVIEW BEFORE ENTRY" if setup_pts >= 2 \
-                      else "🔴 SKIP — low confluence"
+        action_flag = (
+            "🟢 ACTIONABLE"           if (setup_pts >= 3 and iv_level != "HIGH" and time_ok and liq_ok)
+            else "🔴 ILLIQUID — SKIP" if not liq_ok
+            else "🟡 REVIEW BEFORE ENTRY" if setup_pts >= 2
+            else "🔴 SKIP — low confluence"
+        )
 
         return {
             # Core identity
@@ -2446,6 +2759,13 @@ class OptionEngine:
             "t2_pct":          levels["t2_pct"],
             "t3_pct":          levels["t3_pct"],
             "rr":              levels["rr"],
+            # v4/v5 engine diagnostics
+            "mono_factor":     levels.get("mono_factor",    1.0),
+            "iv_factor":       levels.get("iv_factor",      1.0),
+            "gamma_boost":     levels.get("gamma_boost",    False),
+            "strong_move":     levels.get("strong_move",    False),
+            "cheap_premium":   levels.get("cheap_premium",  False),
+            "trend_strength":  levels.get("trend_strength", "normal"),
 
             # Underlying anchors
             "equity_sl":       round(underlying_sl, 2),
@@ -2458,6 +2778,10 @@ class OptionEngine:
             # OI
             "oi_score":        oi_pts,
             "oi_flags":        oi_flags,
+
+            # Liquidity
+            "liquidity_ok":    liq_ok,
+            "liquidity_flag":  liq_flag,
 
             # Time
             "time_ok":         time_ok,
@@ -2472,6 +2796,9 @@ class OptionEngine:
             "equity_score":    equity_score,
             "equity_signal":   equity_signal,
             "pivot_ref":       pivot_ref,
+
+            # UPGRADE 4: Exit rules
+            "exit_rules":      exit_rules,
         }
 
 
@@ -2809,6 +3136,19 @@ class NiftyOptionsEngine:
             entry   = OptionEngine.estimate_premium(ltp, idx_key, vix)
             is_live = False
 
+        # ── DTE for calibrated targets ─────────────────────────
+        _exp_raw = trade_opt.get("expiry")
+        if _exp_raw:
+            try:
+                from datetime import date as _date
+                _today  = datetime.now().date()
+                _expd   = _exp_raw if isinstance(_exp_raw, _date) else _exp_raw.date()
+                sig_dte = max((_expd - _today).days, 1)
+            except Exception:
+                sig_dte = 7 if expiry_type == "weekly" else 21
+        else:
+            sig_dte = 7 if expiry_type == "weekly" else 21
+
         # ── Premium range check ───────────────────────────────
         premium_ok = NiftyOptionsEngine.PREMIUM_MIN <= entry <= NiftyOptionsEngine.PREMIUM_MAX
         if not premium_ok:
@@ -2819,7 +3159,28 @@ class NiftyOptionsEngine:
         # ── Trade levels ──────────────────────────────────────
         und_sl = s1 if direction == "CALL" else r1
         und_tp = r1 if direction == "CALL" else s1
-        levels    = OptionEngine.compute_trade_levels(entry, ltp, und_sl, und_tp)
+        # iv_percentile: map ATM IV to 0–100 scale (12%→0, 18%→50, 25%+→100)
+        _iv_pct = min(max((atm_iv - 12) / 13 * 100, 0), 100) if atm_iv > 0 else 50.0
+        # spot_move_pct for gamma boost: ltp vs yesterday's close proxy
+        _spot_move   = abs(ltp - (s1 + r1) / 2) / ltp * 100 if (s1 and r1) else 0.0
+        # trend_strength from setup_score: ≥7 → strong, ≤4 → weak
+        _trend_str   = "strong" if setup_score >= 7 else ("weak" if setup_score <= 4 else "normal")
+        levels    = OptionEngine.compute_trade_levels(
+            entry, ltp, und_sl, und_tp,
+            dte=sig_dte, strike=float(strike),
+            iv_percentile=_iv_pct, setup_score=setup_score,
+            spot_move_pct=_spot_move, trend_strength=_trend_str)
+
+        # ── UPGRADE 3: Liquidity check ────────────────────────
+        _opt_oi  = int(trade_opt.get("oi",     0))
+        _opt_vol = int(trade_opt.get("volume", 0))
+        liq_ok, liq_flag = OptionEngine.liquidity_check(
+            _opt_oi, _opt_vol, entry, idx_key)
+
+        # ── UPGRADE 4: Exit rules ─────────────────────────────
+        _theta_val = float(atm_data.get("theta", 0.0))
+        exit_rules = OptionEngine.compute_exit_rules(
+            entry, sig_dte, theta=_theta_val, t1=levels["t1"])
         iv_level, iv_flag = OptionEngine.iv_assessment(entry, ltp, vix)
 
         # ── Reason bullets ────────────────────────────────────
@@ -2853,7 +3214,9 @@ class NiftyOptionsEngine:
             setup_score >= min_score and
             iv_level != "HIGH" and
             premium_ok and
+            liq_ok and
             mkt_type == "TRENDING" and
+            time_ok and
             (not greeks_available or abs(theta) <= theta_max)
         )
 
@@ -2879,6 +3242,13 @@ class NiftyOptionsEngine:
             "sl_pct":     levels["sl_pct"], "t1_pct": levels["t1_pct"],
             "t2_pct":     levels["t2_pct"], "t3_pct": levels["t3_pct"],
             "rr":         levels["rr"],
+            # v5 engine diagnostics
+            "mono_factor":    levels.get("mono_factor",    1.0),
+            "iv_factor":      levels.get("iv_factor",      1.0),
+            "gamma_boost":    levels.get("gamma_boost",    False),
+            "strong_move":    levels.get("strong_move",    False),
+            "cheap_premium":  levels.get("cheap_premium",  False),
+            "trend_strength": levels.get("trend_strength", "normal"),
 
             # Greeks (from ATM quote — most reliable)
             "delta":      atm_data.get("delta",  0.0),
@@ -2901,9 +3271,22 @@ class NiftyOptionsEngine:
             "setup_flags":   setup_flags,
             "reasons":       reasons,
             "premium_ok":    premium_ok,
-            "action_flag":   "🟢 ACTIONABLE" if actionable else "🟡 REVIEW",
+
+            # Liquidity
+            "liquidity_ok":   liq_ok,
+            "liquidity_flag": liq_flag,
+
+            # Exit rules (UPGRADE 4)
+            "exit_rules":    exit_rules,
+
+            "action_flag":   ("🔴 ILLIQUID — SKIP" if not liq_ok
+                              else "🔴 SKIP — outside trading window" if not time_ok
+                              else "🟢 ACTIONABLE" if actionable
+                              else "🟡 REVIEW"),
             "trend":         trend,
             "prefer":        prefer,
+            "time_ok":       time_ok,
+            "time_flag":     time_flag,
         }
         """
         Derive trend from index snapshot (pivot data).
@@ -3039,6 +3422,13 @@ class NiftyOptionsEngine:
         entry = real_ltp if real_ltp else OptionEngine.estimate_premium(ltp, idx_key, vix)
         is_live = real_ltp is not None
 
+        # DTE — weekly ≈ 4 days avg, monthly ≈ 20 days avg
+        # (fetch_real_ltp alias doesn't return expiry date; use label heuristic)
+        sig_dte = 4 if "weekly" in exp_label.lower() else 20
+
+        # Time-of-day gate (must be in prime window to be ACTIONABLE)
+        time_ok, time_flag = OptionEngine.time_window_check()
+
         # Premium filter
         premium_ok = NiftyOptionsEngine.PREMIUM_MIN <= entry <= NiftyOptionsEngine.PREMIUM_MAX
         if not premium_ok and is_live:
@@ -3053,8 +3443,8 @@ class NiftyOptionsEngine:
         und_sl = s1 if direction == "CALL" else r1
         und_tp = r1 if direction == "CALL" else s1
 
-        # Option trade levels
-        levels = OptionEngine.compute_trade_levels(entry, ltp, und_sl, und_tp)
+        # Option trade levels (DTE-calibrated, realistic targets)
+        levels = OptionEngine.compute_trade_levels(entry, ltp, und_sl, und_tp, dte=sig_dte)
 
         # IV assessment
         iv_level, iv_flag = OptionEngine.iv_assessment(entry, ltp, vix)
@@ -3071,8 +3461,16 @@ class NiftyOptionsEngine:
         pcr = float(oc_data.get("pcr", 1.0) or 1.0)
         if pcr >= 0.85: reasons.append("✔ OI buildup (PCR bullish)")
         if vix < 15:    reasons.append("✔ Low VIX — cheap premium")
+        if not time_ok: reasons.append(f"⏰ {time_flag}")
 
-        actionable = setup_score >= 5 and iv_level != "HIGH" and premium_ok
+        actionable = setup_score >= 5 and iv_level != "HIGH" and premium_ok and time_ok
+
+        if not time_ok:
+            action_flag = "🔴 SKIP — outside trading window"
+        elif actionable:
+            action_flag = "🟢 ACTIONABLE"
+        else:
+            action_flag = "🟡 REVIEW"
 
         return {
             "symbol":         idx_key,
@@ -3100,8 +3498,10 @@ class NiftyOptionsEngine:
             "setup_flags":    setup_flags,
             "reasons":        reasons,
             "premium_ok":     premium_ok,
-            "action_flag":    "🟢 ACTIONABLE" if actionable else "🟡 REVIEW",
+            "action_flag":    action_flag,
             "trend":          trend,
+            "time_ok":        time_ok,
+            "time_flag":      time_flag,
         }
 
 
