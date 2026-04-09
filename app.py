@@ -844,7 +844,7 @@ def api_indices_live():
     if kl is None:
         return jsonify({"error": "Not authenticated", "indices": STATE.get("indices", {})})
     try:
-        updated = LiveIndexRefresher.refresh(kl, STATE.get("indices", {}))
+        updated = LiveIndexRefresher.refresh(kl)
         with _STATE_LOCK:
             STATE["indices"] = updated
 
@@ -1305,7 +1305,7 @@ def _live_index_refresh_job():
     if not (9*60+15 <= m <= 15*60+35):
         return
     try:
-        updated = LiveIndexRefresher.refresh(kl, STATE.get("indices", {}))
+        updated = LiveIndexRefresher.refresh(kl)
         with _STATE_LOCK:
             STATE["indices"] = updated
         # Refresh live F&O signals
