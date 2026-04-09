@@ -155,6 +155,20 @@ class KiteLayer:
             return 15.0
         except Exception:
             return 15.0
+    
+    def get_all_stocks(self) -> List[str]:
+        """Get all NSE stocks from instruments."""
+        try:
+            instruments = pd.DataFrame(self._k.instruments("NSE"))
+            # Filter for equity stocks only
+            equity = instruments[instruments["segment"] == "NSE"]
+            stocks = equity["tradingsymbol"].unique().tolist()
+            log.info(f"[Kite] Loaded {len(stocks)} NSE stocks")
+            return stocks
+        except Exception as e:
+            log.error(f"[Kite] Failed to load stocks: {e}")
+            # Return curated list as fallback
+            return NSEClient().get_all_stocks()
 
 
 # ═════════════════════════════════════════════════════════════
@@ -434,11 +448,93 @@ class TopMoversEngine:
     @staticmethod
     def analyze(quotes: dict) -> dict:
         return {"gainers": [], "losers": [], "momentum": [], "volume": [], "reversal": []}
+    
+    @staticmethod
+    def get_high_probability(movers: dict, signals: List[dict]) -> List[dict]:
+        """Extract high probability setups from movers and signals."""
+        if not movers or not signals:
+            return []
+        
+        # Create signal lookup
+        sig_map = {s.get("symbol"): s for s in signals}
+        
+        results = []
+        seen = set()
+        
+        # Check gainers and momentum for high-scoring signals
+        for category in ["gainers", "momentum"]:
+            for mover in movers.get(category, []):
+                symbol = mover.get("symbol")
+                if not symbol or symbol in seen:
+                    continue
+                
+                sig = sig_map.get(symbol)
+                if not sig:
+                    continue
+                
+                score = sig.get("score", 0)
+                if score >= 13:  # Minimum tradeable score
+                    seen.add(symbol)
+                    results.append({
+                        **mover,
+                        "score": score,
+                        "signal": sig.get("signal", "BUY"),
+                        "sl": sig.get("sl", 0),
+                        "tp": sig.get("tp", 0),
+                        "vol_surge": sig.get("vol_surge", False),
+                        "above_vwap": sig.get("above_vwap", False),
+                        "smc_bos": sig.get("smc_bos", False),
+                        "breakdown": sig.get("breakdown", {}),
+                        "category": "⚡ High Probability" if score >= 20 else "🎯 BUY Candidate"
+                    })
+                    
+                    if len(results) >= 10:
+                        break
+            
+            if len(results) >= 10:
+                break
+        
+        # Sort by score descending
+        results.sort(key=lambda x: x.get("score", 0), reverse=True)
+        return results
 
 class LiveIndexRefresher:
     @staticmethod
     def refresh_indices(kite: KiteLayer) -> dict:
         return {}
+    
+    @staticmethod
+    def refresh(kite: KiteLayer) -> dict:
+        """Refresh live index data."""
+        try:
+            indices = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCAP"]
+            result = {}
+            
+            for idx in indices:
+                try:
+                    symbol_map = {
+                        "NIFTY": "NIFTY 50",
+                        "BANKNIFTY": "NIFTY BANK",
+                        "FINNIFTY": "NIFTY FIN SERVICE",
+                        "MIDCAP": "NIFTY MIDCAP 100"
+                    }
+                    
+                    quote = kite.get_quote(symbol_map.get(idx, idx))
+                    if quote:
+                        result[idx] = {
+                            "ltp": quote.get("last_price", 0),
+                            "change_pct": quote.get("net_change", 0),
+                            "volume": quote.get("volume", 0),
+                        }
+                    else:
+                        result[idx] = {"error": "No data"}
+                except Exception as e:
+                    result[idx] = {"error": str(e)}
+            
+            return result
+        except Exception as e:
+            log.error(f"[LiveRefresh] Error: {e}")
+            return {}
 
 
 # ═════════════════════════════════════════════════════════════
