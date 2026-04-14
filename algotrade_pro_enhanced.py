@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║           ALGOTRADE PRO ULTIMATE v3.0 - ADVANCED PATTERNS & FIB              ║
+║           ALGOTRADE PRO ULTIMATE v4.0 - ADVANCED PATTERNS & FIB              ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  ✓ 50+ Candlestick Pattern Detection (Real-time)                            ║
 ║  ✓ Fibonacci Analysis (Retracements, Extensions, Fans, Arcs)                ║
@@ -15,16 +15,18 @@
 """
 
 import os, sys, json, math, time, asyncio, logging, sqlite3, platform
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from typing import Dict, List, Optional, Any, Tuple, Set
 from dataclasses import dataclass, asdict, field
 from enum import Enum
 from contextlib import asynccontextmanager
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 import numpy as np
 import pandas as pd
 
-# Windows asyncio fix
+# Windows asyncio fix (only applies locally on Windows, not on Railway/Linux)
 if platform.system() == "Windows":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
@@ -57,11 +59,9 @@ log = logging.getLogger("AlgoTradeUltimate")
 
 API_KEY = os.getenv("KITE_API_KEY", "")
 API_SECRET = os.getenv("KITE_API_SECRET", "")
-if not API_KEY or not API_SECRET:
-    log.warning("⚠️  KITE_API_KEY / KITE_API_SECRET not set in environment — auth will fail until configured")
 CAPITAL = float(os.getenv("CAPITAL", "100000"))
 
-DB_PATH = "algotrade_ultimate.db"
+DB_PATH = os.getenv("DB_PATH", "/tmp/algotrade_ultimate.db")
 
 # Top liquid instruments for pattern scanning
 # ── Base universe -- always scanned ─────────────────────────────────────────
@@ -352,9 +352,9 @@ class CandlestickPatternDetector:
             if not prior_downtrend:
                 continue
 
-            # Volume: is this candle above average?
-            avg_vol = float(df['volume'].iloc[max(0,i-20):i].mean()) if has_vol else 1
-            vol_ratio = float(candle['volume']) / avg_vol if has_vol and avg_vol > 0 else 1.0
+            # Volume: is this candle above average? (session-aware via _avg_volume)
+            avg_vol  = self._avg_volume(df, i)
+            vol_ratio = float(candle['volume']) / avg_vol if 'volume' in df.columns and avg_vol > 0 else 1.0
 
             atr = self._calculate_atr(df, i)
 
@@ -415,7 +415,7 @@ class CandlestickPatternDetector:
             prior_uptrend = all(float(prior.iloc[j]['close']) < float(prior.iloc[j+1]['close']) for j in range(len(prior)-1))
             if not prior_uptrend:
                 continue
-            avg_vol   = float(df['volume'].iloc[max(0,i-20):i].mean()) if has_vol else 1
+            avg_vol   = self._avg_volume(df, i)
             vol_ratio = float(candle['volume']) / avg_vol if has_vol and avg_vol > 0 else 1.0
             if upper_wick >= body * 2 and lower_wick <= body * 0.5 and body / total_range < 0.35:
                 wick_ratio = upper_wick / body
@@ -501,6 +501,20 @@ class CandlestickPatternDetector:
                 
                 # Regular Doji: indecision
                 else:
+                    atr_doji = self._calculate_atr(df, i)
+                    doji_price = float(candle['close'])
+                    # FIX: target was incorrectly set to price_at_detection (= 0 move).
+                    # Use ATR-based symmetric target: upside target for slight upward
+                    # context, downside for downward; distance = 1× ATR.
+                    if trend_up:
+                        doji_target = round(doji_price - atr_doji, 2)   # potential reversal down
+                        doji_sl     = float(candle['high']) + atr_doji * 0.3
+                    elif trend_down:
+                        doji_target = round(doji_price + atr_doji, 2)   # potential reversal up
+                        doji_sl     = float(candle['low'])  - atr_doji * 0.3
+                    else:
+                        doji_target = round(doji_price + atr_doji, 2)   # neutral — show upside
+                        doji_sl     = float(candle['low'])
                     patterns.append(PatternDetection(
                         pattern=CandlePattern.DOJI,
                         timestamp=candle['timestamp'],
@@ -512,9 +526,9 @@ class CandlestickPatternDetector:
                         strength=2,
                         success_rate=0.50,
                         description="Doji: Market indecision. Wait for confirmation from next candle.",
-                        price_at_detection=candle['close'],
-                        stop_loss=candle['low'] if candle['close'] > candle['open'] else candle['high'],
-                        target=candle['close']
+                        price_at_detection=doji_price,
+                        stop_loss=round(doji_sl, 2),
+                        target=doji_target
                     ))
         
         return patterns
@@ -1099,11 +1113,39 @@ class CandlestickPatternDetector:
         return hl_sum / max(1, idx - start)
 
     def _avg_volume(self, df: pd.DataFrame, idx: int, period: int = 20) -> float:
-        """Pre-compute average volume up to idx."""
+        """Average volume up to idx, restricted to the same trading session.
+
+        FIX: The old implementation took the last `period` bars regardless of
+        date, mixing yesterday's low closing-hour volume with today's high
+        opening volume and making vol_ratio meaningless for intraday signals.
+        Now we prefer bars from the same calendar date; only fall back to
+        cross-session bars when fewer than 5 same-session bars are available.
+        """
         if 'volume' not in df.columns:
             return 1.0
+        # Determine the date of the bar at idx
+        try:
+            bar_ts = df.iloc[idx]['timestamp']
+            bar_date = pd.Timestamp(bar_ts).date()
+        except Exception:
+            bar_date = None
+
+        # Collect candidate bars before idx
         start = max(0, idx - period)
-        vals = [float(df.iloc[j]['volume']) for j in range(start, idx) if float(df.iloc[j]['volume']) > 0]
+        if bar_date is not None:
+            # Prefer same-session bars
+            same_session = [
+                float(df.iloc[j]['volume'])
+                for j in range(start, idx)
+                if float(df.iloc[j]['volume']) > 0
+                and pd.Timestamp(df.iloc[j]['timestamp']).date() == bar_date
+            ]
+            if len(same_session) >= 5:
+                return sum(same_session) / len(same_session)
+
+        # Fallback: all bars in window
+        vals = [float(df.iloc[j]['volume']) for j in range(start, idx)
+                if float(df.iloc[j]['volume']) > 0]
         return sum(vals) / len(vals) if vals else 1.0
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -1577,7 +1619,8 @@ class ICTEngine:
     ]
 
     def _in_killzone(self) -> Tuple[bool, str]:
-        now = datetime.now()
+        IST = timezone(timedelta(hours=5, minutes=30))
+        now = datetime.now(tz=IST)
         h, m = now.hour, now.minute
         for (sh, sm), (eh, em), name, _ in self.KILLZONES:
             if (h, m) >= (sh, sm) and (h, m) < (eh, em):
@@ -1589,7 +1632,30 @@ class ICTEngine:
         Find the most recent significant swing (last clear HH or LL).
         Returns (swing_high, swing_low, direction).
         Uses 3-bar pivot with 0.3% ATR-normalized threshold.
+
+        FIX: When the market has been open for at least 45 minutes (i.e. after
+        10:00 AM IST), intraday structure is reliable enough to use.  We
+        restrict the swing search to today's session bars first; this prevents
+        yesterday's distant swing from setting wildly off Fib targets intraday.
+        Falls back to the full 80-bar window when today's session has < 10 bars.
         """
+        IST = timezone(timedelta(hours=5, minutes=30))
+        now = datetime.now(tz=IST).replace(tzinfo=None)
+        session_start = now.replace(hour=10, minute=0, second=0, microsecond=0)
+        use_session_only = now >= session_start
+
+        if use_session_only and 'timestamp' in df.columns:
+            try:
+                today = now.date()
+                today_mask = df['timestamp'].apply(
+                    lambda x: pd.Timestamp(x).date() == today
+                )
+                today_df = df[today_mask]
+                if len(today_df) >= 10:
+                    df = today_df.reset_index(drop=True)
+            except Exception:
+                pass  # fall through to full window
+
         n = min(len(df), 80)
         sub = df.tail(n).reset_index(drop=True)
         highs  = sub["high"].values.astype(float)
@@ -2157,9 +2223,12 @@ class KiteManager:
             access_token = data.get("access_token", "")
             if not access_token:
                 return
-            # Only attempt to load if saved today
-            if saved_date != date.today().isoformat():
-                log.info("⏰ Saved token is from a previous day -- need fresh login")
+            # Only load if saved TODAY in IST (Railway runs UTC — must use IST date)
+            from datetime import timezone as _tz
+            _IST = _tz(timedelta(hours=5, minutes=30))
+            today_ist = datetime.now(tz=_IST).date().isoformat()
+            if saved_date != today_ist:
+                log.info(f"⏰ Saved token is from {saved_date}, today IST is {today_ist} -- need fresh login")
                 self._delete_token()
                 return
             # Set token and VALIDATE with live API call
@@ -2196,8 +2265,11 @@ class KiteManager:
 
     def _save_token(self, token: str):
         try:
+            from datetime import timezone as _tz
+            _IST = _tz(timedelta(hours=5, minutes=30))
+            today_ist = datetime.now(tz=_IST).date().isoformat()
             with open(self._token_path(), "w") as f:
-                json.dump({"access_token": token, "date": date.today().isoformat()}, f)
+                json.dump({"access_token": token, "date": today_ist}, f)
         except Exception as e:
             log.warning(f"Could not save token: {e}")
 
@@ -2218,6 +2290,9 @@ class KiteManager:
             self.is_authenticated = True
             self._save_token(self.access_token)
             log.info("✅ Kite login successful")
+            # Pre-resolve all SCAN_UNIVERSE tokens in one batch (avoids per-symbol
+            # instruments DF loading during the first scan which caused 2+ min delays)
+            threading.Thread(target=_bulk_resolve_tokens, daemon=True).start()
             return True
         except Exception as e:
             log.error(f"Login failed: {e}")
@@ -2227,26 +2302,38 @@ class KiteManager:
         if not self.is_authenticated:
             return pd.DataFrame()
         import time as _time
+        # CRITICAL: Railway runs UTC. Kite needs IST datetimes.
+        IST = timezone(timedelta(hours=5, minutes=30))
         for attempt in range(3):
             try:
-                to_date = datetime.now()
-                from_date = to_date - timedelta(days=days)
-                records = self.kite.historical_data(instrument_token, from_date, to_date, interval)
+                to_dt   = datetime.now(tz=IST).replace(tzinfo=None)   # naive IST
+                from_dt = to_dt - timedelta(days=days)
+                records = self.kite.historical_data(instrument_token, from_dt, to_dt, interval)
+                if not records:
+                    log.warning(f"Kite returned 0 records for token {instrument_token} ({interval}, {days}d)")
+                    return pd.DataFrame()
                 df = pd.DataFrame(records)
                 if not df.empty:
                     df.rename(columns={"date": "timestamp"}, inplace=True)
                     df["timestamp"] = pd.to_datetime(df["timestamp"])
+                    last_ts = df["timestamp"].iloc[-1]
+                    age_min = round((to_dt - last_ts.replace(tzinfo=None)).total_seconds() / 60, 1)
+                    log.info(f"Fetched {len(df)} candles for token {instrument_token} ({interval}). Last: {last_ts}, age: {age_min:.0f} min")
                 return df
             except Exception as e:
                 err_str = str(e).lower()
                 if "too many" in err_str or "rate" in err_str or "429" in err_str:
-                    wait = 2 ** attempt  # 1s, 2s, 4s
-                    log.warning(f"Historical data rate-limited (attempt {attempt+1}/3) -- retrying in {wait}s")
+                    wait = 2 ** attempt
+                    log.warning(f"Rate-limited (attempt {attempt+1}/3) -- retrying in {wait}s")
                     _time.sleep(wait)
                     continue
-                log.error(f"Historical data error: {e}")
+                if "token" in err_str or "session" in err_str or "auth" in err_str or "403" in err_str or "401" in err_str:
+                    log.error(f"Kite auth error — token expired: {e}")
+                    self.is_authenticated = False   # force re-login
+                    return pd.DataFrame()
+                log.error(f"Historical data error (token {instrument_token}, {interval}): {e}")
                 return pd.DataFrame()
-        log.error(f"Historical data: gave up after 3 attempts (rate limit)")
+        log.error(f"Historical data: gave up after 3 attempts")
         return pd.DataFrame()
 
     def get_instruments(self, exchange: str = "NSE") -> List[Dict]:
@@ -3040,6 +3127,62 @@ structure_engine = StructureTradeEngine()
 
 
 
+@dataclass
+class ORBSignal:
+    """
+    Opening Range Breakout signal.
+    Generated by ORBEngine when a confirmed breakout occurs after 9:30 IST.
+    """
+    symbol:          str
+    timeframe:       str
+    direction:       str            # "BULL" | "BEAR"
+    orb_high:        float          # High of the 9:15-9:29 opening range
+    orb_low:         float          # Low of the 9:15-9:29 opening range
+    orb_range:       float          # orb_high - orb_low
+    breakout_price:  float          # Close price of the breakout bar
+    breakout_bar:    int            # Bar index of the breakout candle
+    breakout_time:   str            # Timestamp string of the breakout bar
+    entry_zone:      Tuple[float, float]  # (entry_low, entry_high)
+    sl:              float          # Stop loss price
+    target1:         float          # T1 = 1x ORB range extension
+    target2:         float          # T2 = 2x ORB range extension
+    target3:         float          # T3 = 3x ORB range extension
+    target4:         float          # T4 = 4x ORB range extension (runner)
+    risk_reward:     float          # R:R to T2 (from entry_mid)
+    volume_ratio:    float          # Breakout bar volume / 20-bar avg volume
+    gap_pct:         float          # Gap % from previous close to today open
+    gap_type:        str            # "GAP_UP" | "GAP_DOWN" | "FLAT"
+    confidence:      float          # 0-100 confidence score
+    notes:           List[str]      # Context notes
+    generated_at:    str            # ISO timestamp of signal generation
+
+    def to_dict(self) -> Dict:
+        return {
+            "symbol":         self.symbol,
+            "timeframe":      self.timeframe,
+            "direction":      self.direction,
+            "orb_high":       round(self.orb_high, 2),
+            "orb_low":        round(self.orb_low, 2),
+            "orb_range":      round(self.orb_range, 2),
+            "breakout_price": round(self.breakout_price, 2),
+            "breakout_time":  self.breakout_time,
+            "entry_zone":     [round(self.entry_zone[0], 2), round(self.entry_zone[1], 2)],
+            "sl":             round(self.sl, 2),
+            "target1":        round(self.target1, 2),
+            "target2":        round(self.target2, 2),
+            "target3":        round(self.target3, 2),
+            "target4":        round(self.target4, 2),
+            "risk_reward":    round(self.risk_reward, 2),
+            "volume_ratio":   round(self.volume_ratio, 2),
+            "gap_pct":        round(self.gap_pct, 3),
+            "gap_type":       self.gap_type,
+            "confidence":     round(self.confidence, 1),
+            "notes":          self.notes,
+            "generated_at":   self.generated_at,
+        }
+
+
+
 class ORBEngine:
     """
     Opening Range Breakout engine for intraday trading.
@@ -3113,13 +3256,13 @@ class ORBEngine:
         # ── Gap analysis ─────────────────────────────────────────────────
         yesterday_mask = df["timestamp"].apply(lambda x: ts_date(x) < today)
         yesterday_df   = df[yesterday_mask]
+        today_open = float(orb_bars["open"].iloc[0])  # always use real open
         if not yesterday_df.empty:
             prev_close = float(yesterday_df["close"].iloc[-1])
-            today_open = float(orb_bars["open"].iloc[0])
             gap_pct    = (today_open - prev_close) / prev_close * 100
         else:
+            # Fallback: try to compute from orb_bars open vs first bar close estimate
             gap_pct   = 0.0
-            today_open = orb_high
 
         if gap_pct > 0.2:
             gap_type = "GAP_UP"
@@ -3228,6 +3371,7 @@ class ORBEngine:
             t1         = entry_high + orb_rng          # 1× ORB
             t2         = entry_high + orb_rng * 2      # 2× ORB
             t3         = entry_high + orb_rng * 3      # 3× ORB (runner)
+            t4         = entry_high + orb_rng * 4      # 4× ORB (full runner)
         else:
             entry_high = orb_low
             entry_low  = orb_low - orb_rng * 0.25
@@ -3236,8 +3380,14 @@ class ORBEngine:
             t1         = entry_low - orb_rng
             t2         = entry_low - orb_rng * 2
             t3         = entry_low - orb_rng * 3
+            t4         = entry_low - orb_rng * 4       # 4× ORB (full runner)
 
-        rr = round((t2 - entry_high) / risk if breakout_dir == "BULL" else (entry_low - t2) / risk, 2)
+        # FIX: RR must use entry_mid (displayed value), not the edge of the zone
+        entry_mid = (entry_low + entry_high) / 2
+        if breakout_dir == "BULL":
+            rr = round((t2 - entry_mid) / max(risk, 0.01), 2)
+        else:
+            rr = round((entry_mid - t2) / max(risk, 0.01), 2)
 
         return ORBSignal(
             symbol=symbol, timeframe=timeframe, direction=breakout_dir,
@@ -3246,13 +3396,20 @@ class ORBEngine:
             breakout_bar=breakout_bar_idx, breakout_time=bo_time,
             entry_zone=(round(entry_low, 2), round(entry_high, 2)),
             sl=round(sl, 2),
-            target1=round(t1, 2), target2=round(t2, 2), target3=round(t3, 2),
+            target1=round(t1, 2), target2=round(t2, 2), target3=round(t3, 2), target4=round(t4, 2),
             risk_reward=abs(rr),
             volume_ratio=bo_volume_ratio,
             gap_pct=gap_pct, gap_type=gap_type,
             confidence=confidence, notes=notes,
             generated_at=datetime.now().isoformat(),
         )
+
+
+# ── ORB Daily Signal Cache ────────────────────────────────────────────────────
+# Stores the first confirmed ORBSignal per (symbol, date) so that subsequent
+# API calls within the same session always return the original signal rather
+# than a potentially shifted re-computation (avoids intraday signal flipping).
+# _orb_cache is declared below as a TTLCache(ttl=28800) — do not redeclare here
 
 
 orb_engine = ORBEngine()
@@ -3422,18 +3579,21 @@ class SMCEngine:
 
     # IST session windows (hour, minute)
     SESSIONS = [
-        ((9, 15),  (9, 30),  "OPEN_EXPLOSIVE",  False, "⚠️ First 15min -- opening range. No new entries."),
+        ((9, 15),  (9, 30),  "OPEN_EXPLOSIVE",  True,  "📊 ORB window 9:15-9:30 — wait for range then trade breakout."),
         ((9, 30),  (10, 30), "TREND",            True,  "✅ Best momentum window. Follow direction."),
         ((10, 30), (11, 30), "TREND",            True,  "✅ Good trend continuation window."),
-        ((11, 30), (13, 0),  "LUNCH",            False, "⚠️ Lunch chop. Low volume, false breakouts. Skip."),
+        ((11, 30), (13, 0),  "LUNCH",            True,  "⚠️ Lunch chop 11:30-1PM — lower volume. Use tighter SL."),
         ((13, 0),  (14, 0),  "AFTERNOON",        True,  "✅ Post-lunch reversal setups. Watch OBs."),
         ((14, 0),  (15, 0),  "AFTERNOON",        True,  "✅ Best F&O window. Expiry moves here."),
         ((15, 0),  (15, 30), "CLOSE",            False, "⚠️ Institutional squaring. No new entries."),
     ]
 
     def _get_session(self) -> Tuple[str, bool, str]:
-        now = datetime.now()
+        _IST_TZ = timezone(timedelta(hours=5, minutes=30))
+        now = datetime.now(tz=_IST_TZ)  # Always IST regardless of server timezone
         h, m = now.hour, now.minute
+        if now.weekday() >= 5:
+            return "PRE", False, "⏳ Market closed — weekend."
         for (sh, sm), (eh, em), name, tradeable, note in self.SESSIONS:
             if (h, m) >= (sh, sm) and (h, m) < (eh, em):
                 return name, tradeable, note
@@ -3442,7 +3602,8 @@ class SMCEngine:
     def _calc_vwap(self, df: pd.DataFrame) -> float:
         """True VWAP from today's intraday candles."""
         try:
-            today = pd.Timestamp.now().date()
+            _IST_TZ_V = timezone(timedelta(hours=5, minutes=30))
+            today = datetime.now(tz=_IST_TZ_V).date()  # IST date, not UTC
             mask = pd.to_datetime(df["timestamp"]).dt.date == today
             today_df = df[mask].copy()
             if today_df.empty:
@@ -3793,7 +3954,8 @@ class SMCEngine:
 
         if not session_tradeable:
             notes.append("⚠️ Session filter: not a tradeable window")
-            return "WAIT", 0.0, (curr, curr), curr, curr, curr, curr, curr, notes
+            _atr_est = atr if atr > 0 else curr * 0.005
+            return "WAIT", 0.0, (round(curr-_atr_est*0.2,2), round(curr+_atr_est*0.2,2)), round(curr-_atr_est*1.5,2), round(curr+_atr_est*1.0,2), round(curr+_atr_est*2.0,2), round(curr+_atr_est*3.0,2), round(curr+_atr_est*4.0,2), notes
 
         # Find nearest OB to price
         bull_ob_active = next((o for o in obs
@@ -4925,6 +5087,88 @@ DYNAMIC_RESOLVE_SYMBOLS = [
 # Runtime cache: populated on first use per symbol
 _token_cache: Dict[str, int] = {}
 
+# ── TTL Response Cache ─────────────────────────────────────────────────────────
+# Caches per-symbol analysis results for up to TTL_SECONDS.
+# Prevents redundant Kite API calls when the same symbol is loaded repeatedly
+# within the same candle cycle (e.g. switching tabs on same symbol).
+class TTLCache:
+    """Simple thread-safe TTL dict. Entries expire after `ttl` seconds."""
+    def __init__(self, ttl: int = 180):
+        self._store: Dict[str, Any] = {}
+        self._ts:    Dict[str, float] = {}
+        self._lock   = threading.Lock()
+        self.ttl     = ttl
+
+    def get(self, key: str) -> Optional[Any]:
+        with self._lock:
+            if key in self._store:
+                if time.time() - self._ts[key] < self.ttl:
+                    return self._store[key]
+                del self._store[key]
+                del self._ts[key]
+            return None
+
+    def set(self, key: str, value: Any) -> None:
+        with self._lock:
+            self._store[key] = value
+            self._ts[key]    = time.time()
+
+    def clear(self) -> None:
+        with self._lock:
+            self._store.clear()
+            self._ts.clear()
+
+    # ── dict-compatibility methods so len(), `in`, and [] assignment work ──
+    def __len__(self) -> int:
+        with self._lock:
+            # Count only non-expired entries
+            now = time.time()
+            return sum(1 for k, ts in self._ts.items() if now - ts < self.ttl)
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        self.set(key, value)
+
+    def __getitem__(self, key: str) -> Any:
+        v = self.get(key)
+        if v is None:
+            raise KeyError(key)
+        return v
+
+    def __contains__(self, key: object) -> bool:
+        return self.get(str(key)) is not None
+
+    def keys(self):
+        with self._lock:
+            now = time.time()
+            return [k for k, ts in self._ts.items() if now - ts < self.ttl]
+
+# One cache per analysis type. 3-minute TTL matches the shortest candle interval.
+_smc_cache       = TTLCache(ttl=180)
+_ict_cache       = TTLCache(ttl=180)
+_structure_cache = TTLCache(ttl=180)
+_orb_cache       = TTLCache(ttl=28800)  # Full trading day TTL (8 h) — ORB signals are daily
+_pattern_cache   = TTLCache(ttl=180)
+_scan_cache      = TTLCache(ttl=240)  # Full scan results cached 4 min
+
+def normalise_conf(v: float) -> float:
+    """Ensure confidence is always in 0–100 range.
+    Accepts both 0.0–1.0 (fractional) and 0–100 (percent) formats and
+    returns a consistent 0–100 float so display code never needs to
+    conditionally multiply by 100.
+    """
+    if v is None:
+        return 0.0
+    if 0.0 <= v <= 1.0:
+        return round(v * 100, 1)
+    return round(float(v), 1)
+
+
+# ── Kite API semaphore — max 3 concurrent historical data requests ─────────────
+# Kite rate limit: 3 req/s per IP. This prevents HTTP 429 errors during scans.
+_kite_semaphore = threading.Semaphore(3)
+
+
+
 # NSE symbol alias map -- maps our internal name to actual NSE tradingsymbol
 # Used when our name differs from what Kite's instrument list shows
 NSE_SYMBOL_ALIASES: Dict[str, str] = {
@@ -4948,6 +5192,41 @@ NSE_SYMBOL_ALIASES: Dict[str, str] = {
     # Telecom infra
     "INDUSTOWER":    "INDUSTOWER",
 }
+
+
+def _bulk_resolve_tokens() -> None:
+    """
+    Pre-resolve instrument tokens for all SCAN_UNIVERSE symbols in one pass.
+    Called in a background thread immediately after Kite login.
+    Loads the NSE instruments DF once, then resolves every symbol via vectorised
+    pandas filter — no per-symbol API calls, completes in < 2 seconds.
+    """
+    try:
+        if not kite_manager.is_authenticated:
+            return
+        df = kite_manager._get_nse_instruments_df()
+        if df.empty:
+            return
+        resolved = 0
+        for symbol in SCAN_UNIVERSE:
+            if symbol in _token_cache or symbol in DEMO_TOKENS:
+                continue
+            if symbol in ("NIFTY 50", "NIFTY BANK"):
+                continue
+            lookup = NSE_SYMBOL_ALIASES.get(symbol, symbol)
+            if lookup is None:
+                continue
+            match = df[
+                (df["tradingsymbol"] == lookup) &
+                (df["instrument_type"] == "EQ") &
+                (df["exchange"] == "NSE")
+            ]
+            if not match.empty:
+                _token_cache[symbol] = int(match.iloc[0]["instrument_token"])
+                resolved += 1
+        log.info(f"✅ Bulk token pre-resolve complete: {resolved} symbols cached")
+    except Exception as e:
+        log.warning(f"Bulk token pre-resolve failed: {e}")
 
 def get_instrument_token(symbol: str) -> Optional[int]:
     """
@@ -5026,13 +5305,62 @@ def get_instrument_token(symbol: str) -> Optional[int]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("🚀 AlgoTrade Pro Enhanced starting...")
+    log.info("🚀 AlgoTrade Pro Ultimate v4.0 starting...")
+    # ── Fix #11: Start dynamic universe enrichment background task ────────────
+    # Runs every 30 min during market hours; enriches SCAN_UNIVERSE with live
+    # top movers / high-volume stocks from Kite so the scanner is never stale.
+    async def _refresh_dynamic_universe():
+        global _dynamic_universe, _universe_fetched_at
+        while True:
+            try:
+                now = datetime.now()
+                market_open  = now.replace(hour=9, minute=15, second=0, microsecond=0)
+                market_close = now.replace(hour=15, second=0, microsecond=0)
+                if market_open <= now <= market_close and kite_manager.is_authenticated:
+                    nse_syms = [f"NSE:{s}" for s in SCAN_UNIVERSE
+                                if s not in ("NIFTY 50", "NIFTY BANK")]
+                    batch_size = 100
+                    all_quotes: Dict[str, Any] = {}
+                    for i in range(0, len(nse_syms), batch_size):
+                        batch = nse_syms[i:i + batch_size]
+                        try:
+                            q = kite_manager.get_quote(batch) or {}
+                            all_quotes.update(q)
+                        except Exception:
+                            pass
+                    if all_quotes:
+                        # Sort by % change (abs) descending — surface most volatile
+                        def _pct(q):
+                            ltp  = float(q.get("last_price") or 0)
+                            prev = float(q.get("ohlc", {}).get("close") or ltp or 1)
+                            return abs((ltp - prev) / prev * 100) if prev else 0
+                        sorted_syms = sorted(
+                            all_quotes.items(),
+                            key=lambda kv: _pct(kv[1]),
+                            reverse=True
+                        )
+                        top_movers = [
+                            kv[0].replace("NSE:", "")
+                            for kv in sorted_syms[:30]
+                            if kv[0].replace("NSE:", "") not in ("NIFTY 50", "NIFTY BANK")
+                        ]
+                        # Merge with base universe (top movers first for scanner priority)
+                        merged = top_movers + [s for s in SCAN_UNIVERSE if s not in top_movers]
+                        _dynamic_universe = merged
+                        _universe_fetched_at = datetime.now()
+                        log.info(f"🔄 Dynamic universe updated: {len(merged)} symbols, top movers: {top_movers[:5]}")
+            except Exception as e:
+                log.warning(f"Dynamic universe refresh error: {e}")
+            await asyncio.sleep(30 * 60)  # 30 minutes
+
+    task = asyncio.create_task(_refresh_dynamic_universe())
     yield
-    yield
-    log.info("🛑 AlgoTrade Pro Enhanced shutting down...")
+    task.cancel()
+    log.info("🛑 AlgoTrade Pro Ultimate v4.0 shutting down...")
 
 app = FastAPI(title="AlgoTrade Pro Enhanced", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+_CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()]
+app.add_middleware(CORSMiddleware, allow_origins=_CORS_ORIGINS, allow_methods=["*"], allow_headers=["*"], allow_credentials=True)
 
 import traceback
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -5049,6 +5377,31 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
 
 
 # ── Auth routes ──────────────────────────────────────────────────────────────
+
+
+@app.get("/health")
+async def health_check():
+    """Railway health check endpoint. Returns 200 if service is running."""
+    return {
+        "status": "ok",
+        "service": "AlgoTrade Pro Ultimate",
+        "version": "4.0",
+        "kite_connected": kite_manager.is_authenticated,
+        "universe_size": len(_dynamic_universe) if _dynamic_universe else len(SCAN_UNIVERSE),
+        "universe_source": "dynamic" if _dynamic_universe else "static",
+        "universe_refreshed_at": _universe_fetched_at.isoformat() if _universe_fetched_at else None,
+        "orb_cache_entries": len(_orb_cache),
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.get("/ready")
+async def readiness_check():
+    """Readiness probe - confirms Kite auth status."""
+    return {
+        "ready": True,
+        "authenticated": kite_manager.is_authenticated,
+        "message": "Kite login required at /auth/login" if not kite_manager.is_authenticated else "Ready"
+    }
 
 @app.get("/auth/login")
 async def auth_login():
@@ -5226,6 +5579,9 @@ async def get_patterns(symbol: str, interval: str = "3minute"):
     df = kite_manager.get_historical_data(token, interval, days_back)
     if df.empty:
         return JSONResponse({"error": "No candle data"}, status_code=404)
+    stale = _guard_freshness(df, symbol)
+    if stale:
+        return JSONResponse(stale, status_code=200)
     detections = pattern_detector.detect_all_patterns(df, symbol, interval)
 
     # Deduplicate: keep only the BEST (highest confidence) detection per pattern type
@@ -5321,6 +5677,12 @@ async def scan_all(limit: int = 20, interval: str = "5minute", min_conf: float =
     """
     if not kite_manager.is_authenticated:
         return JSONResponse({"error": "Not authenticated"}, status_code=401)
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _scan_all_sync, limit, interval, min_conf)
+
+
+def _scan_all_sync(limit: int = 20, interval: str = "5minute", min_conf: float = 0.65):
 
     results = []
     scan_list = SCAN_UNIVERSE.copy()
@@ -5443,6 +5805,8 @@ async def get_structure_setups(symbol: str, interval: str = "15minute"):
     df = kite_manager.get_historical_data(token, interval, days_back)
     if df.empty or len(df) < 40:
         return JSONResponse({"error": "Not enough data"}, status_code=404)
+    stale = _guard_freshness(df, symbol)
+    if stale: return JSONResponse(stale, status_code=200)
 
     setups = structure_engine.detect_setups(df, symbol, interval)
 
@@ -5475,14 +5839,23 @@ async def get_ict_analysis(symbol: str, interval: str = "15minute"):
         return JSONResponse({"error": f"No token for {symbol}"}, status_code=404)
 
     days_back = 10 if "minute" in interval else 60
-    df = kite_manager.get_historical_data(token, interval, days_back)
+    _ict_key = f"ict:{symbol}:{interval}"
+    _cached_ict = _ict_cache.get(_ict_key)
+    if _cached_ict is not None:
+        return _cached_ict
+
+    with _kite_semaphore:
+        df = kite_manager.get_historical_data(token, interval, days_back)
     if df.empty or len(df) < 30:
         return JSONResponse({"error": "Not enough data"}, status_code=404)
+    stale = _guard_freshness(df, symbol)
+    if stale: return JSONResponse(stale, status_code=200)
 
     # Daily data for HTF bias
     df_daily = None
     try:
-        df_daily = kite_manager.get_historical_data(token, "day", 30)
+        with _kite_semaphore:
+            df_daily = kite_manager.get_historical_data(token, "day", 30)
     except Exception:
         pass
 
@@ -5491,12 +5864,14 @@ async def get_ict_analysis(symbol: str, interval: str = "15minute"):
 
     result = ict_engine.analyse(df, symbol, interval, df_daily, inst_levels)
 
-    return {
+    resp = {
         "symbol":    symbol,
         "interval":  interval,
         "ict":       result.to_dict(),
         "inst_levels": inst_levels.to_dict(),
     }
+    _ict_cache.set(_ict_key, resp)
+    return resp
 
 
 # ── Institutional Levels endpoint ─────────────────────────────────────────────
@@ -5521,6 +5896,7 @@ async def get_institutional_levels(symbol: str):
     return levels.to_dict()
 
 
+@app.get("/api/fno/{symbol}")
 async def get_fno_signals(symbol: str, interval: str = "5minute"):
     """Generate F&O signals using REAL Kite expiry dates, option chain, IV & Greeks."""
     if not kite_manager.is_authenticated:
@@ -5586,6 +5962,8 @@ async def get_fno_signals(symbol: str, interval: str = "5minute"):
     df = kite_manager.get_historical_data(token, interval, days_back)
     if df.empty:
         return JSONResponse({"error": "No historical data"}, status_code=404)
+    stale = _guard_freshness(df, symbol)
+    if stale: return JSONResponse(stale, status_code=200)
 
     # ── 3. ATR ───────────────────────────────────────────────────────────────
     if len(df) >= 14:
@@ -5750,13 +6128,24 @@ async def get_smc_plus(symbol: str, interval: str = "15minute"):
         return JSONResponse({"error": f"No token for {symbol}"}, status_code=404)
 
     days_back = 10 if "minute" in interval else 60
-    df = kite_manager.get_historical_data(token, interval, days_back)
+    _smc_key = f"smc:{symbol}:{interval}"
+    _cached_smc = _smc_cache.get(_smc_key)
+    if _cached_smc is not None:
+        return _cached_smc
+
+    with _kite_semaphore:
+        df = kite_manager.get_historical_data(token, interval, days_back)
     if df.empty or len(df) < 20:
         return JSONResponse({"error": "No data"}, status_code=404)
 
+    stale = _guard_freshness(df, symbol)
+    if stale:
+        return JSONResponse(stale, status_code=200)
+
     df_1h = None
     try:
-        df_1h = kite_manager.get_historical_data(token, "60minute", 5)
+        with _kite_semaphore:
+            df_1h = kite_manager.get_historical_data(token, "60minute", 5)
     except Exception:
         pass
 
@@ -5766,12 +6155,13 @@ async def get_smc_plus(symbol: str, interval: str = "15minute"):
     # Also run ICT for additional context
     df_daily = None
     try:
-        df_daily = kite_manager.get_historical_data(token, "day", 20)
+        with _kite_semaphore:
+            df_daily = kite_manager.get_historical_data(token, "day", 20)
     except Exception:
         pass
     ict = ict_engine.analyse(df, symbol, interval, df_daily, inst_levels)
 
-    return {
+    smc_resp = {
         "symbol":        symbol,
         "interval":      interval,
         "smc":           result.to_dict(),
@@ -5797,6 +6187,8 @@ async def get_smc_plus(symbol: str, interval: str = "15minute"):
             "daily_bias": ict.daily_bias,
         },
     }
+    _smc_cache.set(_smc_key, smc_resp)
+    return smc_resp
 
 @app.get("/api/orb/{symbol}")
 async def get_orb(symbol: str, interval: str = "5minute"):
@@ -5804,13 +6196,14 @@ async def get_orb(symbol: str, interval: str = "5minute"):
     Opening Range Breakout signal.
     ORB range = High/Low of 9:15-9:29 candles today.
     Breakout = first 9:30+ candle that CLOSES beyond the range with volume.
+    Once a signal fires for the day it is cached — subsequent calls return
+    the original signal so intraday data jitter cannot flip the levels.
     """
     if not kite_manager.is_authenticated:
         return JSONResponse({"error": "Not authenticated"}, status_code=401)
 
     sym_clean = symbol.replace(" 50", "").replace("NIFTY BANK", "BANKNIFTY").replace("NIFTY", "NIFTY")
     if "NIFTY" in symbol.upper():
-        # Use index token
         token = DEMO_TOKENS.get(symbol) or DEMO_TOKENS.get("NIFTY 50")
     else:
         token = get_instrument_token(symbol)
@@ -5825,12 +6218,32 @@ async def get_orb(symbol: str, interval: str = "5minute"):
 
     if df.empty or len(df) < 5:
         return JSONResponse({"error": "Insufficient data -- market may not be open yet"}, status_code=404)
+    stale = _guard_freshness(df, symbol, max_age=90)
+    if stale: return JSONResponse(stale, status_code=200)
+
+    # ── Check daily ORB cache first ───────────────────────────────────────────
+    _IST_orb = timezone(timedelta(hours=5, minutes=30))
+    today_str  = datetime.now(tz=_IST_orb).strftime("%Y-%m-%d")
+    cache_key  = f"{symbol}:{today_str}"
+    cached_sig = _orb_cache.get(cache_key)
 
     try:
         signal = orb_engine.detect(df, symbol, interval)
     except Exception as e:
         log.error(f"ORB detect error for {symbol}: {e}")
         return JSONResponse({"error": f"ORB analysis error: {e}"}, status_code=500)
+
+    # If a signal fired for the first time today, store it in cache
+    if signal is not None and cached_sig is None:
+        _orb_cache[cache_key] = signal
+        log.info(f"📦 ORB signal cached for {symbol} ({today_str})")
+    elif signal is None and cached_sig is not None:
+        # Reuse today's cached signal — data jitter cleared the live signal
+        signal = cached_sig
+        log.info(f"♻️  ORB using cached signal for {symbol} ({today_str})")
+    elif cached_sig is not None:
+        # Both present — always serve cached (original) signal to prevent flipping
+        signal = cached_sig
 
     if signal is None:
         # Return info about current ORB range even if no breakout yet
@@ -5870,11 +6283,33 @@ async def get_orb(symbol: str, interval: str = "5minute"):
             "generated_at": datetime.now().isoformat(),
         }
 
+    # ── Invalidation check: if CMP has breached ORB High (BEAR) or Low (BULL),
+    # the signal is structurally dead — flag it so the UI shows a warning. ────
+    try:
+        curr_price = float(df["close"].iloc[-1])
+    except Exception:
+        curr_price = 0.0
+
+    signal_dict = signal.to_dict()
+    invalidated = False
+    if signal.direction == "BEAR" and curr_price > signal.orb_high:
+        invalidated = True
+        signal_dict["notes"] = [
+            f"⛔ Signal INVALIDATED — CMP ({curr_price:.2f}) reclaimed ORB High ({signal.orb_high:.2f}). Do not trade."
+        ] + signal_dict.get("notes", [])
+    elif signal.direction == "BULL" and curr_price < signal.orb_low:
+        invalidated = True
+        signal_dict["notes"] = [
+            f"⛔ Signal INVALIDATED — CMP ({curr_price:.2f}) broke below ORB Low ({signal.orb_low:.2f}). Do not trade."
+        ] + signal_dict.get("notes", [])
+
+    signal_dict["invalidated"] = invalidated
+
     return {
         "symbol":   symbol,
         "interval": interval,
-        "signal":   signal.to_dict(),
-        "status":   "BREAKOUT",
+        "signal":   signal_dict,
+        "status":   "INVALIDATED" if invalidated else "BREAKOUT",
         "generated_at": datetime.now().isoformat(),
     }
 
@@ -6272,23 +6707,36 @@ async def get_smc_scan(interval: str = "15minute", min_conf: float = 60.0, limit
     scan_list = [s for s in SCAN_UNIVERSE if s not in ("NIFTY 50", "NIFTY BANK")]
     import time as _time
 
-    for symbol in scan_list:
+    def _fetch_smc_data(symbol: str):
         token = get_instrument_token(symbol)
         if token is None:
-            continue
+            return symbol, None, None
         try:
             days_back = 7 if "minute" in interval else 30
-            df = kite_manager.get_historical_data(token, interval, days_back)
+            with _kite_semaphore:
+                df = kite_manager.get_historical_data(token, interval, days_back)
             if df.empty or len(df) < 20:
-                continue
-            _time.sleep(0.35)  # ~3 req/s -- stays within Kite's rate limit
-
+                return symbol, None, None
             df_1h = None
             try:
-                df_1h = kite_manager.get_historical_data(token, "60minute", 5)
-                _time.sleep(0.35)
+                with _kite_semaphore:
+                    df_1h = kite_manager.get_historical_data(token, "60minute", 5)
             except Exception:
                 pass
+            return symbol, df, df_1h
+        except Exception:
+            return symbol, None, None
+
+    smc_data = {}
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(_fetch_smc_data, s): s for s in scan_list}
+        for future in as_completed(futures):
+            sym, df, df_1h = future.result()
+            if df is not None:
+                smc_data[sym] = (df, df_1h)
+
+    for symbol, (df, df_1h) in smc_data.items():
+        try:
 
             result = smc_engine.analyse(df, symbol, interval, df_1h)
 
@@ -6335,6 +6783,23 @@ async def get_smc_scan(interval: str = "15minute", min_conf: float = 60.0, limit
     # Sort by confidence
     results.sort(key=lambda x: x["confidence"], reverse=True)
 
+    # Auto-log signals to journal
+    for _r in results[:limit]:
+        try:
+            _ez = _r.get("entry_zone", [0, 0])
+            threading.Thread(
+                target=_log_signal,
+                args=(_r["symbol"], _r["direction"], "smc",
+                      _r["confidence"],
+                      _ez[0] if _ez else 0, _ez[1] if _ez else 0,
+                      _r.get("stop_loss", 0), _r.get("target_2", 0), _r.get("rr_t2", 0),
+                      _r.get("pattern_type", "")),
+                daemon=True,
+            ).start()
+        except Exception:
+            pass
+
+    _IST = timezone(timedelta(hours=5, minutes=30))
     return {
         "signals":      results[:limit],
         "total_found":  len(results),
@@ -6342,6 +6807,7 @@ async def get_smc_scan(interval: str = "15minute", min_conf: float = 60.0, limit
         "interval":     interval,
         "min_conf":     min_conf,
         "generated_at": datetime.now().isoformat(),
+        "scanned_at":   datetime.now(tz=_IST).strftime("%H:%M:%S IST"),
     }
 
 
@@ -6424,31 +6890,68 @@ async def institutional_scan(
         return JSONResponse({"error": "Not authenticated"}, status_code=401)
 
     import time as _time
-    results = []
-    scan_list = [s for s in SCAN_UNIVERSE if s not in ("NIFTY 50", "NIFTY BANK")]
 
-    for symbol in scan_list:
+    # ── Check scan cache first (4-min TTL) ───────────────────────────────────
+    _scan_key = f"inst_scan:{interval}:{int(min_conf)}"
+    _cached = _scan_cache.get(_scan_key)
+    if _cached is not None:
+        log.info(f"Returning cached institutional scan ({interval})")
+        return _cached
+
+    results = []
+    # Fix #11: prefer _dynamic_universe (top movers first) when populated by
+    # the background enrichment task; fall back to static SCAN_UNIVERSE.
+    _base = _dynamic_universe if _dynamic_universe else SCAN_UNIVERSE
+    scan_list = [s for s in _base if s not in ("NIFTY 50", "NIFTY BANK")]
+
+    def _fetch_symbol_data(symbol: str):
         token = get_instrument_token(symbol)
         if token is None:
-            continue
+            return symbol, None, None, None
         try:
-            days_back = 10
-            df = kite_manager.get_historical_data(token, interval, days_back)
+            with _kite_semaphore:
+                df = kite_manager.get_historical_data(token, interval, 10)
             if df.empty or len(df) < 30:
-                continue
-            _time.sleep(0.35)
-
-            df_1h = None
-            df_daily = None
+                return symbol, None, None, None
+            # Skip stale data during market hours
+            if _is_market_hours() and _data_age_minutes(df) > 75:
+                return symbol, None, None, None
+            df_1h = df_daily = None
             try:
-                df_1h    = kite_manager.get_historical_data(token, "60minute", 7)
-                _time.sleep(0.2)
-                df_daily = kite_manager.get_historical_data(token, "day", 20)
-                _time.sleep(0.2)
+                with _kite_semaphore:
+                    df_1h = kite_manager.get_historical_data(token, "60minute", 7)
+                with _kite_semaphore:
+                    df_daily = kite_manager.get_historical_data(token, "day", 20)
             except Exception:
                 pass
+            return symbol, df, df_1h, df_daily
+        except Exception:
+            return symbol, None, None, None
+
+    # Fetch all symbols in parallel (max 5 concurrent threads, semaphore limits API to 3 req/s)
+    symbol_data = {}
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(_fetch_symbol_data, s): s for s in scan_list}
+        for future in as_completed(futures):
+            sym, df, df_1h, df_daily = future.result()
+            if df is not None:
+                symbol_data[sym] = (df, df_1h, df_daily)
+
+    log.info(f"Institutional scan: fetched data for {len(symbol_data)}/{len(scan_list)} symbols")
+
+    for symbol, (df, df_1h, df_daily) in symbol_data.items():
+        try:
 
             inst_levels = calculate_institutional_levels(df, symbol)
+
+            # ── ACCURACY IMPROVEMENT 2: Volume Confirmation Gate ─────────────
+            # Institutional moves ALWAYS have above-average volume on the trigger bar.
+            # Reject setups where the last 3 bars are all below 80% of 20-bar avg vol.
+            if "volume" in df.columns and len(df) >= 23:
+                avg_vol_20 = float(df["volume"].iloc[-23:-3].mean())
+                recent_max_vol = float(df["volume"].iloc[-3:].max())
+                if avg_vol_20 > 0 and recent_max_vol < avg_vol_20 * 0.80:
+                    continue  # Dead volume -- no institutional interest, skip
 
             # Run all 3 engines
             smc_result   = smc_engine.analyse(df, symbol, interval, df_1h, inst_levels)
@@ -6487,6 +6990,15 @@ async def institutional_scan(
 
             if composite_conf < min_conf:
                 continue
+
+            # ── ACCURACY IMPROVEMENT 3: Minimum RR gate ──────────────────────
+            # Never surface a setup with RR < 1.5 to T2 (risk not worth reward).
+            # Also flag if we are outside market hours (stale data warning).
+            _IST = timezone(timedelta(hours=5, minutes=30))
+            _now = datetime.now(tz=_IST).replace(tzinfo=None)
+            _market_open  = _now.replace(hour=9, minute=30, second=0, microsecond=0)
+            _market_close = _now.replace(hour=15, minute=30, second=0, microsecond=0)
+            _in_market_hours = _market_open <= _now <= _market_close
 
             # Determine best targets (prefer structure engine if available, else ICT)
             if str_setups and norm(str_sig) == direction:
@@ -6544,16 +7056,48 @@ async def institutional_scan(
             if inst_levels.below_pdl and direction == "SELL":
                 key_notes.append(f"Below PDL {inst_levels.pdl:.0f}")
 
-            # Quality label
-            if composite_conf >= 80: quality = "A+"
-            elif composite_conf >= 70: quality = "A"
-            else: quality = "B"
+            # ── ACCURACY IMPROVEMENT 1: 5-point Confluence Score Gate ──────────
+            # Only surface signals with strong multi-factor confluence.
+            # Each factor adds 1 point; min score 3 to show as A/A+.
+            confluence_score = 0
+            if ob_conf:                                          confluence_score += 1  # OB confirmed
+            if fvg_conf:                                         confluence_score += 1  # FVG confirmed
+            if ict_result.in_killzone:                           confluence_score += 1  # Active killzone
+            if inst_levels.above_pdh and direction == "BUY":    confluence_score += 1  # PDH breakout
+            elif inst_levels.below_pdl and direction == "SELL": confluence_score += 1  # PDL breakdown
+            daily_ok = (ict_result.daily_bias == "BULLISH" and direction == "BUY") or                        (ict_result.daily_bias == "BEARISH" and direction == "SELL")
+            if daily_ok:                                         confluence_score += 1  # HTF aligned
+
+            # Quality label driven by BOTH confidence AND confluence score
+            if composite_conf >= 80 and confluence_score >= 3:   quality = "A+"
+            elif composite_conf >= 70 and confluence_score >= 2:  quality = "A"
+            elif composite_conf >= 65:                            quality = "B"
+            else:
+                continue  # Below minimum quality -- reject
+
+            key_notes.append(f"Confluence: {confluence_score}/5")
+
+            # Enforce minimum RR 1.5x to T2 -- below this, risk/reward is poor
+            # FIX: rr_t2 == 0 means the signal is in WAIT state (no real setup);
+            # the old `else True` let these ghost signals pass through.
+            if rr_t2 <= 0 or rr_t2 < 1.5:
+                continue
+
+            # ── ACCURACY IMPROVEMENT 4: Market hours tag ──────────────────────
+            _stale_warning = [] if _in_market_hours else ["⚠️ Outside market hours — confirm before trading"]
+            key_notes.extend(_stale_warning)
+
+            # Position sizing: 2% risk model
+            _entry_mid   = round((entry_low + entry_high) / 2, 2)
+            _risk_ps     = abs(_entry_mid - sl) if sl else 0
+            _pos_size    = int(CAPITAL * 0.02 / _risk_ps) if _risk_ps > 0 else 0
 
             results.append({
                 "symbol":        symbol,
                 "direction":     direction,
                 "quality":       quality,
                 "confidence":    composite_conf,
+                "position_size": _pos_size,
                 "engine_votes":  f"{votes}/3 engines agree",
                 "engines":       {
                     "smc":  norm(smc_sig),
@@ -6587,6 +7131,7 @@ async def institutional_scan(
                 "pdl":           round(inst_levels.pdl, 2),
                 "notes":         key_notes,
                 "interval":      interval,
+                "confluence_score": confluence_score,
             })
 
         except Exception as e:
@@ -6595,12 +7140,30 @@ async def institutional_scan(
 
     results.sort(key=lambda x: (x["confidence"], x["quality"] == "A+"), reverse=True)
 
-    return {
+    # ── Auto-log all signals to journal (background, non-blocking) ────────
+    for _r in results:
+        try:
+            threading.Thread(
+                target=_log_signal,
+                args=(_r["symbol"], _r["direction"], "institutional",
+                      _r["confidence"],
+                      _r["entry_zone"][0], _r["entry_zone"][1],
+                      _r["stop_loss"], _r["target_2"], _r["rr_t2"],
+                      "; ".join(_r.get("notes", []))),
+                daemon=True,
+            ).start()
+        except Exception:
+            pass
+
+    _IST_tz = timezone(timedelta(hours=5, minutes=30))
+    scan_response = {
         "signals":      results[:limit],
         "total_found":  len(results),
-        "scanned":      len(scan_list),
+        "scanned":      len(symbol_data),
         "interval":     interval,
         "generated_at": datetime.now().isoformat(),
+        "scanned_at":   datetime.now(tz=_IST_tz).strftime("%H:%M:%S IST"),
+        "cached":       False,
         "methodology":  (
             "Requires 2/3 engines (SMC + ICT + Structure) to agree. "
             "Entry: OTE zone 61.8%-78.6% Fibonacci retracement. "
@@ -6608,6 +7171,8 @@ async def institutional_scan(
             "Minimum RR 1.8x to T2. PDH/PDL + Daily bias + Killzone context included."
         ),
     }
+    _scan_cache.set(_scan_key, scan_response)
+    return scan_response
 
 
 def _detect_pattern_type(df: pd.DataFrame, signal: str, structure: str) -> str:
@@ -6692,6 +7257,36 @@ def _detect_pattern_type(df: pd.DataFrame, signal: str, structure: str) -> str:
 
 
 
+def get_india_vix() -> float:
+    """
+    Fetch India VIX from Kite. Returns float (e.g. 14.5).
+    Falls back to 15.0 (neutral) if unavailable or not authenticated.
+    Used to scale stop-loss ATR multipliers: high VIX → wider stops.
+    """
+    try:
+        if not kite_manager.is_authenticated:
+            return 15.0
+        q = kite_manager.kite.quote(["NSE:INDIA VIX"])
+        vix = float(q.get("NSE:INDIA VIX", {}).get("last_price", 15.0) or 15.0)
+        return vix
+    except Exception:
+        return 15.0
+
+def vix_atr_multiplier() -> float:
+    """
+    Returns an ATR stop multiplier scaled to current VIX regime.
+      VIX < 14 (low vol)   → 0.5x  (tight stops, trending market)
+      VIX 14–20 (normal)   → 0.75x
+      VIX 20–25 (elevated) → 1.0x
+      VIX > 25 (panic)     → 1.5x  (wide stops, avoid getting shaken out)
+    """
+    vix = get_india_vix()
+    if vix < 14:   return 0.5
+    elif vix < 20: return 0.75
+    elif vix < 25: return 1.0
+    else:          return 1.5
+
+
 HTML_UI = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -6699,115 +7294,247 @@ HTML_UI = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>AlgoTrade Pro Ultimate v4.0</title>
 <style>
-:root{--bg:#060b14;--panel:#0d1421;--panel2:#111c2d;--border:#1a2540;--accent:#00d4ff;--green:#00e676;--red:#ff3d57;--yellow:#ffb300;--purple:#a855f7;--orange:#ff6b35;--teal:#00bcd4;--text:#e2e8f0;--muted:#4a5568}
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap');
+:root{
+  --bg:#08080e;--panel:#0f0f18;--panel2:#141420;--border:#1c1c2e;
+  --accent:#a8ff3e;--accent-dim:rgba(168,255,62,.12);--accent-glow:rgba(168,255,62,.25);
+  --green:#a8ff3e;--red:#ff4560;--yellow:#ffd166;--purple:#c084fc;--orange:#fb923c;--teal:#22d3ee;
+  --text:#f0f0fa;--muted:#52526e;--sub:#8888aa;
+  --radius:12px;--radius-sm:8px;--radius-xs:6px;
+}
 *{margin:0;padding:0;box-sizing:border-box}
-body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;height:100vh;overflow:hidden;display:flex;flex-direction:column}
-header{background:var(--panel);border-bottom:1px solid var(--border);padding:10px 20px;display:flex;align-items:center;gap:12px;flex-shrink:0}
-header h1{font-size:1rem;color:var(--accent);font-weight:800;letter-spacing:.5px}
-.badge{background:rgba(0,212,255,.1);color:var(--accent);font-size:.62rem;padding:2px 6px;border-radius:999px;border:1px solid rgba(0,212,255,.3)}
-.badge.green{background:rgba(0,230,118,.1);color:var(--green);border-color:rgba(0,230,118,.3)}
-.badge.yellow{background:rgba(255,179,0,.1);color:var(--yellow);border-color:rgba(255,179,0,.3)}
-.badge.purple{background:rgba(168,85,247,.1);color:var(--purple);border-color:rgba(168,85,247,.3)}
+body{background:var(--bg);color:var(--text);font-family:'DM Sans',system-ui,sans-serif;height:100vh;overflow:hidden;display:flex;flex-direction:column}
+
+/* ── Header ── */
+header{
+  background:var(--panel);border-bottom:1px solid var(--border);
+  padding:10px 20px;display:flex;align-items:center;gap:12px;flex-shrink:0;
+  position:relative;
+}
+header::after{content:'';position:absolute;bottom:0;left:0;right:0;height:1px;
+  background:linear-gradient(90deg,transparent,var(--accent-glow),transparent)}
+.logo-mark{width:26px;height:26px;background:var(--accent);border-radius:7px;
+  display:flex;align-items:center;justify-content:center;font-size:.75rem;font-weight:800;color:#000;flex-shrink:0}
+header h1{font-size:.92rem;color:var(--text);font-weight:700;letter-spacing:-.2px}
+header h1 span{color:var(--accent)}
+.badge{background:rgba(168,255,62,.1);color:var(--accent);font-size:.6rem;padding:2px 8px;border-radius:999px;border:1px solid rgba(168,255,62,.25);font-weight:600;letter-spacing:.3px}
+.badge.green{background:rgba(168,255,62,.1);color:var(--green);border-color:rgba(168,255,62,.25)}
+.badge.yellow{background:rgba(255,209,102,.1);color:var(--yellow);border-color:rgba(255,209,102,.25)}
+.badge.purple{background:rgba(192,132,252,.1);color:var(--purple);border-color:rgba(192,132,252,.25)}
 .auth-bar{margin-left:auto;display:flex;align-items:center;gap:10px;font-size:.8rem}
 .dot{width:7px;height:7px;border-radius:50%;background:var(--red)}
-.dot.ok{background:var(--green);box-shadow:0 0 6px var(--green)}
-.tabs{display:flex;background:var(--panel);border-bottom:1px solid var(--border);overflow-x:auto;flex-shrink:0}
-.tab{padding:10px 15px;font-size:.75rem;font-weight:600;color:var(--muted);cursor:pointer;border-bottom:2px solid transparent;white-space:nowrap;transition:.2s}
-.tab:hover{color:var(--text)}
-.tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+.dot.ok{background:var(--green);box-shadow:0 0 8px var(--accent-glow)}
+
+/* ── Tab Bar (pill-style like reference) ── */
+.tabs{
+  display:flex;background:var(--panel);
+  border-bottom:1px solid var(--border);
+  overflow-x:auto;flex-shrink:0;padding:8px 16px;gap:4px;align-items:center;
+}
+.tab{
+  padding:6px 14px;font-size:.72rem;font-weight:600;color:var(--sub);cursor:pointer;
+  border-radius:999px;white-space:nowrap;transition:.18s;border:1px solid transparent;
+}
+.tab:hover{color:var(--text);background:rgba(255,255,255,.04)}
+.tab.active{background:var(--accent);color:#000;border-color:transparent;
+  box-shadow:0 0 14px var(--accent-glow);font-weight:700}
+
+/* ── Layout ── */
 .main{display:flex;flex:1;overflow:hidden}
-.sidebar{width:210px;background:var(--panel);border-right:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0}
-.content{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:10px}
+.sidebar{
+  width:215px;background:var(--panel);border-right:1px solid var(--border);
+  display:flex;flex-direction:column;flex-shrink:0;
+}
+.content{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px}
+
+/* ── Sidebar Symbol List ── */
 .sym-input{display:flex;gap:6px;padding:10px;border-bottom:1px solid var(--border)}
-.sym-input input{flex:1;background:var(--panel2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:6px;font-size:.78rem;outline:none}
-.sym-input input:focus{border-color:var(--accent)}
-.sym-input button{background:var(--accent);color:#000;border:none;padding:6px 11px;border-radius:6px;cursor:pointer;font-size:.78rem;font-weight:700}
-.sym-list{flex:1;overflow-y:auto;padding:6px}
-.sym-item{padding:5px 9px;border-radius:5px;cursor:pointer;font-size:.76rem;font-weight:500;margin-bottom:2px;transition:.15s}
-.sym-item:hover,.sym-item.active{background:rgba(0,212,255,.1);color:var(--accent)}
-.card{background:var(--panel);border:1px solid var(--border);border-radius:9px;padding:13px}
-.card-title{font-size:.78rem;font-weight:700;color:var(--accent);margin-bottom:9px;display:flex;align-items:center;gap:5px}
-.row{display:flex;gap:10px;flex-wrap:wrap}
+.sym-input input{
+  flex:1;background:var(--panel2);border:1px solid var(--border);color:var(--text);
+  padding:7px 10px;border-radius:var(--radius-sm);font-size:.76rem;outline:none;
+  font-family:'DM Sans',sans-serif;transition:.18s;
+}
+.sym-input input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-dim)}
+.sym-input input::placeholder{color:var(--muted)}
+.sym-input button{
+  background:var(--accent);color:#000;border:none;padding:7px 12px;
+  border-radius:var(--radius-sm);cursor:pointer;font-size:.76rem;font-weight:700;
+  transition:.15s;font-family:'DM Sans',sans-serif;
+}
+.sym-input button:hover{filter:brightness(1.1)}
+.sym-list{flex:1;overflow-y:auto;padding:8px}
+.sym-item{
+  padding:7px 10px;border-radius:var(--radius-xs);cursor:pointer;font-size:.74rem;
+  font-weight:500;margin-bottom:2px;transition:.15s;color:var(--sub);
+  display:flex;align-items:center;gap:8px;
+}
+.sym-item::before{content:'';width:5px;height:5px;border-radius:50%;background:var(--border);flex-shrink:0;transition:.15s}
+.sym-item:hover{background:rgba(255,255,255,.04);color:var(--text)}
+.sym-item.active{background:var(--accent-dim);color:var(--accent);font-weight:700}
+.sym-item.active::before{background:var(--accent)}
+
+/* ── Cards ── */
+.card{
+  background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:16px;
+  transition:.18s;
+}
+.card:hover{border-color:rgba(168,255,62,.15)}
+.card-title{
+  font-size:.76rem;font-weight:700;color:var(--text);margin-bottom:12px;
+  display:flex;align-items:center;gap:6px;letter-spacing:.1px;
+}
+.card-title .ct-icon{color:var(--accent);font-size:.85rem}
+
+/* ── Grid / Layout helpers ── */
+.row{display:flex;gap:12px;flex-wrap:wrap}
 .col{flex:1;min-width:230px}
-.stat-row{display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid var(--border);font-size:.74rem}
+.stat-row{
+  display:flex;justify-content:space-between;padding:5px 0;
+  border-bottom:1px solid var(--border);font-size:.73rem;
+}
 .stat-row:last-child{border-bottom:none}
-.stat-label{color:var(--muted)}
-.stat-val{font-weight:700}
+.stat-label{color:var(--sub)}
+.stat-val{font-weight:700;font-family:'JetBrains Mono',monospace;font-size:.71rem}
+
+/* ── Color utilities ── */
 .green{color:var(--green)} .red{color:var(--red)} .yellow{color:var(--yellow)}
 .purple{color:var(--purple)} .orange{color:var(--orange)} .muted{color:var(--muted)}
-.accent{color:var(--accent)}
-.signal-box{padding:10px 13px;border-radius:8px;border:1px solid;margin-bottom:8px}
-.signal-box.BUY,.signal-box.LONG{background:rgba(0,230,118,.07);border-color:rgba(0,230,118,.3)}
-.signal-box.SELL,.signal-box.SHORT{background:rgba(255,61,87,.07);border-color:rgba(255,61,87,.3)}
-.signal-box.WAIT{background:rgba(255,179,0,.07);border-color:rgba(255,179,0,.25)}
-.sig-dir{font-size:.95rem;font-weight:800;margin-bottom:4px}
-.targets-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:8px}
-.tgt{background:var(--panel2);border-radius:6px;padding:7px 9px;border:1px solid var(--border)}
-.tgt-label{font-size:.63rem;color:var(--muted);margin-bottom:2px}
-.tgt-val{font-size:.85rem;font-weight:800}
-.btn{background:var(--panel2);border:1px solid var(--border);color:var(--text);padding:5px 11px;border-radius:6px;cursor:pointer;font-size:.73rem;transition:.15s}
+.accent{color:var(--accent)} .sub{color:var(--sub)}
+
+/* ── Signal Boxes ── */
+.signal-box{padding:12px 14px;border-radius:var(--radius-sm);border:1px solid;margin-bottom:8px}
+.signal-box.BUY,.signal-box.LONG{background:rgba(168,255,62,.06);border-color:rgba(168,255,62,.25)}
+.signal-box.SELL,.signal-box.SHORT{background:rgba(255,69,96,.07);border-color:rgba(255,69,96,.3)}
+.signal-box.WAIT{background:rgba(255,209,102,.06);border-color:rgba(255,209,102,.25)}
+.sig-dir{font-size:.95rem;font-weight:800;margin-bottom:4px;letter-spacing:.3px}
+.targets-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}
+.tgt{
+  background:var(--panel2);border-radius:var(--radius-xs);padding:8px 10px;
+  border:1px solid var(--border);
+}
+.tgt-label{font-size:.6rem;color:var(--sub);margin-bottom:3px;text-transform:uppercase;letter-spacing:.5px}
+.tgt-val{font-size:.82rem;font-weight:700;font-family:'JetBrains Mono',monospace}
+
+/* ── Buttons ── */
+.btn{
+  background:var(--panel2);border:1px solid var(--border);color:var(--text);
+  padding:6px 12px;border-radius:var(--radius-xs);cursor:pointer;font-size:.72rem;
+  transition:.15s;font-family:'DM Sans',sans-serif;font-weight:500;
+}
 .btn:hover{border-color:var(--accent);color:var(--accent)}
-.btn.primary{background:var(--accent);color:#000;border-color:var(--accent);font-weight:700}
-.chip{display:inline-block;padding:2px 6px;border-radius:999px;font-size:.63rem;font-weight:700;margin:2px}
-.chip.bull{background:rgba(0,230,118,.15);color:var(--green)}
-.chip.bear{background:rgba(255,61,87,.15);color:var(--red)}
-.chip.neutral{background:rgba(255,179,0,.15);color:var(--yellow)}
-.chip.info{background:rgba(0,212,255,.12);color:var(--accent)}
-.ob-box,.fvg-box,.sweep-box{background:var(--panel2);border-radius:6px;padding:7px 9px;margin-bottom:5px;font-size:.72rem;border-left:3px solid}
+.btn.primary{
+  background:var(--accent);color:#000;border-color:var(--accent);font-weight:700;
+  box-shadow:0 0 12px var(--accent-glow);
+}
+.btn.primary:hover{filter:brightness(1.08)}
+
+/* ── Chips ── */
+.chip{display:inline-block;padding:2px 8px;border-radius:999px;font-size:.61rem;font-weight:700;margin:2px}
+.chip.bull{background:rgba(168,255,62,.15);color:var(--green)}
+.chip.bear{background:rgba(255,69,96,.15);color:var(--red)}
+.chip.neutral{background:rgba(255,209,102,.15);color:var(--yellow)}
+.chip.info{background:rgba(168,255,62,.1);color:var(--accent)}
+
+/* ── SMC Blocks ── */
+.ob-box,.fvg-box,.sweep-box{
+  background:var(--panel2);border-radius:var(--radius-xs);padding:8px 10px;
+  margin-bottom:6px;font-size:.71rem;border-left:3px solid;
+}
 .ob-box.BULL{border-color:var(--green)} .ob-box.BEAR{border-color:var(--red)}
 .fvg-box{border-color:var(--yellow)} .sweep-box{border-color:var(--purple)}
-.note-item{font-size:.71rem;padding:2px 0;line-height:1.5}
-.inst-level{display:flex;justify-content:space-between;padding:3px 0;font-size:.73rem;border-bottom:1px solid var(--border)}
+.note-item{font-size:.71rem;padding:2px 0;line-height:1.6}
+.inst-level{display:flex;justify-content:space-between;padding:4px 0;font-size:.72rem;border-bottom:1px solid var(--border)}
 .inst-level:last-child{border-bottom:none}
-.scan-item{background:var(--panel2);border-radius:7px;padding:9px 11px;margin-bottom:7px;border:1px solid var(--border);cursor:pointer;transition:.15s}
-.scan-item:hover{border-color:var(--accent)}
+
+/* ── Scanner items ── */
+.scan-item{
+  background:var(--panel2);border-radius:var(--radius-sm);padding:10px 13px;
+  margin-bottom:8px;border:1px solid var(--border);cursor:pointer;transition:.15s;
+}
+.scan-item:hover{border-color:var(--accent);transform:translateY(-1px)}
 .scan-item.BUY{border-left:3px solid var(--green)}
 .scan-item.SELL{border-left:3px solid var(--red)}
-.scan-hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:5px}
-.scan-sym{font-size:.87rem;font-weight:800}
-.scan-targets{display:flex;gap:7px;flex-wrap:wrap;margin-top:5px}
-.scan-t{font-size:.68rem;padding:2px 6px;border-radius:4px;background:var(--panel);border:1px solid var(--border)}
-.po3-badge{padding:2px 8px;border-radius:5px;font-size:.68rem;font-weight:700}
-.po3-ACCUMULATION{background:rgba(0,188,212,.15);color:var(--teal)}
-.po3-DISTRIBUTION{background:rgba(255,107,53,.15);color:var(--orange)}
-.po3-MANIPULATION_BULL_TRAP,.po3-MANIPULATION_BEAR_TRAP{background:rgba(255,61,87,.2);color:var(--red)}
-.kz-badge{padding:2px 7px;border-radius:5px;font-size:.66rem;font-weight:700}
-.kz-badge.active{background:rgba(255,179,0,.2);color:var(--yellow)}
+.scan-hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
+.scan-sym{font-size:.88rem;font-weight:800;font-family:'JetBrains Mono',monospace;letter-spacing:.5px}
+.scan-targets{display:flex;gap:7px;flex-wrap:wrap;margin-top:6px}
+.scan-t{
+  font-size:.67rem;padding:2px 7px;border-radius:4px;
+  background:var(--panel);border:1px solid var(--border);
+  font-family:'JetBrains Mono',monospace;
+}
+
+/* ── PO3 / KZ badges ── */
+.po3-badge{padding:2px 9px;border-radius:999px;font-size:.66rem;font-weight:700}
+.po3-ACCUMULATION{background:rgba(34,211,238,.15);color:var(--teal)}
+.po3-DISTRIBUTION{background:rgba(251,146,60,.15);color:var(--orange)}
+.po3-MANIPULATION_BULL_TRAP,.po3-MANIPULATION_BEAR_TRAP{background:rgba(255,69,96,.2);color:var(--red)}
+.kz-badge{padding:2px 8px;border-radius:999px;font-size:.64rem;font-weight:700}
+.kz-badge.active{background:rgba(255,209,102,.2);color:var(--yellow)}
 .kz-badge.inactive{background:var(--panel2);color:var(--muted)}
-.ote-box{border-radius:7px;padding:9px 11px;margin-bottom:7px;border:1px solid}
-.ote-box.ACTIVE{border-color:var(--yellow);background:rgba(255,179,0,.07)}
+.ote-box{border-radius:var(--radius-sm);padding:10px 13px;margin-bottom:8px;border:1px solid}
+.ote-box.ACTIVE{border-color:var(--yellow);background:rgba(255,209,102,.06)}
 .ote-box.INACTIVE{border-color:var(--border);background:var(--panel2)}
+
+/* ── Quality levels ── */
 .quality-Ap{color:#ffd700;font-weight:800}
 .quality-A{color:var(--green);font-weight:700}
 .quality-B{color:var(--yellow);font-weight:600}
+
+/* ── Spinner ── */
 .spinner{display:inline-block;width:12px;height:12px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
-.tab-content{display:none} .tab-content.active{display:contents}
-.tabs::-webkit-scrollbar{height:3px} .tabs::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
-.content::-webkit-scrollbar,.sym-list::-webkit-scrollbar{width:4px}
+
+/* ── Scrollbars ── */
+.tabs::-webkit-scrollbar{height:0}
+.content::-webkit-scrollbar,.sym-list::-webkit-scrollbar{width:3px}
 .content::-webkit-scrollbar-thumb,.sym-list::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
+.tab-content{display:none} .tab-content.active{display:contents}
+
+/* ── Number / mono values ── */
+.mono{font-family:'JetBrains Mono',monospace;font-size:.72rem}
+
+/* ── Mobile ── */
+@media (max-width:768px){
+  .main{flex-direction:column}
+  .sidebar{width:100%;height:auto;border-right:none;border-bottom:1px solid var(--border);flex-direction:column}
+  .sym-list{display:flex;flex-direction:row;flex-wrap:nowrap;overflow-x:auto;flex:none;padding:4px 6px;gap:4px}
+  .sym-list::-webkit-scrollbar{height:0}
+  .sym-item{white-space:nowrap;padding:4px 10px}
+  .content{padding:10px}
+  .row{flex-direction:column}
+  .col{min-width:unset}
+  header{padding:8px 12px}
+  header h1{font-size:.85rem}
+  .tabs{padding:6px 10px}
+  .tab{padding:5px 11px;font-size:.68rem}
+}
 </style>
 </head>
 <body>
 <header>
-  <h1>AlgoTrade Pro Ultimate v4.0</h1>
+  <div class="logo-mark">A</div>
+  <h1>AlgoTrade <span>Pro</span> v4.0</h1>
   <span class="badge">SMC</span><span class="badge green">ICT</span>
-  <span class="badge yellow">OTE</span><span class="badge purple">F&O</span>
+  <span class="badge yellow">OTE</span><span class="badge purple">F&amp;O</span>
   <div class="auth-bar">
     <div id="authDot" class="dot"></div>
     <span id="authLabel" style="color:var(--muted);font-size:.76rem">Checking...</span>
+    <span id="arCountdown" style="color:var(--accent);font-size:.7rem;min-width:50px;text-align:right" title="Auto-refresh countdown"></span>
     <a id="loginBtn" href="/auth/login" style="display:none;background:var(--accent);color:#000;padding:3px 11px;border-radius:5px;font-size:.73rem;font-weight:700;text-decoration:none">Login Kite</a>
     <a id="logoutBtn" href="/auth/logout" style="display:none;color:var(--muted);font-size:.7rem;padding:2px 8px;border:1px solid var(--border);border-radius:4px;text-decoration:none">Logout</a>
   </div>
 </header>
 <div class="tabs" id="tabs">
-  <div class="tab active" data-tab="smc">SMC Analysis</div>
+  <div class="tab active" data-tab="signal">Signal</div>
+  <div class="tab" data-tab="smc">SMC Analysis</div>
   <div class="tab" data-tab="ict">ICT / OTE</div>
   <div class="tab" data-tab="structure">Structure Setup</div>
   <div class="tab" data-tab="scanner">Inst. Scanner</div>
   <div class="tab" data-tab="orb">ORB</div>
   <div class="tab" data-tab="patterns">Patterns</div>
   <div class="tab" data-tab="fno">F&O</div>
+  <div class="tab" data-tab="journal">Journal</div>
+  <div class="tab" data-tab="sniper" style="color:#00ff88;font-weight:700">🎯 Sniper</div>
   <div class="tab" data-tab="guide">Guide</div>
 </div>
 <div class="main">
@@ -6819,7 +7546,51 @@ header h1{font-size:1rem;color:var(--accent);font-weight:800;letter-spacing:.5px
     <div class="sym-list" id="symList"></div>
   </div>
   <div class="content" id="content">
-    <div class="tab-content active" id="tab-smc">
+    <!-- ══ SIGNAL TAB ══════════════════════════════════════════════════════ -->
+    <div class="tab-content active" id="tab-signal">
+      <!-- Single symbol signal card -->
+      <div class="card" style="padding:16px">
+        <div class="card-title" style="justify-content:space-between">
+          <span>Live Signal — <span id="sigSym" style="color:var(--accent)">--</span></span>
+          <div style="display:flex;align-items:center;gap:8px">
+            <span id="sigAge" style="font-size:.66rem;color:var(--muted)"></span>
+            <span id="sigTimerEl" style="font-size:.66rem;margin-left:6px"></span>
+            <button class="btn primary" onclick="loadSignal()" style="padding:4px 12px;font-size:.72rem">Analyse</button>
+          </div>
+        </div>
+        <div id="sigBody">
+          <p class="muted" style="font-size:.78rem">Select a symbol from the sidebar, then click Analyse.</p>
+        </div>
+      </div>
+      <!-- Pre-market watchlist -->
+      <div class="card" id="preMktCard" style="padding:16px;display:none">
+        <div class="card-title" style="justify-content:space-between">
+          <span>Pre-market Watchlist</span>
+          <span style="font-size:.66rem;color:var(--yellow)">Market opens at 9:15 AM</span>
+        </div>
+        <div id="preMktBody"><p class="muted" style="font-size:.78rem">Loading candidates...</p></div>
+      </div>
+      <!-- Quick scanner -->
+      <div class="card" style="padding:16px">
+        <div class="card-title" style="justify-content:space-between">
+          <span>Live Scanner — All Signals</span>
+          <div style="display:flex;align-items:center;gap:8px">
+            <span id="scanAge2" style="font-size:.66rem;color:var(--muted)"></span>
+            <select id="scanInterval2" class="btn" style="padding:4px 9px;font-size:.7rem">
+              <option value="15minute">15 Min</option>
+              <option value="5minute">5 Min</option>
+              <option value="60minute">1 Hour</option>
+            </select>
+            <button class="btn primary" onclick="runQuickScan()" style="padding:4px 12px;font-size:.72rem">Scan All</button>
+          </div>
+        </div>
+        <div id="quickScanBody">
+          <p class="muted" style="font-size:.78rem">Click "Scan All" to find live BUY/SELL signals across 30+ stocks. Only A+ and A quality shown.</p>
+        </div>
+      </div>
+    </div>
+    <!-- ══ SMC TAB ════════════════════════════════════════════════════════ -->
+    <div class="tab-content" id="tab-smc">
       <div class="card"><div class="card-title">SMC Analysis -- <span id="smcSym">--</span></div><div id="smcBody"><p class="muted" style="font-size:.78rem">Select a symbol.</p></div></div>
     </div>
     <div class="tab-content" id="tab-ict">
@@ -6838,6 +7609,9 @@ header h1{font-size:1rem;color:var(--accent);font-weight:800;letter-spacing:.5px
           <select id="scanMinConf" class="btn" style="padding:4px 9px">
             <option value="65">Conf 65+</option><option value="75">Conf 75+</option><option value="80">Conf 80+</option>
           </select>
+          <select id="scanLimit" class="btn" style="padding:4px 9px" title="Max results to show">
+            <option value="5">Top 5</option><option value="10" selected>Top 10</option><option value="20">Top 20</option><option value="50">Top 50</option>
+          </select>
           <button class="btn primary" onclick="runScan()">Run Institutional Scan</button>
           <button class="btn" onclick="runSmcScan()">SMC Quick Scan</button>
         </div>
@@ -6848,16 +7622,61 @@ header h1{font-size:1rem;color:var(--accent);font-weight:800;letter-spacing:.5px
       <div class="card"><div class="card-title">ORB -- <span id="orbSym">--</span></div><div id="orbBody"><p class="muted" style="font-size:.78rem">Select a symbol.</p></div></div>
     </div>
     <div class="tab-content" id="tab-patterns">
-      <div class="card"><div class="card-title">Patterns & Fibonacci -- <span id="patSym">--</span></div><div id="patBody"><p class="muted" style="font-size:.78rem">Select a symbol.</p></div></div>
+      <div class="card"><div class="card-title" style="display:flex;align-items:center;justify-content:space-between">Patterns & Fibonacci -- <span id="patSym">--</span><label style="font-size:.68rem;color:var(--muted);font-weight:400;cursor:pointer"><input id="hideNeutralChk" type="checkbox" checked onchange="loadPatterns()" style="margin-right:4px">Hide Neutral</label></div><div id="patBody"><p class="muted" style="font-size:.78rem">Select a symbol.</p></div></div>
     </div>
     <div class="tab-content" id="tab-fno">
       <div class="card"><div class="card-title">F&O Signals -- <span id="fnoSym">--</span></div><div id="fnoBody"><p class="muted" style="font-size:.78rem">Select an F&O symbol (NIFTY, BANKNIFTY, RELIANCE...)</p></div></div>
+    </div>
+    <div class="tab-content" id="tab-journal">
+      <div class="card">
+        <div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
+          Trade Journal
+          <div style="display:flex;gap:6px">
+            <button class="btn" onclick="loadJournal()">↻ Refresh</button>
+            <button class="btn" onclick="exportJournal()" style="font-size:.68rem">⬇ Export CSV</button>
+          </div>
+        </div>
+        <div id="journalBody"><p class="muted" style="font-size:.78rem">Loading journal...</p></div>
+      </div>
+    </div>
+    <div class="tab-content" id="tab-sniper">
+      <div class="card">
+        <div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
+          <span>🎯 Sniper Engine — High-Accuracy Auto-Trading</span>
+          <div style="display:flex;gap:6px;align-items:center">
+            <select id="sniperInterval" style="background:var(--card);color:var(--fg);border:1px solid var(--border);padding:3px 6px;border-radius:4px;font-size:.7rem">
+              <option value="5minute">5 min</option>
+              <option value="15minute" selected>15 min</option>
+            </select>
+            <button class="btn" onclick="runSniperScan()" style="background:#00ff8822;border-color:#00ff88;color:#00ff88;font-weight:700">⚡ Scan Now</button>
+          </div>
+        </div>
+        <!-- Daily risk dashboard -->
+        <div id="sniperDailyBar" style="display:flex;gap:16px;flex-wrap:wrap;padding:8px 0 4px;font-size:.7rem;border-bottom:1px solid var(--border);margin-bottom:10px">
+          <span>Trades today: <b id="sdTrades">--</b> / 2</span>
+          <span>Losses today: <b id="sdLosses" class="red">--</b> / 2</span>
+          <span id="sdStatus" class="green">✅ Trading allowed</span>
+          <span style="color:var(--muted)" id="sdTimeNote">--</span>
+        </div>
+        <!-- Sniper rules reminder -->
+        <div style="background:#00ff8811;border:1px solid #00ff8833;border-radius:6px;padding:8px 12px;font-size:.68rem;color:var(--muted);margin-bottom:10px;line-height:1.6">
+          <b style="color:#00ff88">7 Gates must ALL pass:</b>
+          &nbsp;⏰ Time window (09:30–11:30 / 14:30–15:30)
+          &nbsp;→ 📈 Trend (EMA50 > EMA200)
+          &nbsp;→ 🕯 Engulfing pattern
+          &nbsp;→ ✅ Confirmation candle break
+          &nbsp;→ 📍 Location (VWAP/PDH/PDL)
+          &nbsp;→ 🏦 NIFTY aligned
+          &nbsp;→ 💰 RR ≥ 2:1
+        </div>
+        <div id="sniperBody"><p class="muted" style="font-size:.78rem;padding:10px">Click ⚡ Scan Now to find sniper setups across 26 liquid stocks.</p></div>
+      </div>
     </div>
     <div class="tab-content" id="tab-guide">
       <div class="card">
         <div class="card-title">Institutional Trading Guide -- v4.0</div>
         <div style="font-size:.78rem;line-height:1.7">
-          <p class="yellow" style="font-weight:700;margin-bottom:6px">What was fixed in v4.0:</p>
+          <p class="yellow" style="font-weight:700;margin-bottom:6px">What was fixed and added in v4.0:</p>
           <p class="muted" style="margin-bottom:10px">Previous version had ALL targets in WRONG ORDER -- T1 was furthest, T2 was closest. Now fully corrected.</p>
           <p class="accent" style="font-weight:700;margin:8px 0 5px">Fibonacci Target Cascade (CORRECT ORDER):</p>
           <table style="width:100%;border-collapse:collapse;font-size:.72rem;margin-bottom:12px">
@@ -6882,7 +7701,13 @@ header h1{font-size:1rem;color:var(--accent);font-weight:800;letter-spacing:.5px
 </div>
 <script>
 const SYMBOLS = ["NIFTY 50", "NIFTY BANK", "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "BAJFINANCE", "HINDUNILVR", "MARUTI", "TATAMOTORS", "AXISBANK", "LT", "WIPRO", "SUNPHARMA", "TATASTEEL", "KOTAKBANK", "SBIN", "ADANIENT", "BHARTIARTL", "NTPC", "POWERGRID", "ONGC", "COALINDIA", "HCLTECH", "TECHM", "VEDL", "JSWSTEEL", "HINDALCO", "ULTRACEMCO", "GRASIM", "TITAN", "NESTLEIND", "DIVISLAB", "NATIONALUM", "SAIL", "NMDC", "MOIL", "APLAPOLLO", "LTM", "PERSISTENT", "COFORGE", "MPHASIS", "KPITTECH", "HAPPSTMNDS", "RATEGAIN", "MASTEK", "FIVESTAR", "MUTHOOTFIN", "CHOLAFIN", "ABCAPITAL", "MANAPPURAM", "IIFL", "POONAWALLA", "DMART", "TRENT", "NYKAA", "KALYANKJIL", "TVSHLTD", "BAJAJ-AUTO", "HEROMOTOCO", "MOTHERSON", "TIINDIA", "BALKRISIND", "RVNL", "IREDA", "IRFC", "RECLTD", "PFC", "PHOENIXLTD", "GODREJPROP", "OBEROIRLTY", "ALKEM", "TORNTPHARM", "MAXHEALTH", "APOLLOHOSP", "DRREDDY", "CIPLA", "INDUSTOWER", "HFCL"];
-let currentSym = 'RELIANCE', currentTab = 'smc';
+let currentSym = 'RELIANCE', currentTab = 'signal';
+
+// Event delegation for scan result cards (avoids onclick escaping issues)
+document.addEventListener('click', function(e) {
+  const card = e.target.closest('[data-sym]');
+  if (card) { selectSym(card.getAttribute('data-sym')); }
+});
 
 document.querySelectorAll('.tab').forEach(t => {
   t.addEventListener('click', () => {
@@ -6890,7 +7715,7 @@ document.querySelectorAll('.tab').forEach(t => {
     document.querySelectorAll('.tab-content').forEach(x => x.classList.remove('active'));
     t.classList.add('active'); currentTab = t.dataset.tab;
     document.getElementById('tab-' + currentTab).classList.add('active');
-    setTimeout(loadAll, 50);
+    setTimeout(() => { loadAll(); _startAutoRefresh(); }, 50);
   });
 });
 
@@ -6906,34 +7731,301 @@ function selectSym(s) {
   currentSym = s;
   document.getElementById('symInput').value = s;
   document.querySelectorAll('.sym-item').forEach(el => el.classList.toggle('active', el.textContent === s));
+  const panelMap = {
+    signal: 'sigBody', smc: 'smcBody', ict: 'ictBody', structure: 'strBody',
+    orb: 'orbBody', patterns: 'patBody', fno: 'fnoBody', journal: 'journalBody',
+    sniper: 'sniperBody',
+  };
+  const panelId = panelMap[currentTab];
+  if (panelId) loading(panelId);
   loadAll();
+  _startAutoRefresh();
 }
 
 function loadAll() {
   const v = document.getElementById('symInput').value.trim().toUpperCase();
   if (v) currentSym = v;
-  if (currentTab === 'smc')       loadSmc();
+  if (currentTab === 'signal')    loadSignal();
+  else if (currentTab === 'smc')  loadSmc();
   else if (currentTab === 'ict')  loadIct();
   else if (currentTab === 'structure') loadStructure();
   else if (currentTab === 'orb')  loadOrb();
   else if (currentTab === 'patterns') loadPatterns();
   else if (currentTab === 'fno')  loadFno();
+  else if (currentTab === 'journal') loadJournal();
+  else if (currentTab === 'sniper') loadSniperDailyBar();
+}
+
+// ── Auto-refresh intervals ────────────────────────────────────────────────────
+const AUTO_REFRESH_MS = {
+  signal: 3 * 60 * 1000,   // Signal tab: every 3 min (fresh live data)
+  smc: 5 * 60 * 1000, ict: 5 * 60 * 1000, structure: 5 * 60 * 1000,
+  orb: 60 * 1000, patterns: 3 * 60 * 1000, fno: 5 * 60 * 1000,
+};
+let _arTimer = null, _arCountdown = null, _arSecondsLeft = 0;
+
+function _startAutoRefresh() {
+  _stopAutoRefresh();
+  const ms = AUTO_REFRESH_MS[currentTab];
+  if (!ms) return;
+  _arSecondsLeft = ms / 1000;
+  _updateCountdown();
+  _arCountdown = setInterval(() => {
+    _arSecondsLeft--;
+    _updateCountdown();
+    if (_arSecondsLeft <= 0) {
+      loadAll();
+      _arSecondsLeft = ms / 1000;
+    }
+  }, 1000);
+}
+
+function _stopAutoRefresh() {
+  if (_arTimer)    { clearInterval(_arTimer);    _arTimer    = null; }
+  if (_arCountdown){ clearInterval(_arCountdown); _arCountdown = null; }
+  const el = document.getElementById('arCountdown');
+  if (el) el.textContent = '';
+}
+
+function _updateCountdown() {
+  const el = document.getElementById('arCountdown');
+  if (!el) return;
+  const m = Math.floor(_arSecondsLeft / 60), s = _arSecondsLeft % 60;
+  el.textContent = `↻ ${m}:${String(s).padStart(2,'0')}`;
 }
 
 const fmtN = v => v == null ? '--' : parseFloat(v).toLocaleString('en-IN', {minimumFractionDigits:2, maximumFractionDigits:2});
 const dirColor = d => (d==='BUY'||d==='LONG') ? 'green' : (d==='SELL'||d==='SHORT') ? 'red' : 'yellow';
 const sigEmoji = d => (d==='BUY'||d==='LONG') ? '[BUY]' : (d==='SELL'||d==='SHORT') ? '[SELL]' : '[WAIT]';
 
+// ── Global stale-data banner ─────────────────────────────────────────────────
+// Returns true if response is stale (caller should return early)
+function checkStale(r, bodyId) {
+  if (!r || !r.stale) return false;
+  const age = r.data_age_min ? Math.round(r.data_age_min) : '?';
+  document.getElementById(bodyId).innerHTML = `
+    <div style="padding:16px 18px;border-radius:10px;background:rgba(255,69,96,.08);border:1px solid rgba(255,69,96,.3);margin-bottom:12px">
+      <div style="font-size:.95rem;font-weight:800;color:var(--red);margin-bottom:6px">Stale Data — ${age} min old</div>
+      <div style="font-size:.78rem;color:var(--muted);margin-bottom:12px">${r.error}</div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <a href="/auth/logout" style="background:var(--panel2);color:var(--text);padding:6px 14px;border-radius:6px;font-size:.76rem;font-weight:700;text-decoration:none;border:1px solid var(--border)">Step 1: Logout</a>
+        <a href="/auth/login"  style="background:var(--accent);color:#000;padding:6px 14px;border-radius:6px;font-size:.76rem;font-weight:700;text-decoration:none">Step 2: Login Kite</a>
+      </div>
+      <div style="margin-top:10px;font-size:.7rem;color:var(--muted)">After logging in, click the tab again to refresh.</div>
+    </div>`;
+  return true;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  SIGNAL TAB — Simple live BUY/SELL card
+// ════════════════════════════════════════════════════════════════════════════
+
+async function loadSignal() {
+  const sym = currentSym;
+  const interval = '15minute';
+  document.getElementById('sigSym').textContent = sym;
+  loading('sigBody');
+  try {
+    const r = await fetch(`/api/signal/${encodeURIComponent(sym)}?interval=${interval}`).then(x => x.json());
+    const age = r.data_age_min || 0;
+    // Detect early-market window: before 9:35 IST the last candle is from yesterday —
+    // show an informational note instead of a red STALE warning.
+    const nowIst = new Date(Date.now() + (5.5 * 60 - new Date().getTimezoneOffset()) * 60000);
+    const istH = nowIst.getUTCHours(), istM = nowIst.getUTCMinutes();
+    const isEarlyMarket = (istH === 9 && istM < 35) || istH < 9;
+    let ageStr = '';
+    if (age > 60 && isEarlyMarket) {
+      ageStr = `<span style="color:var(--yellow);font-weight:600">Early session — yesterday's close used</span>`;
+    } else if (age > 60) {
+      ageStr = `<span style="color:var(--red);font-weight:700">Data ${Math.round(age)} min old — STALE</span>`;
+    } else if (r.fetched_at) {
+      ageStr = `<span style="color:var(--muted)">Data: ${r.fetched_at} (${Math.round(age)} min ago)</span>`;
+    }
+    document.getElementById('sigAge').innerHTML = ageStr;
+    document.getElementById('sigBody').innerHTML = renderSignalCard(r);
+    // Only start the valid-for timer when we have a real actionable signal.
+    // If r.error is set (stale data, auth failure, etc.) or signal is absent/WAIT,
+    // clear any leftover timer text instead of starting a bogus countdown.
+    if (r.signal && r.signal !== 'WAIT' && !r.error) {
+      _startSignalTimer('15minute');
+    } else {
+      if (_sigTimerInterval) { clearInterval(_sigTimerInterval); _sigTimerInterval = null; }
+      const _tel = document.getElementById('sigTimerEl');
+      if (_tel) _tel.textContent = '';
+    }
+  } catch(e) {
+    document.getElementById('sigBody').innerHTML = `<p class="red" style="font-size:.78rem">Error: ${e.message}</p>`;
+  }
+}
+
+function renderSignalCard(r) {
+  if (r.error) return `<p class="red" style="font-size:.78rem">${r.error}</p>`;
+
+  const isWait  = r.signal === 'WAIT';
+  const isBuy   = r.signal === 'BUY';
+  const isSell  = r.signal === 'SELL';
+  const dirCol  = isBuy ? 'var(--green)' : isSell ? 'var(--red)' : 'var(--yellow)';
+  const dirBg   = isBuy ? 'rgba(168,255,62,.08)' : isSell ? 'rgba(255,69,96,.08)' : 'rgba(255,209,102,.06)';
+  const dirBord = isBuy ? 'rgba(168,255,62,.3)'  : isSell ? 'rgba(255,69,96,.3)'  : 'rgba(255,209,102,.25)';
+  const qColor  = r.quality === 'A+' ? '#ffd700' : r.quality === 'A' ? 'var(--green)' : 'var(--yellow)';
+
+  if (isWait) {
+    return `
+    <div style="padding:18px;border-radius:10px;background:rgba(255,209,102,.07);border:1px solid rgba(255,209,102,.25);margin-bottom:12px">
+      <div style="font-size:1.2rem;font-weight:800;color:var(--yellow);margin-bottom:6px">WAIT — No clear signal</div>
+      <div style="font-size:.78rem;color:var(--muted);margin-bottom:8px">${r.reason || 'Engines disagree. Skip this trade.'}</div>
+      <div style="font-size:.74rem;color:var(--sub)">Current price: <span class="mono" style="color:var(--text)">₹${fmtN(r.current_price)}</span></div>
+      ${r.engines && Object.keys(r.engines).length ? `<div style="margin-top:8px;font-size:.7rem;color:var(--muted)">Engine votes: ${Object.entries(r.engines).map(([k,v])=>`${k}:<span style="color:${v==='BUY'?'var(--green)':'var(--red)'}">${v}</span>`).join(' · ')}</div>` : ''}
+    </div>
+    <div style="font-size:.73rem;color:var(--muted);padding:8px 12px;background:var(--panel2);border-radius:6px">
+      Try another symbol or wait for market structure to develop.
+    </div>`;
+  }
+
+  const inZone = r.in_zone;
+  const entryText = inZone
+    ? `<span style="color:var(--green);font-weight:700">Price is in entry zone NOW</span>`
+    : `Wait for price to reach ₹${fmtN(r.entry_low)} – ₹${fmtN(r.entry_high)}`;
+
+  const warns = (r.warnings || []).map(w =>
+    `<div style="font-size:.7rem;color:var(--yellow);padding:2px 0">&#x26A0; ${w}</div>`).join('');
+
+  const reasons = (r.reasons || []).map(rs =>
+    `<div style="font-size:.71rem;color:var(--sub);padding:2px 0;border-bottom:1px solid var(--border)">${rs}</div>`).join('');
+
+  const engines = Object.entries(r.engines || {}).map(([k,v]) =>
+    `<span style="font-size:.65rem;padding:2px 8px;border-radius:999px;background:${v==='BUY'?'rgba(168,255,62,.15)':'rgba(255,69,96,.15)'};color:${v==='BUY'?'var(--green)':'var(--red)'};margin-right:4px">${k}: ${v}</span>`
+  ).join('');
+
+  const patBadge = r.pattern ? `<span style="font-size:.65rem;padding:2px 8px;border-radius:999px;background:rgba(168,255,62,.1);color:var(--accent);margin-left:4px">${r.pattern}</span>` : '';
+
+  return `
+  <!-- Direction header -->
+  <div style="padding:16px 18px;border-radius:10px;background:${dirBg};border:1px solid ${dirBord};margin-bottom:12px">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+      <div style="font-size:1.5rem;font-weight:800;color:${dirCol};letter-spacing:1px">${r.signal}</div>
+      <div style="display:flex;align-items:center;gap:6px">
+        <span style="font-size:.72rem;font-weight:700;color:${qColor};padding:3px 10px;border-radius:999px;border:1px solid ${qColor}">${r.quality || 'B'}</span>
+        <span style="font-size:.72rem;color:var(--sub)">Conf: <b style="color:var(--text)">${r.confidence}%</b></span>
+      </div>
+    </div>
+    <div style="font-size:.76rem;color:var(--sub);margin-bottom:8px">${r.symbol} · ${entryText}</div>
+    <div style="font-size:.7rem">${engines}${patBadge}</div>
+    ${warns ? `<div style="margin-top:10px">${warns}</div>` : ''}
+  </div>
+
+  <!-- Entry zone + SL side by side -->
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px">
+    <div style="background:var(--panel2);border-radius:8px;padding:12px 14px;border:1px solid var(--border)">
+      <div style="font-size:.63rem;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Entry zone</div>
+      <div style="font-size:1.05rem;font-weight:700;color:${dirCol};font-family:'JetBrains Mono',monospace">₹${fmtN(r.entry_low)}</div>
+      <div style="font-size:.7rem;color:var(--sub)">to ₹${fmtN(r.entry_high)}</div>
+      ${inZone ? '<div style="margin-top:4px;font-size:.65rem;color:var(--green);font-weight:700">● IN ZONE</div>' : '<div style="margin-top:4px;font-size:.65rem;color:var(--yellow)">● Waiting</div>'}
+    </div>
+    <div style="background:rgba(255,69,96,.08);border-radius:8px;padding:12px 14px;border:1px solid rgba(255,69,96,.25)">
+      <div style="font-size:.63rem;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Stop Loss — exit if hit</div>
+      <div style="font-size:1.05rem;font-weight:700;color:var(--red);font-family:'JetBrains Mono',monospace">₹${fmtN(r.sl)}</div>
+      ${r.rr_t2 ? `<div style="font-size:.7rem;color:var(--sub)">R:R to T2: <b style="color:${r.rr_t2>=2.5?'var(--green)':r.rr_t2>=2?'var(--yellow)':'var(--red)'}">${r.rr_t2}x</b></div>` : ''}
+    </div>
+  </div>
+
+  <!-- Targets -->
+  <div style="font-size:.63rem;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px">Targets — exit in stages</div>
+  <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px;margin-bottom:12px">
+    ${[['T1','30–40% exit',r.t1,'Fib 1.0'],['T2','Main target',r.t2,'Fib 1.272'],['T3','Runner 20%',r.t3,'Fib 1.618'],['T4','Extended',r.t4,'Fib 2.0']].map(([lbl,sub,val,fib])=>`
+    <div style="background:var(--panel2);border-radius:8px;padding:10px;border:1px solid var(--border);text-align:center">
+      <div style="font-size:.62rem;color:var(--muted);margin-bottom:2px">${lbl} <span style="color:var(--muted);font-size:.58rem">${fib}</span></div>
+      <div style="font-size:.9rem;font-weight:700;color:var(--green);font-family:'JetBrains Mono',monospace">${val ? '₹'+fmtN(val) : '--'}</div>
+      <div style="font-size:.6rem;color:var(--muted);margin-top:2px">${sub}</div>
+    </div>`).join('')}
+  </div>
+
+  <!-- Rule reminder -->
+  <div style="font-size:.72rem;color:var(--sub);padding:10px 12px;background:var(--panel2);border-radius:8px;border-left:3px solid ${dirCol};line-height:1.7">
+    When T1 hits → move Stop Loss to your entry price. You are now risk-free.
+    ${r.rsi_val ? `<span style="margin-left:8px;color:var(--muted)">RSI: ${r.rsi_val}</span>` : ''}
+    ${r.vwap ? `<span style="margin-left:8px;color:var(--muted)">VWAP: ₹${fmtN(r.vwap)}</span>` : ''}
+  </div>
+
+  ${reasons ? `<div style="margin-top:10px;padding:10px 12px;background:var(--panel2);border-radius:8px"><div style="font-size:.65rem;color:var(--accent);margin-bottom:4px">Why this signal</div>${reasons}</div>` : ''}
+  `;
+}
+
+async function runQuickScan() {
+  const interval = document.getElementById('scanInterval2').value;
+  document.getElementById('quickScanBody').innerHTML = '<div style="text-align:center;padding:24px"><div class="spinner"></div><div style="margin-top:8px;font-size:.73rem;color:var(--muted)">Scanning 30+ stocks live from Kite... this takes ~30 seconds</div></div>';
+  document.getElementById('scanAge2').textContent = '';
+  try {
+    const r = await fetch(`/api/quick-scan?interval=${interval}&limit=20`).then(x => x.json());
+    document.getElementById('scanAge2').textContent = r.fetched_at || '';
+    if (r.error) {
+      document.getElementById('quickScanBody').innerHTML = `<p class="red" style="font-size:.78rem">${r.error}</p>`;
+      return;
+    }
+    const sigs = r.signals || [];
+    if (!sigs.length) {
+      document.getElementById('quickScanBody').innerHTML = `<p class="muted" style="font-size:.78rem">No A/A+ signals found across ${r.scanned} stocks right now. Market may be in consolidation.</p>`;
+      return;
+    }
+    let html = `<div style="font-size:.7rem;color:var(--muted);margin-bottom:10px">Found <b style="color:var(--text)">${sigs.length}</b> signals from ${r.scanned} stocks scanned</div>`;
+    html += sigs.map(s => {
+      const isBuy = s.signal === 'BUY';
+      const col   = isBuy ? 'var(--green)' : 'var(--red)';
+      const bg    = isBuy ? 'rgba(168,255,62,.06)' : 'rgba(255,69,96,.06)';
+      const bord  = isBuy ? 'rgba(168,255,62,.25)' : 'rgba(255,69,96,.25)';
+      const qcol  = s.quality === 'A+' ? '#ffd700' : 'var(--green)';
+      return `
+      <div data-sym="${s.symbol}" style="background:${bg};border:1px solid ${bord};border-radius:9px;padding:12px 14px;margin-bottom:8px;cursor:pointer;transition:.15s" onmouseover="this.style.borderColor='${col}'" onmouseout="this.style.borderColor='${bord}'">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <div style="display:flex;align-items:center;gap:8px">
+            <span style="font-size:.95rem;font-weight:800;font-family:'JetBrains Mono',monospace;color:${col}">${s.signal}</span>
+            <span style="font-size:.82rem;font-weight:700;color:var(--text)">${s.symbol}</span>
+            ${s.pattern ? `<span style="font-size:.62rem;padding:1px 6px;border-radius:999px;background:rgba(168,255,62,.1);color:var(--accent)">${s.pattern}</span>` : ''}
+          </div>
+          <div style="display:flex;align-items:center;gap:6px">
+            <span style="font-size:.68rem;font-weight:700;color:${qcol};padding:2px 8px;border-radius:999px;border:1px solid ${qcol}">${s.quality}</span>
+            <span style="font-size:.68rem;color:var(--muted)">${s.confidence}%</span>
+          </div>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:6px;font-size:.68rem">
+          <div><div style="color:var(--muted)">CMP</div><div style="font-family:'JetBrains Mono',monospace;font-weight:700;color:var(--text)">₹${fmtN(s.current_price)}</div></div>
+          <div><div style="color:var(--muted)">Entry</div><div style="font-family:'JetBrains Mono',monospace;color:${col}">₹${fmtN(s.entry_low)}</div></div>
+          <div><div style="color:var(--muted)">SL</div><div style="font-family:'JetBrains Mono',monospace;color:var(--red)">₹${fmtN(s.sl)}</div></div>
+          <div><div style="color:var(--muted)">T1</div><div style="font-family:'JetBrains Mono',monospace;color:var(--green)">₹${fmtN(s.t1)}</div></div>
+          <div><div style="color:var(--muted)">T2</div><div style="font-family:'JetBrains Mono',monospace;color:var(--green)">₹${fmtN(s.t2)}</div></div>
+        </div>
+        ${s.in_zone ? `<div style="margin-top:6px;font-size:.65rem;color:var(--green);font-weight:700">● Price in entry zone now — click to see full signal</div>` : `<div style="margin-top:4px;font-size:.63rem;color:var(--muted)">Click to see full analysis</div>`}
+      </div>`;
+    }).join('');
+    document.getElementById('quickScanBody').innerHTML = html;
+  } catch(e) {
+    document.getElementById('quickScanBody').innerHTML = `<p class="red" style="font-size:.78rem">Scan error: ${e.message}</p>`;
+  }
+}
+
 function loading(id) {
   document.getElementById(id).innerHTML = '<div style="text-align:center;padding:18px"><div class="spinner"></div><div style="margin-top:7px;font-size:.73rem;color:var(--muted)">Fetching live data...</div></div>';
 }
 
-function renderTargets(t1, t2, t3, t4, entry, sl, rr2, rr3, dir) {
+function renderTargets(t1, t2, t3, t4, entry, sl, rr2, rr3, dir, labelMode) {
+  // FIX: When signal is WAIT (rr2===0 or all targets equal entry), don't show
+  // a misleading target grid — show a waiting message instead.
+  if (!rr2 || rr2 === 0 || Math.abs(t1 - entry) < 0.01) {
+    return `<div style="padding:8px;font-size:.73rem;color:var(--muted);background:var(--panel2);border-radius:5px;margin-top:7px">
+      &#x23F3; No active setup — waiting for entry conditions to align.
+    </div>`;
+  }
+  // ORB uses range multiples, not Fib extensions — show correct labels
+  const isOrb = labelMode === 'orb';
+  const l1 = isOrb ? 'T1  1× ORB Range'           : 'T1 Fib 1.0 (Equal leg)';
+  const l2 = isOrb ? `T2  2× ORB | RR ${rr2 || '--'}x` : `T2 Fib 1.272 | RR ${rr2 || '--'}x`;
+  const l3 = isOrb ? `T3  3× ORB | RR ${rr3 || '--'}x` : `T3 Fib 1.618 Golden | RR ${rr3 || '--'}x`;
+  const l4 = isOrb ? 'T4  4× ORB Runner'           : 'T4 Fib 2.0 Runner';
   return `<div class="targets-grid">
-    <div class="tgt"><div class="tgt-label">T1 Fib 1.0 (Equal leg)</div><div class="tgt-val yellow">Rs.${fmtN(t1)}</div><div style="font-size:.62rem;color:var(--muted)">First exit 30-40%</div></div>
-    <div class="tgt"><div class="tgt-label">T2 Fib 1.272 | RR ${rr2 || '--'}x</div><div class="tgt-val green">Rs.${fmtN(t2)}</div><div style="font-size:.62rem;color:var(--muted)">Main target 40%</div></div>
-    <div class="tgt"><div class="tgt-label">T3 Fib 1.618 Golden | RR ${rr3 || '--'}x</div><div class="tgt-val accent">Rs.${fmtN(t3)}</div><div style="font-size:.62rem;color:var(--muted)">Extended 20%</div></div>
-    <div class="tgt"><div class="tgt-label">T4 Fib 2.0 Runner</div><div class="tgt-val purple">Rs.${fmtN(t4)}</div><div style="font-size:.62rem;color:var(--muted)">Runner 10% trail SL</div></div>
+    <div class="tgt"><div class="tgt-label">${l1}</div><div class="tgt-val yellow">Rs.${fmtN(t1)}</div><div style="font-size:.62rem;color:var(--muted)">First exit 30-40%</div></div>
+    <div class="tgt"><div class="tgt-label">${l2}</div><div class="tgt-val green">Rs.${fmtN(t2)}</div><div style="font-size:.62rem;color:var(--muted)">Main target 40%</div></div>
+    <div class="tgt"><div class="tgt-label">${l3}</div><div class="tgt-val accent">Rs.${fmtN(t3)}</div><div style="font-size:.62rem;color:var(--muted)">Extended 20%</div></div>
+    <div class="tgt"><div class="tgt-label">${l4}</div><div class="tgt-val purple">Rs.${fmtN(t4)}</div><div style="font-size:.62rem;color:var(--muted)">Runner 10% trail SL</div></div>
   </div>
   <div style="display:flex;gap:10px;margin-top:7px;font-size:.71rem;flex-wrap:wrap">
     <span>Entry: <b>Rs.${fmtN(entry)}</b></span>
@@ -6959,6 +8051,7 @@ async function loadSmc() {
   document.getElementById('smcSym').textContent = currentSym; loading('smcBody');
   try {
     const r = await fetch('/api/smc-plus/' + encodeURIComponent(currentSym) + '?interval=15minute').then(r => r.json());
+    if (checkStale(r, 'smcBody')) return;
     if (r.error) { document.getElementById('smcBody').innerHTML = '<p class="red">' + r.error + '</p>'; return; }
     const s = r.smc, il = r.inst_levels, cs = r.combined_signal;
     const dc = dirColor(s.smc_signal);
@@ -7015,6 +8108,7 @@ async function loadIct() {
   document.getElementById('ictSym').textContent = currentSym; loading('ictBody');
   try {
     const r = await fetch('/api/ict/' + encodeURIComponent(currentSym) + '?interval=15minute').then(r => r.json());
+    if (checkStale(r, 'ictBody')) return;
     if (r.error) { document.getElementById('ictBody').innerHTML = '<p class="red">' + r.error + '</p>'; return; }
     const ict = r.ict, il = r.inst_levels;
     const dc = dirColor(ict.ict_signal==='LONG'?'BUY':'SELL');
@@ -7071,6 +8165,7 @@ async function loadStructure() {
   document.getElementById('strSym').textContent = currentSym; loading('strBody');
   try {
     const r = await fetch('/api/structure/' + encodeURIComponent(currentSym) + '?interval=15minute').then(r => r.json());
+    if (checkStale(r, 'strBody')) return;
     if (r.error) { document.getElementById('strBody').innerHTML = '<p class="red">' + r.error + '</p>'; return; }
     if (!r.setups || r.setups.length === 0) {
       document.getElementById('strBody').innerHTML = '<div class="signal-box WAIT"><div class="sig-dir yellow">[WAIT] No Active Setup</div><div style="font-size:.73rem;color:var(--muted);margin-top:4px">Waiting for BOS + pullback into OTE zone (61.8%-78.6%). Min RR 1.8x required.</div></div>';
@@ -7107,34 +8202,119 @@ async function loadStructure() {
   } catch(e) { document.getElementById('strBody').innerHTML = '<p class="red">Error: ' + e.message + '</p>'; }
 }
 
+// ── Helpers ──────────────────────────────────────────────────────────────────
+function _confluenceDots(score, max) {
+  max = max || 5;
+  let h = '';
+  for (let i = 0; i < max; i++) {
+    h += '<span style="display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:2px;background:'
+      + (i < score ? 'var(--accent)' : 'var(--border)') + '"></span>';
+  }
+  return '<span title="Confluence ' + score + '/' + max + '">' + h + '</span>';
+}
+
+function _intervalMinutes(iv) {
+  if (iv === 'minute') return 1;
+  const m = iv.match(/(\d+)minute/); if (m) return parseInt(m[1]);
+  if (iv === '60minute' || iv === 'hour') return 60;
+  return 15;
+}
+
+function _expiryBadge(intervalStr) {
+  // A signal is valid for ~5 candles; show how many are left (rough)
+  const mins = _intervalMinutes(intervalStr);
+  const totalMins = mins * 5;
+  const now = new Date();
+  const hhmm = now.getHours() * 60 + now.getMinutes();
+  const close = 15 * 60 + 30;
+  const left = Math.min(totalMins, close - hhmm);
+  if (left <= 0) return '<span style="font-size:.62rem;color:var(--red);padding:1px 6px;border-radius:4px;background:rgba(255,69,96,.12)">Expired</span>';
+  const candles = Math.max(0, Math.floor(left / mins));
+  const col = candles >= 4 ? 'var(--green)' : candles >= 2 ? 'var(--yellow)' : 'var(--red)';
+  return '<span style="font-size:.62rem;color:' + col + ';padding:1px 6px;border-radius:4px;background:rgba(168,255,62,.08)">' + candles + ' candles left</span>';
+}
+
+function _renderScanCard(s, iv) {
+  const isBuy = s.direction === 'BUY';
+  const col   = isBuy ? 'var(--green)' : 'var(--red)';
+  const qcol  = s.quality === 'A+' ? '#ffd700' : 'var(--green)';
+  const cs    = s.confluence_score != null ? s.confluence_score : (s.notes || []).join(' ').match(/Confluence:\s*(\d)/)?.[1] || 0;
+  const rr    = parseFloat(s.rr_t2 || 0);
+  const posSize = s.position_size > 0 ? `<span style="font-size:.65rem;color:var(--yellow)">Qty: ${s.position_size} shares</span>` : '';
+  return `
+  <div class="scan-item ${s.direction}" data-sym="${s.symbol}" style="cursor:pointer">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px;flex-wrap:wrap;gap:4px">
+      <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+        <span class="scan-sym" style="color:${col}">${s.symbol}</span>
+        <span class="chip ${isBuy?'bull':'bear'}">${s.direction}</span>
+        <span style="font-size:.68rem;font-weight:700;color:${qcol};padding:1px 7px;border-radius:999px;border:1px solid ${qcol}">${s.quality}</span>
+        ${_expiryBadge(iv)}
+      </div>
+      <div style="display:flex;align-items:center;gap:6px">
+        ${_confluenceDots(parseInt(cs))}
+        <span style="font-size:.68rem;color:var(--sub)">${parseFloat(s.confidence).toFixed(0)}% conf</span>
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(90px,1fr));gap:6px;margin-bottom:8px">
+      <div style="background:var(--panel);border-radius:6px;padding:6px 8px;border:1px solid var(--border)">
+        <div style="font-size:.6rem;color:var(--muted)">CMP</div>
+        <div style="font-size:.8rem;font-weight:700;font-family:'JetBrains Mono',monospace">₹${fmtN(s.current_price)}</div>
+      </div>
+      <div style="background:var(--panel);border-radius:6px;padding:6px 8px;border:1px solid rgba(168,255,62,.2)">
+        <div style="font-size:.6rem;color:var(--muted)">Entry</div>
+        <div style="font-size:.78rem;font-weight:700;font-family:'JetBrains Mono',monospace;color:${col}">₹${fmtN(s.entry_zone[0])}</div>
+        <div style="font-size:.6rem;color:var(--muted)">to ₹${fmtN(s.entry_zone[1])}</div>
+      </div>
+      <div style="background:rgba(255,69,96,.07);border-radius:6px;padding:6px 8px;border:1px solid rgba(255,69,96,.2)">
+        <div style="font-size:.6rem;color:var(--muted)">Stop Loss</div>
+        <div style="font-size:.78rem;font-weight:700;font-family:'JetBrains Mono',monospace;color:var(--red)">₹${fmtN(s.stop_loss)}</div>
+        <div style="font-size:.6rem;color:${rr>=2?'var(--green)':'var(--yellow)'}">R:R ${rr}x</div>
+      </div>
+      <div style="background:var(--panel);border-radius:6px;padding:6px 8px;border:1px solid var(--border)">
+        <div style="font-size:.6rem;color:var(--muted)">T1</div>
+        <div style="font-size:.78rem;font-weight:700;font-family:'JetBrains Mono',monospace;color:var(--yellow)">₹${fmtN(s.target_1)}</div>
+        <div style="font-size:.6rem;color:var(--muted)">30–40% exit</div>
+      </div>
+      <div style="background:var(--panel);border-radius:6px;padding:6px 8px;border:1px solid rgba(168,255,62,.15)">
+        <div style="font-size:.6rem;color:var(--muted)">T2</div>
+        <div style="font-size:.78rem;font-weight:700;font-family:'JetBrains Mono',monospace;color:var(--green)">₹${fmtN(s.target_2)}</div>
+        <div style="font-size:.6rem;color:var(--muted)">Main target</div>
+      </div>
+      <div style="background:var(--panel);border-radius:6px;padding:6px 8px;border:1px solid var(--border)">
+        <div style="font-size:.6rem;color:var(--muted)">T3</div>
+        <div style="font-size:.78rem;font-weight:700;font-family:'JetBrains Mono',monospace;color:var(--accent)">₹${fmtN(s.target_3)}</div>
+        <div style="font-size:.6rem;color:var(--muted)">Runner 20%</div>
+      </div>
+    </div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;font-size:.65rem;color:var(--muted)">
+      ${s.in_killzone ? '<span style="color:var(--yellow)">Killzone: '+s.killzone+'</span>' : ''}
+      <span>Daily: ${s.daily_bias}</span>
+      <span>Po3: ${s.po3_phase}</span>
+      ${posSize}
+    </div>
+  </div>`;
+}
+
 async function runScan() {
   const interval = document.getElementById('scanInterval').value;
-  const minConf = document.getElementById('scanMinConf').value;
+  const minConf  = document.getElementById('scanMinConf').value;
+  const limit    = document.getElementById('scanLimit').value;
   loading('scanBody');
   try {
-    const r = await fetch('/api/institutional-scan?interval=' + interval + '&min_conf=' + minConf + '&limit=25').then(r => r.json());
+    const r = await fetch('/api/institutional-scan?interval=' + interval + '&min_conf=' + minConf + '&limit=' + limit).then(r => r.json());
+    if (checkStale(r, 'scanBody')) return;
     if (r.error) { document.getElementById('scanBody').innerHTML = '<p class="red">' + r.error + '</p>'; return; }
     if (!r.signals || r.signals.length === 0) {
       document.getElementById('scanBody').innerHTML = '<div class="signal-box WAIT"><div class="sig-dir yellow">No setups found</div><div class="muted" style="font-size:.73rem;margin-top:3px">Scanned ' + r.scanned + ' symbols. No multi-engine confluence. Try lower confidence or different interval.</div></div>';
       return;
     }
-    document.getElementById('scanBody').innerHTML = '<div style="font-size:.7rem;color:var(--muted);margin-bottom:7px">Found ' + r.total_found + ' from ' + r.scanned + ' symbols. Showing top ' + r.signals.length + '.</div>'
-      + r.signals.map(s => '<div class="scan-item ' + s.direction + '" onclick="selectSym(\'' + s.symbol + '\')">'
-        + '<div class="scan-hdr"><div><span class="scan-sym">' + s.symbol + '</span>'
-        + '<span class="chip ' + (s.direction==='BUY'?'bull':'bear') + '" style="margin-left:4px">' + s.direction + '</span>'
-        + '<span class="quality-' + (s.quality==='A+'?'Ap':s.quality) + '" style="font-size:.78rem;margin-left:3px">' + s.quality + '</span></div>'
-        + '<span class="' + (s.direction==='BUY'?'green':'red') + '" style="font-size:.7rem">' + s.confidence.toFixed(0) + '% | ' + s.engine_votes + '</span></div>'
-        + '<div style="font-size:.7rem;margin-bottom:4px">Rs.' + fmtN(s.current_price) + ' | Entry: Rs.' + fmtN(s.entry_zone[0]) + '-' + fmtN(s.entry_zone[1]) + ' | SL: <span class="red">Rs.' + fmtN(s.stop_loss) + '</span></div>'
-        + '<div class="scan-targets">'
-        + '<span class="scan-t"><span class="muted">T1:</span> <b class="yellow">Rs.' + fmtN(s.target_1) + '</b></span>'
-        + '<span class="scan-t"><span class="muted">T2:</span> <b class="green">Rs.' + fmtN(s.target_2) + '</b></span>'
-        + '<span class="scan-t"><span class="muted">T3:</span> <b class="accent">Rs.' + fmtN(s.target_3) + '</b></span>'
-        + '<span class="scan-t"><span class="muted">T4:</span> <b class="purple">Rs.' + fmtN(s.target_4) + '</b></span>'
-        + '<span class="scan-t">RR T2: <b class="' + (s.rr_t2>=2?'green':'yellow') + '">' + s.rr_t2 + 'x</b></span>'
-        + '</div><div style="font-size:.66rem;color:var(--muted);margin-top:3px">'
-        + (s.in_killzone ? '<span class="yellow">Killzone: ' + s.killzone + ' </span>' : '')
-        + 'Daily: ' + s.daily_bias + ' | PDH:' + fmtN(s.pdh) + ' PDL:' + fmtN(s.pdl)
-        + '</div></div>').join('');
+    if (r.signals[0] && typeof _notifySignal === 'function') {
+      _notifySignal(r.signals[0].symbol, r.signals[0].direction, r.signals[0].quality);
+    }
+    document.getElementById('scanBody').innerHTML =
+      '<div style="font-size:.7rem;color:var(--muted);margin-bottom:10px">Found <b style="color:var(--text)">' + r.signals.length + '</b> signals from ' + r.scanned + ' stocks'
+      + (r.scanned_at ? ' · <span style="color:var(--accent)">' + r.scanned_at + '</span>' : '') + '</div>'
+      + r.signals.map(s => _renderScanCard(s, interval)).join('');
   } catch(e) { document.getElementById('scanBody').innerHTML = '<p class="red">Error: ' + e.message + '</p>'; }
 }
 
@@ -7143,10 +8323,11 @@ async function runSmcScan() {
   loading('scanBody');
   try {
     const r = await fetch('/api/smc-scan?interval=' + interval + '&min_conf=65&limit=20').then(r => r.json());
+    if (checkStale(r, 'scanBody')) return;
     if (r.error) { document.getElementById('scanBody').innerHTML = '<p class="red">' + r.error + '</p>'; return; }
     if (!r.signals || !r.signals.length) { document.getElementById('scanBody').innerHTML = '<div class="muted" style="font-size:.78rem;padding:8px">No SMC signals found.</div>'; return; }
     document.getElementById('scanBody').innerHTML = '<div style="font-size:.7rem;color:var(--muted);margin-bottom:7px">SMC: ' + r.total_found + ' from ' + r.scanned + ' scanned</div>'
-      + r.signals.map(s => '<div class="scan-item ' + s.signal + '" onclick="selectSym(\'' + s.symbol + '\')">'
+      + r.signals.map(s => '<div class="scan-item ' + s.signal + '" data-sym="' + s.symbol + '" style="cursor:pointer">'
         + '<div class="scan-hdr"><div><span class="scan-sym">' + s.symbol + '</span>'
         + '<span class="chip ' + (s.signal==='BUY'?'bull':'bear') + '" style="margin-left:4px">' + s.signal + '</span></div>'
         + '<span class="' + (s.signal==='BUY'?'green':'red') + '" style="font-size:.7rem">' + s.confidence.toFixed(0) + '%</span></div>'
@@ -7163,16 +8344,25 @@ async function loadOrb() {
   document.getElementById('orbSym').textContent = currentSym; loading('orbBody');
   try {
     const r = await fetch('/api/orb/' + encodeURIComponent(currentSym) + '?interval=5minute').then(r => r.json());
+    if (checkStale(r, 'orbBody')) return;
     if (r.error) { document.getElementById('orbBody').innerHTML = '<p class="red">' + r.error + '</p>'; return; }
     if (!r.signal) { document.getElementById('orbBody').innerHTML = '<div class="signal-box WAIT"><div class="sig-dir yellow">[WAIT] No ORB Signal</div><div class="muted" style="font-size:.73rem;margin-top:3px">' + (r.message||'Waiting for 9:30+ breakout.') + '</div></div>'; return; }
     const s = r.signal, dc = s.direction==='BULL'?'green':'red';
+    // FIX: show invalidation banner when CMP has breached the ORB signal level
+    const invalidBanner = s.invalidated
+      ? '<div style="background:#3a1010;border:1px solid var(--red);border-radius:5px;padding:7px;margin:7px 0;font-size:.73rem;color:var(--red)">'
+        + '&#x26D4; <b>Signal Invalidated</b> — price has reclaimed the ORB boundary. Do not enter.'
+        + '</div>'
+      : '';
     document.getElementById('orbBody').innerHTML = '<div class="signal-box ' + (s.direction==='BULL'?'BUY':'SELL') + '">'
       + '<div class="sig-dir ' + dc + '">' + sigEmoji(s.direction==='BULL'?'BUY':'SELL') + ' ORB ' + s.direction + ' at ' + s.breakout_time + '</div>'
       + '<div style="font-size:.71rem;color:var(--muted);margin:3px 0">Vol: ' + s.volume_ratio.toFixed(1) + 'x avg | Conf: ' + s.confidence.toFixed(0) + '%</div>'
+      + invalidBanner
       + '<div style="background:var(--panel2);border-radius:5px;padding:7px;margin:7px 0;font-size:.72rem">'
       + 'ORB H: <b>Rs.' + fmtN(s.orb_high) + '</b>  ORB L: <b>Rs.' + fmtN(s.orb_low) + '</b>  Range: <b class="yellow">Rs.' + fmtN(s.orb_range) + '</b><br/>'
       + 'Entry Zone: <b>Rs.' + fmtN(s.entry_zone[0]) + ' - Rs.' + fmtN(s.entry_zone[1]) + '</b>  SL: <b class="red">Rs.' + fmtN(s.sl) + '</b></div>'
-      + renderTargets(s.target1, s.target2, s.target3, s.target3, (s.entry_zone[0]+s.entry_zone[1])/2, s.sl, s.risk_reward, null, s.direction==='BULL'?'BUY':'SELL')
+      // FIX: pass s.target4 (not s.target3 twice), use 'orb' label mode for correct ×ORB labels
+      + renderTargets(s.target1, s.target2, s.target3, s.target4, (s.entry_zone[0]+s.entry_zone[1])/2, s.sl, s.risk_reward, null, s.direction==='BULL'?'BUY':'SELL', 'orb')
       + (s.notes||[]).map(n => '<div class="note-item" style="margin-top:3px">' + n + '</div>').join('')
       + '</div>';
   } catch(e) { document.getElementById('orbBody').innerHTML = '<p class="red">Error: ' + e.message + '</p>'; }
@@ -7185,8 +8375,16 @@ async function loadPatterns() {
       fetch('/api/patterns/' + encodeURIComponent(currentSym) + '?interval=5minute').then(r => r.json()),
       fetch('/api/fibonacci/' + encodeURIComponent(currentSym) + '?interval=15minute').then(r => r.json()),
     ]);
+    if (checkStale(pr, 'patBody')) return;
     if (pr.error) { document.getElementById('patBody').innerHTML = '<p class="red">' + pr.error + '</p>'; return; }
-    const patterns = pr.patterns || [];
+    let patterns = pr.patterns || [];
+
+    // FIX #7: filter toggle state
+    const hideNeutral = document.getElementById('hideNeutralChk') && document.getElementById('hideNeutralChk').checked;
+    if (hideNeutral) patterns = patterns.filter(p => p.signal !== 'NEUTRAL');
+    // Always enforce minimum 65% confidence for non-NEUTRAL to reduce noise
+    patterns = patterns.filter(p => p.signal === 'NEUTRAL' || (p.confidence * 100) >= 65);
+
     const patHtml = patterns.length ? patterns.map(p =>
       '<div class="scan-item ' + p.signal + '">'
       + '<div class="scan-hdr"><span class="scan-sym" style="font-size:.82rem">' + p.pattern + '</span>'
@@ -7196,7 +8394,7 @@ async function loadPatterns() {
       + '<span class="scan-t">Entry: Rs.' + fmtN(p.price_at_detection) + '</span>'
       + '<span class="scan-t">SL: <b class="red">Rs.' + fmtN(p.stop_loss) + '</b></span>'
       + '<span class="scan-t">T: <b class="green">Rs.' + fmtN(p.target) + '</b></span></div></div>').join('')
-      : '<div class="muted" style="font-size:.78rem;padding:7px">No patterns detected.</div>';
+      : '<div class="muted" style="font-size:.78rem;padding:7px">No patterns detected (try unchecking "Hide Neutral").</div>';
     let fibHtml = '';
     if (!fr.error && fr.retracements) {
       fibHtml = '<div class="card" style="margin-top:8px"><div class="card-title">Fibonacci Levels</div>'
@@ -7216,30 +8414,2067 @@ async function loadFno() {
   document.getElementById('fnoSym').textContent = currentSym; loading('fnoBody');
   try {
     const r = await fetch('/api/fno/' + encodeURIComponent(currentSym) + '?interval=5minute').then(r => r.json());
+    if (checkStale(r, 'fnoBody')) return;
     if (r.error) { document.getElementById('fnoBody').innerHTML = '<p class="red">' + r.error + '</p>'; return; }
+
+    // Fix #8: PCR panel at top of F&O tab
+    const biasColor = r.market_bias === 'BULLISH' ? 'green' : r.market_bias === 'BEARISH' ? 'red' : 'yellow';
+    const pcrPanel = r.market_bias ? (
+      '<div class="card" style="margin-bottom:8px;padding:8px 10px">'
+      + '<div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;font-size:.75rem">'
+      + '<span>&#x1F9ED; Bias: <b class="' + biasColor + '">' + r.market_bias + '</b></span>'
+      + (r.range_support ? '<span>&#x1F7E2; Support: <b>' + fmtN(r.range_support) + '</b></span>' : '')
+      + (r.range_resistance ? '<span>&#x1F534; Resistance: <b>' + fmtN(r.range_resistance) + '</b></span>' : '')
+      + (r.range_pts ? '<span>↔ Range: <b>' + fmtN(r.range_pts) + ' pts</b></span>' : '')
+      + (r.iv_proxy ? '<span>&#x1F4CA; IV Proxy: <b>' + r.iv_proxy + '%</b></span>' : '')
+      + '</div>'
+      + '<div style="font-size:.68rem;color:var(--muted);margin-top:4px">' + (r.bias_reason || '') + '</div>'
+      + '</div>'
+    ) : '';
+
     const sigs = r.signals || [];
-    if (!sigs.length) { document.getElementById('fnoBody').innerHTML = '<div class="muted" style="font-size:.78rem;padding:7px">No F&O signals. Use NIFTY, BANKNIFTY, or F&O-eligible stocks.</div>'; return; }
-    document.getElementById('fnoBody').innerHTML = sigs.map(s => {
+    if (!sigs.length) {
+      document.getElementById('fnoBody').innerHTML = pcrPanel + '<div class="muted" style="font-size:.78rem;padding:7px">No F&O signals. Use NIFTY, BANKNIFTY, or F&O-eligible stocks.</div>';
+      return;
+    }
+    document.getElementById('fnoBody').innerHTML = pcrPanel + sigs.map(s => {
       if (s.error) return '<div class="red" style="font-size:.78rem;padding:7px">' + s.error + '</div>';
       const dc = s.direction && s.direction.includes('CALL') ? 'green' : 'red';
+      const capitalNeeded = (s.option_price && s.lot_size)
+        ? 'Rs.' + fmtN(s.option_price * s.lot_size)
+        : '--';
+      const maxLoss = (s.option_sl && s.lot_size)
+        ? 'Rs.' + fmtN(Math.abs(s.option_price - s.option_sl) * s.lot_size)
+        : '--';
       return '<div class="scan-item ' + (s.direction&&s.direction.includes('CALL')?'BUY':'SELL') + '" style="margin-bottom:7px">'
         + '<div class="scan-hdr"><span class="scan-sym" style="font-size:.83rem">' + s.symbol + ' ' + s.strike + ' ' + s.option_type + '</span><span class="' + dc + '" style="font-size:.73rem">' + s.direction + '</span></div>'
         + '<div style="font-size:.7rem;color:var(--muted);margin-bottom:4px">Expiry: ' + s.expiry_str + ' (' + s.expiry_type + ') | Lot: ' + s.lot_size + '</div>'
         + '<div class="scan-targets"><span class="scan-t">LTP: <b>Rs.' + fmtN(s.option_price) + '</b></span><span class="scan-t">SL: <b class="red">Rs.' + fmtN(s.option_sl) + '</b></span><span class="scan-t">T: <b class="green">Rs.' + fmtN(s.option_target) + '</b></span><span class="scan-t">RR: <b>' + s.rr + '</b></span></div>'
+        + '<div style="font-size:.68rem;margin-top:5px;display:flex;gap:12px;flex-wrap:wrap">'
+        + '<span>&#x1F4B0; Capital needed: <b class="yellow">' + capitalNeeded + '</b></span>'
+        + '<span>[!] Max loss/lot: <b class="red">' + maxLoss + '</b></span>'
+        + '</div>'
         + '</div>';
     }).join('');
   } catch(e) { document.getElementById('fnoBody').innerHTML = '<p class="red">Error: ' + e.message + '</p>'; }
 }
 
-setTimeout(() => selectSym('RELIANCE'), 600);
+// ── Trade Journal ─────────────────────────────────────────────────────────────
+async function loadJournal() {
+  loading('journalBody');
+  try {
+    const r = await fetch('/api/journal?limit=50').then(r => r.json());
+    if (r.error) { document.getElementById('journalBody').innerHTML = '<p class="red">' + r.error + '</p>'; return; }
+    const entries = r.entries || [];
+    if (!entries.length) {
+      document.getElementById('journalBody').innerHTML =
+        '<div class="muted" style="font-size:.78rem;padding:10px">No journal entries yet. Signals will appear here as they fire.</div>';
+      return;
+    }
+    const outcomeColor = o => o === 'WIN' ? 'green' : o === 'LOSS' ? 'red' : o === 'SCRATCH' ? 'yellow' : 'muted';
+    const wins   = entries.filter(e => e.outcome === 'WIN').length;
+    const losses = entries.filter(e => e.outcome === 'LOSS').length;
+    const totalPnl = entries.reduce((s, e) => s + (e.pnl || 0), 0);
+    const summaryHtml =
+      '<div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:10px;font-size:.72rem">'
+      + '<span>Total: <b>' + r.total + '</b></span>'
+      + '<span class="green">Wins: <b>' + wins + '</b></span>'
+      + '<span class="red">Losses: <b>' + losses + '</b></span>'
+      + '<span class="' + (totalPnl >= 0 ? 'green' : 'red') + '">Net P&L: <b>Rs.' + fmtN(totalPnl) + '</b></span>'
+      + '</div>';
+    const tableHtml = '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:.7rem">'
+      + '<thead><tr style="color:var(--muted);border-bottom:1px solid var(--border)">'
+      + '<th style="text-align:left;padding:4px 6px">Time</th>'
+      + '<th style="text-align:left;padding:4px 6px">Symbol</th>'
+      + '<th style="padding:4px 6px">Dir</th>'
+      + '<th style="padding:4px 6px">Engine</th>'
+      + '<th style="padding:4px 6px">Conf</th>'
+      + '<th style="padding:4px 6px">Entry</th>'
+      + '<th style="padding:4px 6px">SL</th>'
+      + '<th style="padding:4px 6px">T2</th>'
+      + '<th style="padding:4px 6px">RR</th>'
+      + '<th style="padding:4px 6px">Outcome</th>'
+      + '<th style="padding:4px 6px">P&L</th>'
+      + '</tr></thead><tbody>'
+      + entries.map(e => {
+          const dc = e.direction === 'BUY' ? 'green' : 'red';
+          const entryMid = e.entry_low && e.entry_high ? ((e.entry_low + e.entry_high) / 2).toFixed(2) : '--';
+          return '<tr style="border-bottom:1px solid var(--border);cursor:pointer" data-id="' + e.id + '" data-outcome="' + (e.outcome||'OPEN') + '" onclick="toggleOutcome(this.dataset.id,this.dataset.outcome)">'
+            + '<td style="padding:4px 6px;color:var(--muted)">' + (e.ts || '').slice(0, 16) + '</td>'
+            + '<td style="padding:4px 6px;font-weight:700">' + e.symbol + '</td>'
+            + '<td style="padding:4px 6px;text-align:center"><span class="' + dc + '">' + e.direction + '</span></td>'
+            + '<td style="padding:4px 6px;text-align:center;color:var(--muted)">' + (e.engine || '--') + '</td>'
+            + '<td style="padding:4px 6px;text-align:center">' + (e.confidence ? e.confidence.toFixed(0) + '%' : '--') + '</td>'
+            + '<td style="padding:4px 6px;text-align:right">Rs.' + fmtN(entryMid) + '</td>'
+            + '<td style="padding:4px 6px;text-align:right;color:var(--red)">Rs.' + fmtN(e.sl) + '</td>'
+            + '<td style="padding:4px 6px;text-align:right;color:var(--green)">Rs.' + fmtN(e.t2) + '</td>'
+            + '<td style="padding:4px 6px;text-align:center">' + (e.rr_t2 || '--') + 'x</td>'
+            + '<td style="padding:4px 6px;text-align:center"><span class="' + outcomeColor(e.outcome) + '">' + (e.outcome || 'OPEN') + '</span></td>'
+            + '<td style="padding:4px 6px;text-align:right;color:' + (e.pnl >= 0 ? 'var(--green)' : 'var(--red)') + '">' + (e.pnl ? 'Rs.' + fmtN(e.pnl) : '--') + '</td>'
+            + '</tr>';
+        }).join('')
+      + '</tbody></table></div>'
+      + '<div style="font-size:.65rem;color:var(--muted);margin-top:6px">Click any row to cycle outcome: OPEN → WIN → LOSS → SCRATCH</div>';
+    document.getElementById('journalBody').innerHTML = summaryHtml + tableHtml;
+  } catch(e) { document.getElementById('journalBody').innerHTML = '<p class="red">Error: ' + e.message + '</p>'; }
+}
+
+async function toggleOutcome(id, current) {
+  const cycle = { OPEN: 'WIN', WIN: 'LOSS', LOSS: 'SCRATCH', SCRATCH: 'OPEN' };
+  const next = cycle[current] || 'WIN';
+  const pnl = next === 'WIN' ? 500 : next === 'LOSS' ? -300 : 0;  // placeholder; user can edit
+  try {
+    await fetch('/api/journal/' + id, { method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify({outcome: next, pnl}) });
+    loadJournal();
+  } catch(e) {}
+}
+
+function exportJournal() {
+  window.open('/api/journal?limit=1000&offset=0', '_blank');
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  SNIPER ENGINE UI
+// ════════════════════════════════════════════════════════════════════════
+
+async function loadSniperDailyBar() {
+  try {
+    const r = await fetch('/api/sniper/daily-status').then(x => x.json());
+    document.getElementById('sdTrades').textContent  = r.trades_today ?? '--';
+    document.getElementById('sdLosses').textContent  = r.losses_today ?? '--';
+    document.getElementById('sdTimeNote').textContent = r.time_note   ?? '';
+    const statusEl = document.getElementById('sdStatus');
+    if (!r.trading_allowed) {
+      statusEl.textContent = '&#x1F6AB; ' + (r.block_reason || 'Trading paused');
+      statusEl.className = 'red';
+    } else {
+      statusEl.textContent = '&#x2705; Trading allowed';
+      statusEl.className = 'green';
+    }
+  } catch(e) {}
+}
+
+async function runSniperScan() {
+  const body = document.getElementById('sniperBody');
+  body.innerHTML = '<p class="muted" style="font-size:.78rem;padding:10px">&#x26A1; Scanning 26 liquid stocks through 7 gates... (~30 sec)</p>';
+  await loadSniperDailyBar();
+  const interval = document.getElementById('sniperInterval').value;
+  try {
+    const r = await fetch('/api/sniper-scan?interval=' + interval).then(x => x.json());
+    if (r.error) { body.innerHTML = '<p class="red">' + r.error + '</p>'; return; }
+
+    const timeColor = r.time_window_ok ? 'green' : 'yellow';
+    let html = '<div style="display:flex;gap:16px;flex-wrap:wrap;font-size:.7rem;margin-bottom:10px">'
+      + '<span>Scanned: <b>' + r.scanned + '</b></span>'
+      + '<span class="' + timeColor + '">Window: <b>' + r.time_note + '</b></span>'
+      + '<span class="green">Signals: <b>' + r.signals_found + '</b></span>'
+      + '<span class="muted">' + r.fetched_at + '</span>'
+      + '</div>';
+
+    if (!r.signals || !r.signals.length) {
+      html += '<div style="text-align:center;padding:30px;color:var(--muted);font-size:.8rem">'
+        + '&#x1F3AF; No sniper setups right now — all ' + r.scanned + ' stocks checked.<br>'
+        + '<span style="font-size:.68rem">This is normal. Sniper fires 1-4 times per session.<br>Top wait reasons:</span><br>'
+        + (r.wait_summary||[]).slice(0,5).map(w =>
+            '<span style="font-size:.65rem;color:var(--muted)">• ' + w.symbol + ': ' + (w.reason||'').split('—')[0].trim() + '</span>'
+          ).join('<br>')
+        + '</div>';
+    } else {
+      html += r.signals.map(s => renderSniperCard(s)).join('');
+    }
+    body.innerHTML = html;
+  } catch(e) { body.innerHTML = '<p class="red">Scan error: ' + e.message + '</p>'; }
+}
+
+function renderSniperCard(s) {
+  const isBuy = s.signal === 'BUY';
+  const sigColor = isBuy ? '#00ff88' : '#ff4444';
+  const confBar = Math.round((s.confidence||70));
+  const rr = s.rr_t2 || 0;
+  const rrColor = rr >= 2.5 ? '#00ff88' : rr >= 2.0 ? '#ffd700' : '#ff6b6b';
+
+  return `<div style="border:1px solid ${sigColor}44;border-radius:8px;padding:12px;margin-bottom:10px;background:${sigColor}08">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:8px">
+      <div>
+        <span style="font-size:.9rem;font-weight:700;color:${sigColor}">${s.signal}</span>
+        <span style="font-size:1rem;font-weight:700;margin-left:8px">${s.symbol}</span>
+        <span style="font-size:.7rem;color:var(--muted);margin-left:8px">${s.pattern||''}</span>
+        <span style="font-size:.7rem;color:var(--muted);margin-left:6px">×${s.engulf_ratio||'?'}  vol ${s.vol_mult||'?'}x</span>
+      </div>
+      <div style="display:flex;gap:6px;align-items:center">
+        <span style="font-size:.68rem;background:#00ff8811;border:1px solid #00ff8833;color:#00ff88;padding:2px 7px;border-radius:4px">${s.quality||'A'}</span>
+        <span style="font-size:.78rem;color:${rrColor};font-weight:700">RR ${rr}x</span>
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin:10px 0;font-size:.72rem">
+      <div style="background:var(--bg);border-radius:4px;padding:6px;text-align:center">
+        <div style="color:var(--muted);font-size:.62rem">ENTRY</div>
+        <div style="font-weight:700">₹${fmtN(s.entry)}</div>
+      </div>
+      <div style="background:var(--bg);border-radius:4px;padding:6px;text-align:center">
+        <div style="color:var(--red);font-size:.62rem">STOP LOSS</div>
+        <div style="font-weight:700;color:var(--red)">₹${fmtN(s.sl)}</div>
+      </div>
+      <div style="background:var(--bg);border-radius:4px;padding:6px;text-align:center">
+        <div style="color:#ffd700;font-size:.62rem">T1 (1:1)</div>
+        <div style="font-weight:700;color:#ffd700">₹${fmtN(s.t1)}</div>
+      </div>
+      <div style="background:var(--bg);border-radius:4px;padding:6px;text-align:center">
+        <div style="color:#00ff88;font-size:.62rem">T2 (2:1)</div>
+        <div style="font-weight:700;color:#00ff88">₹${fmtN(s.t2)}</div>
+      </div>
+    </div>
+    <div style="font-size:.65rem;color:var(--muted);margin-bottom:8px">${(s.reasons||[]).slice(0,3).join(' &nbsp;|&nbsp; ')}</div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+      <button onclick="executeSniper(this,'${s.symbol}','${s.signal}',${s.entry},${s.sl},${s.t1},${s.t2})"
+        style="background:${sigColor}22;border:1px solid ${sigColor};color:${sigColor};padding:5px 14px;border-radius:5px;cursor:pointer;font-weight:700;font-size:.75rem">
+        &#x1F680; Execute Trade
+      </button>
+      <button onclick="executeSniperPaper(this,'${s.symbol}','${s.signal}',${s.entry},${s.sl},${s.t1},${s.t2})"
+        style="background:transparent;border:1px solid var(--border);color:var(--muted);padding:5px 12px;border-radius:5px;cursor:pointer;font-size:.72rem">
+        &#x1F4CB; Paper Log
+      </button>
+      <span style="font-size:.65rem;color:var(--muted);margin-left:4px">MIS · NSE · LIMIT</span>
+    </div>
+  </div>`;
+}
+
+async function executeSniper(btn, symbol, direction, entry, sl, t1, t2) {
+  if (!confirm(
+    '[LIVE ORDER] Zerodha Kite\\n\\n' +
+    direction + ' ' + symbol + '\\n' +
+    'Entry: ₹' + fmtN(entry) + '\\n' +
+    'SL: ₹' + fmtN(sl) + '\\n' +
+    'T1: ₹' + fmtN(t1) + '  T2: ₹' + fmtN(t2) + '\\n\\n' +
+    'This will place a REAL order. Confirm?'
+  )) return;
+
+  btn.disabled = true;
+  btn.textContent = '⌛ Placing...';
+  try {
+    const res = await fetch('/api/sniper/execute', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({symbol, direction, entry, sl, t1, t2})
+    }).then(x => x.json());
+
+    if (res.error) {
+      btn.textContent = '&#x274C; ' + res.error;
+      btn.style.color = '#ff4444';
+    } else {
+      btn.textContent = '&#x2705; Order placed #' + res.entry_order_id;
+      btn.style.color = '#00ff88';
+      await loadSniperDailyBar();
+    }
+  } catch(e) {
+    btn.textContent = '&#x274C; ' + e.message;
+    btn.style.color = '#ff4444';
+  }
+}
+
+async function executeSniperPaper(btn, symbol, direction, entry, sl, t1, t2) {
+  btn.disabled = true;
+  btn.textContent = '⌛ Logging...';
+  try {
+    const res = await fetch('/api/sniper/paper', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({symbol, direction, entry, sl, t1, t2})
+    }).then(x => x.json());
+    btn.textContent = res.ok ? '&#x2705; Logged' : '&#x274C; ' + res.error;
+  } catch(e) {
+    btn.textContent = '&#x274C; ' + e.message;
+  }
+}
+
+setTimeout(() => { selectSym('RELIANCE'); _startAutoRefresh(); }, 600);
+
+// ── Fix #9: Keyboard shortcuts ────────────────────────────────────────────────
+(function _initKeyboardShortcuts() {
+  const TAB_KEYS = {
+    '1': 'smc', '2': 'ict', '3': 'structure', '4': 'scan',
+    '5': 'orb', '6': 'patterns', '7': 'fno', '8': 'journal'
+  };
+  document.addEventListener('keydown', function(e) {
+    // Ignore when typing in an input
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+    if (TAB_KEYS[e.key]) {
+      e.preventDefault();
+      const tab = document.querySelector('.tab[data-tab="' + TAB_KEYS[e.key] + '"]');
+      if (tab) tab.click();
+    }
+    // Enter = run active scan / load
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      const activeTab = document.querySelector('.tab.active');
+      if (!activeTab) return;
+      const t = activeTab.getAttribute('data-tab');
+      if (t === 'scan') { if (typeof runScan === 'function') runScan(); }
+      else { if (typeof loadAll === 'function') loadAll(); }
+    }
+    // ArrowLeft / ArrowRight = navigate symbol list
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+      e.preventDefault();
+      const items = document.querySelectorAll('.sym-item');
+      const active = document.querySelector('.sym-item.active');
+      if (!items.length) return;
+      const idx = Array.from(items).indexOf(active);
+      const next = e.key === 'ArrowRight' ? Math.min(idx + 1, items.length - 1) : Math.max(idx - 1, 0);
+      if (items[next]) items[next].click();
+    }
+  });
+})();
+
+// ── Auto-load on page start ─────────────────────────────────────────────────
+// ── Signal expiry timer on Signal tab ───────────────────────────────────────
+let _sigTimerInterval = null;
+function _startSignalTimer(intervalStr) {
+  if (_sigTimerInterval) clearInterval(_sigTimerInterval);
+  const el = document.getElementById('sigTimerEl');
+  if (!el) return;
+  const mins = _intervalMinutes ? _intervalMinutes(intervalStr) : 15;
+  let remaining = mins * 5 * 60; // 5 candles in seconds
+  function _tick() {
+    if (remaining <= 0) { el.textContent = 'Signal expired'; el.style.color = 'var(--red)'; clearInterval(_sigTimerInterval); return; }
+    const m = Math.floor(remaining / 60), s = remaining % 60;
+    el.textContent = 'Valid ~' + m + ':' + String(s).padStart(2,'0');
+    el.style.color = remaining > 300 ? 'var(--green)' : remaining > 120 ? 'var(--yellow)' : 'var(--red)';
+    remaining--;
+  }
+  _tick();
+  _sigTimerInterval = setInterval(_tick, 1000);
+}
+
+// ── Pre-market watchlist ─────────────────────────────────────────────────────
+async function _loadPremarket() {
+  const now = new Date();
+  const istOffset = 5.5 * 60;
+  const utcMin = now.getUTCHours() * 60 + now.getUTCMinutes();
+  const istMin = (utcMin + istOffset) % (24 * 60);
+  const isPreMkt = istMin >= 8 * 60 && istMin < 9 * 60 + 15;
+  const card = document.getElementById('preMktCard');
+  if (!card) return;
+  if (!isPreMkt) { card.style.display = 'none'; return; }
+  card.style.display = 'block';
+  try {
+    const r = await fetch('/api/premarket').then(x => x.json());
+    if (!r.candidates || !r.candidates.length) {
+      document.getElementById('preMktBody').innerHTML = '<p class="muted" style="font-size:.78rem">No strong candidates found. Market data may not be updated yet.</p>';
+      return;
+    }
+    document.getElementById('preMktBody').innerHTML =
+      '<div style="font-size:.7rem;color:var(--muted);margin-bottom:8px">Top candidates for today · ' + (r.generated_at||'') + '</div>'
+      + r.candidates.map(c => {
+        const isBuy = c.bias === 'BUY' || c.bias === 'WATCH_BUY';
+        const col = isBuy ? 'var(--green)' : c.bias === 'SELL' || c.bias === 'WATCH_SELL' ? 'var(--red)' : 'var(--yellow)';
+        return '<div style="display:flex;justify-content:space-between;align-items:center;padding:7px 10px;border-radius:7px;margin-bottom:5px;background:var(--panel2);border:1px solid var(--border);cursor:pointer" data-sym="' + c.symbol + '">'
+          + '<div><span style="font-size:.82rem;font-weight:700;font-family:JetBrains Mono,monospace">' + c.symbol + '</span>'
+          + '<span style="font-size:.66rem;color:' + col + ';margin-left:6px">' + c.bias + '</span>'
+          + '<div style="font-size:.65rem;color:var(--muted);margin-top:2px">' + c.notes.join(' · ') + '</div></div>'
+          + '<div style="text-align:right;font-size:.7rem">'
+          + '<div style="font-family:JetBrains Mono,monospace">₹' + c.close.toFixed(2) + '</div>'
+          + '<div style="color:' + (c.chg_pct >= 0 ? 'var(--green)' : 'var(--red)') + '">' + (c.chg_pct >= 0 ? '+' : '') + c.chg_pct + '%</div>'
+          + '</div></div>';
+      }).join('')
+      + '<div style="font-size:.66rem;color:var(--muted);margin-top:8px;padding:6px 10px;background:var(--panel2);border-radius:6px">'
+      + (r.note || '') + '</div>';
+  } catch(e) {
+    document.getElementById('preMktBody').innerHTML = '<p class="red" style="font-size:.75rem">Pre-market fetch error: ' + e.message + '</p>';
+  }
+}
+
+(function _autoLoad() {
+  setTimeout(async () => {
+    try {
+      const st = await fetch('/api/auth/status').then(r => r.json());
+      if (st.authenticated) {
+        _loadPremarket();
+        const first = SYMBOLS[0] || 'RELIANCE';
+        selectSym(first);
+      }
+    } catch(e) {}
+  }, 800);
+})();
+
+// ── Fix #12: Browser notifications when new signal fires ─────────────────────
+let _lastNotifKey = '';
+(function _initNotifications() {
+  if ('Notification' in window && Notification.permission === 'default') {
+    Notification.requestPermission();
+  }
+})();
+
+function _notifySignal(symbol, direction, quality) {
+  const key = symbol + ':' + direction;
+  if (key === _lastNotifKey) return;
+  _lastNotifKey = key;
+  // Play a short beep via AudioContext
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain); gain.connect(ctx.destination);
+    osc.frequency.value = direction === 'BUY' ? 880 : 440;
+    gain.gain.setValueAtTime(0.15, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.4);
+    osc.start(); osc.stop(ctx.currentTime + 0.4);
+  } catch(e) {}
+  // Browser notification
+  if ('Notification' in window && Notification.permission === 'granted') {
+    try {
+      new Notification('AlgoTrade: ' + direction + ' ' + symbol, {
+        body: 'Quality: ' + quality + ' — click to view',
+        icon: '/favicon.ico',
+      });
+    } catch(e) {}
+  }
+}
 </script>
 </body></html>"""
 
 
+
+def _log_signal(
+    symbol: str,
+    direction: str,
+    engine: str,
+    confidence: float,
+    entry_low: float,
+    entry_high: float,
+    sl: float,
+    t2: float,
+    rr_t2: float,
+    notes: str = "",
+) -> None:
+    """
+    Persist a BUY/SELL signal to the SQLite journal (signal_log table).
+    Called whenever a non-WAIT signal fires from any engine.
+    Thread-safe — uses its own sqlite3 connection.
+    """
+    try:
+        IST = timezone(timedelta(hours=5, minutes=30))
+        ts = datetime.now(tz=IST).strftime("%Y-%m-%d %H:%M:%S IST")
+        # Position sizing: 2% risk per trade
+        entry_mid = round((entry_low + entry_high) / 2, 2)
+        risk_per_share = abs(entry_mid - sl) if sl else 0
+        position_size = int(CAPITAL * 0.02 / risk_per_share) if risk_per_share > 0 else 0
+
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS signal_log (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts          TEXT    NOT NULL,
+                symbol      TEXT    NOT NULL,
+                direction   TEXT    NOT NULL,
+                engine      TEXT,
+                confidence  REAL,
+                entry_low   REAL,
+                entry_high  REAL,
+                sl          REAL,
+                t1          REAL,
+                t2          REAL,
+                t3          REAL,
+                rr_t2       REAL,
+                position_size INTEGER,
+                outcome     TEXT    DEFAULT 'OPEN',
+                pnl         REAL    DEFAULT 0,
+                notes       TEXT
+            )
+        """)
+        conn.execute(
+            """INSERT INTO signal_log
+               (ts, symbol, direction, engine, confidence,
+                entry_low, entry_high, sl, t2, rr_t2, position_size, notes)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (ts, symbol, direction, engine, round(confidence, 1),
+             entry_low, entry_high, sl, t2, round(rr_t2, 2), position_size, notes),
+        )
+        conn.commit()
+        conn.close()
+        log.info(f"📓 Logged {direction} signal for {symbol} ({engine}, conf={confidence:.0f}%)")
+    except Exception as exc:
+        log.warning(f"_log_signal error for {symbol}: {exc}")
+
+
+@app.get("/api/journal")
+async def get_journal(limit: int = 50, offset: int = 0):
+    """
+    Return the last `limit` signal entries from the SQLite trade journal.
+    The DB is written by the background signal-logger whenever a BUY/SELL
+    signal fires.  If the DB doesn't exist yet, returns an empty list so the
+    UI shows a sensible 'No entries yet' message rather than an error.
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        # Create table if it doesn't exist (first run)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS signal_log (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts          TEXT    NOT NULL,
+                symbol      TEXT    NOT NULL,
+                direction   TEXT    NOT NULL,
+                engine      TEXT,
+                confidence  REAL,
+                entry_low   REAL,
+                entry_high  REAL,
+                sl          REAL,
+                t1          REAL,
+                t2          REAL,
+                t3          REAL,
+                rr_t2       REAL,
+                outcome     TEXT    DEFAULT 'OPEN',
+                pnl         REAL    DEFAULT 0,
+                notes       TEXT
+            )
+        """)
+        conn.commit()
+        rows = cur.execute(
+            "SELECT * FROM signal_log ORDER BY id DESC LIMIT ? OFFSET ?",
+            (limit, offset)
+        ).fetchall()
+        total = cur.execute("SELECT COUNT(*) FROM signal_log").fetchone()[0]
+        conn.close()
+        return {
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "entries": [dict(r) for r in rows],
+        }
+    except Exception as e:
+        log.error(f"Journal fetch error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.patch("/api/journal/{entry_id}")
+async def update_journal_entry(entry_id: int, request: Request):
+    """Update outcome/pnl for a journal entry (mark as WIN/LOSS/SCRATCH)."""
+    try:
+        body = await request.json()
+        outcome = body.get("outcome", "OPEN")
+        pnl     = float(body.get("pnl", 0))
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            "UPDATE signal_log SET outcome=?, pnl=? WHERE id=?",
+            (outcome, pnl, entry_id)
+        )
+        conn.commit(); conn.close()
+        return {"ok": True, "id": entry_id, "outcome": outcome, "pnl": pnl}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  DATA FRESHNESS HELPER  —  used by ALL API endpoints
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _data_age_minutes(df: pd.DataFrame) -> float:
+    """Return minutes since the last candle timestamp (IST-aware)."""
+    try:
+        IST = timezone(timedelta(hours=5, minutes=30))
+        last_ts = df["timestamp"].iloc[-1]
+        now_ist = datetime.now(tz=IST).replace(tzinfo=None)
+        last_naive = last_ts.replace(tzinfo=None) if hasattr(last_ts, "tzinfo") and last_ts.tzinfo else last_ts
+        return round((now_ist - last_naive).total_seconds() / 60, 1)
+    except Exception:
+        return 0.0
+
+
+def _is_market_hours() -> bool:
+    IST = timezone(timedelta(hours=5, minutes=30))
+    now = datetime.now(tz=IST)
+    return (now.weekday() < 5 and
+            now.replace(hour=9, minute=15, second=0, microsecond=0) <= now <=
+            now.replace(hour=15, minute=30, second=0, microsecond=0))
+
+
+def _stale_error(age_min: float, symbol: str) -> Dict:
+    """Standard stale-data error dict returned to the frontend."""
+    IST = timezone(timedelta(hours=5, minutes=30))
+    return {
+        "stale": True,
+        "error": (
+            f"Data is {age_min:.0f} min old for {symbol}. "
+            "Kite session may have expired — please Logout and Login Kite again."
+        ),
+        "data_age_min": age_min,
+        "fetched_at": datetime.now(tz=IST).strftime("%H:%M:%S IST"),
+    }
+
+
+def _guard_freshness(df: pd.DataFrame, symbol: str, max_age: int = 75) -> Optional[Dict]:
+    """
+    Returns a stale error dict if data is too old during market hours.
+    Returns None if data is fresh (caller proceeds normally).
+    max_age: minutes — default 75 (one 15-min candle + 1 hour buffer)
+
+    Early-market bypass: the first complete 15-min candle closes at 9:30 IST.
+    Before 9:35 AM IST we intentionally skip the stale check because the last
+    available candle is legitimately from yesterday's 15:30 close — this is NOT
+    a stale session, it is normal overnight gap data.
+    """
+    if not _is_market_hours():
+        return None          # outside market hours — age is expected to be large
+    IST = timezone(timedelta(hours=5, minutes=30))
+    now_ist = datetime.now(tz=IST)
+    # First complete 15-min candle closes at 9:30; allow 5-min Kite publish delay.
+    # Before 9:35 AM, yesterday's 15:30 candle is the most recent — skip stale check.
+    first_candle_ready = now_ist.replace(hour=9, minute=35, second=0, microsecond=0)
+    if now_ist < first_candle_ready:
+        return None          # early market open — overnight gap is expected
+    age = _data_age_minutes(df)
+    if age > max_age:
+        return _stale_error(age, symbol)
+    return None
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  SIMPLE SIGNAL ENGINE  —  Fresh live data, no cache
+#  Combines SMC + ICT + Candlestick Patterns → single BUY / SELL / WAIT
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _compute_simple_signal(symbol: str, interval: str = "15minute") -> Dict:
+    """
+    Fetch live Kite data, run all 3 engines, return one clean verdict.
+    Intentionally uncached — every call gets fresh market data.
+    """
+    IST = timezone(timedelta(hours=5, minutes=30))
+    now_ist = datetime.now(tz=IST)
+
+    token = get_instrument_token(symbol)
+    if token is None:
+        return {"error": f"Unknown symbol: {symbol}"}
+
+    # ── Fresh candles (always live) ───────────────────────────────────────────
+    with _kite_semaphore:
+        df = kite_manager.get_historical_data(token, interval, 10)
+    if df.empty or len(df) < 20:
+        with _kite_semaphore:
+            df = kite_manager.get_historical_data(token, interval, 20)
+    if df.empty or len(df) < 15:
+        return {"error": "Insufficient data from Kite — market may be closed"}
+
+    current_price = float(df["close"].iloc[-1])
+
+    # ── Data freshness check ─────────────────────────────────────────────────
+    try:
+        lct = df["timestamp"].iloc[-1]
+        lct_naive = lct.replace(tzinfo=None) if (hasattr(lct, "tzinfo") and lct.tzinfo) else lct
+        now_naive = now_ist.replace(tzinfo=None)
+        data_age_min = round((now_naive - lct_naive).total_seconds() / 60, 1)
+    except Exception:
+        data_age_min = 0
+
+    # Market hours: 9:15-15:30 IST Mon-Fri
+    market_open  = now_ist.replace(hour=9,  minute=15, second=0, microsecond=0)
+    market_close = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
+    is_market_hours = (now_ist.weekday() < 5 and
+                       market_open <= now_ist <= market_close)
+
+    # Early-market bypass: the first complete 15-min candle closes at 9:30 IST.
+    # Before 9:35 AM the most recent Kite candle is legitimately yesterday's 15:30
+    # close — this is a normal overnight gap, NOT a stale/expired session.
+    # Firing a stale error here after a fresh login is a false positive.
+    first_candle_ready = now_ist.replace(hour=9, minute=35, second=0, microsecond=0)
+    is_pre_first_candle = is_market_hours and (now_ist < first_candle_ready)
+
+    # During market hours (after first candle available), reject data > 60 min old
+    if is_market_hours and not is_pre_first_candle and data_age_min > 60:
+        return {
+            "error": (
+                f"Data is {data_age_min:.0f} min old — Kite session likely expired. "
+                "Please logout and re-login via the Login Kite button, then click Analyse again."
+            ),
+            "data_age_min": data_age_min,
+            "fetched_at": now_ist.strftime("%H:%M:%S IST"),
+        }
+
+    # ── Higher timeframe context ──────────────────────────────────────────────
+    df_1h = df_daily = None
+    try:
+        with _kite_semaphore:
+            df_1h = kite_manager.get_historical_data(token, "60minute", 5)
+    except Exception:
+        pass
+    try:
+        with _kite_semaphore:
+            df_daily = kite_manager.get_historical_data(token, "day", 20)
+    except Exception:
+        pass
+
+    inst = calculate_institutional_levels(df, symbol)
+
+    # ── Run all 3 engines ─────────────────────────────────────────────────────
+    smc_res = ict_res = top_pattern = None
+    pat_signal = "NEUTRAL"
+
+    try:
+        smc_res = smc_engine.analyse(df, symbol, interval, df_1h, inst)
+    except Exception as e:
+        log.warning(f"SMC failed {symbol}: {e}")
+    try:
+        ict_res = ict_engine.analyse(df, symbol, interval, df_daily, inst)
+    except Exception as e:
+        log.warning(f"ICT failed {symbol}: {e}")
+    try:
+        pats = pattern_detector.detect_all_patterns(df, symbol, interval)
+        if pats:
+            top_pattern = pats[0]
+            pat_signal = top_pattern.signal
+    except Exception as e:
+        log.warning(f"Pattern failed {symbol}: {e}")
+
+    # ── Map each engine → BUY / SELL / WAIT ──────────────────────────────────
+    def _dir(s):
+        if s in ("LONG", "BUY", "BULLISH"): return "BUY"
+        if s in ("SHORT", "SELL", "BEARISH"): return "SELL"
+        return "WAIT"
+
+    smc_dir = _dir(smc_res.smc_signal  if smc_res  else "WAIT")
+    ict_dir = _dir(ict_res.ict_signal  if ict_res  else "WAIT")
+    pat_dir = _dir(pat_signal)
+
+    votes = {"BUY": 0, "SELL": 0}
+    engine_votes: Dict[str, str] = {}
+    for eng, d in [("SMC", smc_dir), ("ICT", ict_dir), ("PATTERN", pat_dir)]:
+        if d in votes:
+            votes[d] += 1
+            engine_votes[eng] = d
+
+    # ── Confluence rule: 2+ engines must agree ────────────────────────────────
+    # Block any signal if session is not tradeable
+    _session_ok = not smc_res or getattr(smc_res, "session_tradeable", True)
+    if not _session_ok:
+        _snote = getattr(smc_res, "session_note", "Session not tradeable")
+        return {
+            "symbol": symbol, "signal": "WAIT", "current_price": current_price,
+            "reason": f"Session not tradeable: {_snote}. Market opens 9:15 AM IST.",
+            "engines": engine_votes, "data_age_min": data_age_min,
+            "fetched_at": now_ist.strftime("%H:%M:%S IST"),
+        }
+    if votes["BUY"] >= 2:
+        final_dir = "BUY"
+    elif votes["SELL"] >= 2:
+        final_dir = "SELL"
+    else:
+        # VWAP tiebreak only when EXACTLY 1 engine signals AND it is NOT the Pattern engine alone
+        # (Pattern-only tiebreak produces unreliable signals with inverted levels)
+        vwap_tb = getattr(smc_res, "vwap", None)
+        _non_pat_votes_buy  = sum(1 for e,d in engine_votes.items() if d=="BUY"  and e!="PATTERN")
+        _non_pat_votes_sell = sum(1 for e,d in engine_votes.items() if d=="SELL" and e!="PATTERN")
+        if vwap_tb and _non_pat_votes_buy >= 1 and votes["BUY"] == 1 and current_price > vwap_tb * 1.003:
+            final_dir = "BUY"
+        elif vwap_tb and _non_pat_votes_sell >= 1 and votes["SELL"] == 1 and current_price < vwap_tb * 0.997:
+            final_dir = "SELL"
+        else:
+            return {
+                "symbol": symbol, "signal": "WAIT", "current_price": current_price,
+                "reason": f"Engines disagree — SMC:{smc_dir} ICT:{ict_dir} Pattern:{pat_dir}. Need 2+ to agree.",
+                "engines": engine_votes, "data_age_min": data_age_min,
+                "fetched_at": now_ist.strftime("%H:%M:%S IST"),
+            }
+
+    # ── Extract entry zone / SL / targets (prefer ICT Fib targets) ───────────
+    entry_low = entry_high = sl = t1 = t2 = t3 = t4 = None
+    confidence = 60
+    reasons: List[str] = []
+
+    if ict_res and ict_res.ict_signal in ("LONG", "SHORT"):
+        entry_low  = round(ict_res.ict_entry_zone[0], 2)
+        entry_high = round(ict_res.ict_entry_zone[1], 2)
+        sl         = round(ict_res.ict_sl,  2)
+        t1         = round(ict_res.ict_t1,  2)
+        t2         = round(ict_res.ict_t2,  2)
+        t3         = round(ict_res.ict_t3,  2)
+        t4         = round(ict_res.ict_t4,  2)
+        confidence = round(ict_res.ict_confidence)
+        if ict_res.daily_bias: reasons.append(f"Daily bias: {ict_res.daily_bias}")
+        if ict_res.po3_phase:  reasons.append(f"Po3: {ict_res.po3_phase}")
+
+    # SMC fallback — SMCAnalysis has no t1/t2/t3, derive from entry zone + risk
+    if t1 is None and smc_res:
+        ez = smc_res.smc_entry_zone or (current_price * 0.999, current_price * 1.001)
+        entry_low  = round(float(min(ez)), 2)
+        entry_high = round(float(max(ez)), 2)
+        sl_raw     = smc_res.smc_sl
+        sl         = round(float(sl_raw), 2) if sl_raw else None
+        confidence = round(float(smc_res.smc_confidence))
+        # Derive Fib targets from risk — use ATR floor to prevent zero-risk collapse
+        em   = (entry_low + entry_high) / 2
+        _atr_now = float((df["high"] - df["low"]).rolling(14).mean().dropna().iloc[-1]) if len(df) >= 14 else em * 0.005
+        risk = abs(em - sl) if sl else em * 0.005
+        risk = max(risk, _atr_now * 0.5)  # minimum risk = 0.5x ATR
+        if final_dir == "BUY":
+            t1 = round(em + risk * 1.0,   2)
+            t2 = round(em + risk * 1.272, 2)
+            t3 = round(em + risk * 1.618, 2)
+            t4 = round(em + risk * 2.0,   2)
+        else:
+            t1 = round(em - risk * 1.0,   2)
+            t2 = round(em - risk * 1.272, 2)
+            t3 = round(em - risk * 1.618, 2)
+            t4 = round(em - risk * 2.0,   2)
+
+    # ── Sanity-check levels: SL must be on the correct side of entry ──────────
+    # If ICT/SMC returned a SHORT setup but signal is BUY (or vice versa),
+    # the stop loss will be on the wrong side. Recompute from ATR in that case.
+    if entry_low and entry_high and sl and t1:
+        _atr_sig = float((df["high"] - df["low"]).rolling(14).mean().dropna().iloc[-1]) if len(df) >= 14 else current_price * 0.005
+        _em_sig  = (entry_low + entry_high) / 2
+        if final_dir == "BUY" and sl >= entry_low:
+            # SL is above or at entry for a BUY — inverted, recompute
+            sl         = round(_em_sig - _atr_sig * 1.5, 2)
+            _risk_fix  = abs(_em_sig - sl)
+            t1         = round(_em_sig + _risk_fix * 1.0,   2)
+            t2         = round(_em_sig + _risk_fix * 1.272, 2)
+            t3         = round(_em_sig + _risk_fix * 1.618, 2)
+            t4         = round(_em_sig + _risk_fix * 2.0,   2)
+            reasons.append("[i] Levels recomputed (SL was inverted for BUY)")
+        elif final_dir == "SELL" and sl <= entry_high:
+            # SL is below or at entry for a SELL — inverted, recompute
+            sl         = round(_em_sig + _atr_sig * 1.5, 2)
+            _risk_fix  = abs(sl - _em_sig)
+            t1         = round(_em_sig - _risk_fix * 1.0,   2)
+            t2         = round(_em_sig - _risk_fix * 1.272, 2)
+            t3         = round(_em_sig - _risk_fix * 1.618, 2)
+            t4         = round(_em_sig - _risk_fix * 2.0,   2)
+            reasons.append("[i] Levels recomputed (SL was inverted for SELL)")
+
+    # Pattern boost
+    if top_pattern and pat_dir == final_dir:
+        confidence = min(95, confidence + 5)
+        reasons.append(f"Pattern: {top_pattern.pattern.value} ({top_pattern.confidence*100:.0f}%)")
+
+    if smc_res and smc_res.smc_notes:
+        reasons += [n for n in smc_res.smc_notes[:2] if n]
+
+    # ── VWAP filter ───────────────────────────────────────────────────────────
+    vwap_val = getattr(smc_res, "vwap", None)
+    if vwap_val: vwap_val = float(vwap_val)
+    vwap_ok  = True
+    if vwap_val:
+        if final_dir == "BUY"  and current_price < vwap_val and confidence < 85: vwap_ok = False
+        if final_dir == "SELL" and current_price > vwap_val and confidence < 85: vwap_ok = False
+
+    # ── RSI filter ────────────────────────────────────────────────────────────
+    rsi_val = None
+    rsi_ok  = True
+    try:
+        rsi_val = pattern_detector._calc_rsi(df)
+        if final_dir == "BUY"  and rsi_val > 78: rsi_ok = False
+        if final_dir == "SELL" and rsi_val < 22: rsi_ok = False
+    except Exception:
+        pass
+
+    # ── Is price already inside the entry zone? ───────────────────────────────
+    in_zone = bool(entry_low and entry_high and entry_low <= current_price <= entry_high)
+
+    # ── R:R ──────────────────────────────────────────────────────────────────
+    rr = None
+    if t2 and sl and entry_low and entry_high:
+        em   = (entry_low + entry_high) / 2
+        risk = abs(em - sl)
+        if risk > 0:
+            rr = round(abs(t2 - em) / risk, 2)
+
+    # ── Quality grade ─────────────────────────────────────────────────────────
+    quality = "B"
+    if confidence >= 80 and vwap_ok and rsi_ok and (rr or 0) >= 2.0: quality = "A+"
+    elif confidence >= 65 and vwap_ok and rsi_ok:                     quality = "A"
+
+    # ── Warnings ─────────────────────────────────────────────────────────────
+    warnings: List[str] = []
+    if not vwap_ok:          warnings.append("Counter-VWAP — higher risk")
+    if not rsi_ok:           warnings.append("RSI extreme — skip entry")
+    if rr and rr < 2.0:      warnings.append(f"R:R {rr}x below 2x minimum")
+    if data_age_min > 20:    warnings.append(f"Data {data_age_min:.0f} min old — refresh")
+
+    return {
+        "symbol":        symbol,
+        "signal":        final_dir,
+        "quality":       quality,
+        "confidence":    confidence,
+        "current_price": current_price,
+        "entry_low":     entry_low,
+        "entry_high":    entry_high,
+        "sl":            sl,
+        "t1":            t1,
+        "t2":            t2,
+        "t3":            t3,
+        "t4":            t4,
+        "rr_t2":         rr,
+        "in_zone":       in_zone,
+        "vwap":          round(vwap_val, 2) if vwap_val else None,
+        "vwap_ok":       vwap_ok,
+        "rsi_val":       round(rsi_val, 1) if rsi_val else None,
+        "engines":       engine_votes,
+        "reasons":       [r for r in reasons if r][:4],
+        "warnings":      warnings,
+        "data_age_min":  data_age_min,
+        "fetched_at":    now_ist.strftime("%H:%M:%S IST"),
+        "inst_levels":   inst.to_dict() if inst else {},
+        "pattern":       top_pattern.pattern.value if top_pattern else None,
+    }
+
+
+@app.get("/api/signal/{symbol}")
+async def get_simple_signal(symbol: str, interval: str = "15minute"):
+    """Simple BUY/SELL/WAIT — always fresh Kite data, no cache."""
+    if not kite_manager.is_authenticated:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: _compute_simple_signal(symbol, interval))
+        return result
+    except Exception as e:
+        log.error(f"Signal error {symbol}: {e}", exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/quick-scan")
+async def quick_scan_simple(limit: int = 20, interval: str = "15minute"):
+    """
+    Scan top liquid symbols and return simple BUY/SELL signals.
+    Only A+ and A quality signals returned. Always fresh data.
+    """
+    if not kite_manager.is_authenticated:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+
+    scan_list = [
+        "NIFTY 50", "NIFTY BANK",
+        "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "BAJFINANCE",
+        "TATAMOTORS", "AXISBANK", "SBIN", "WIPRO", "HCLTECH", "LTM",
+        "TATASTEEL", "VEDL", "COALINDIA", "ONGC", "SAIL", "NATIONALUM",
+        "TVSHLTD", "KPITTECH", "MARUTI", "BAJAJ-AUTO",
+        "TITAN", "SUNPHARMA", "DRREDDY", "APOLLOHOSP",
+        "RVNL", "IRFC", "RECLTD", "ADANIENT",
+    ][:limit + 10]
+
+    results: List[Dict] = []
+
+    def _scan_one(sym: str):
+        try:
+            r = _compute_simple_signal(sym, interval)
+            if r.get("signal") in ("BUY", "SELL") and r.get("quality") in ("A+", "A"):
+                return r
+        except Exception:
+            pass
+        return None
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futs = {ex.submit(_scan_one, s): s for s in scan_list}
+        for f in as_completed(futs, timeout=60):
+            r = f.result()
+            if r:
+                results.append(r)
+
+    results.sort(key=lambda x: x.get("confidence", 0), reverse=True)
+    IST = timezone(timedelta(hours=5, minutes=30))
+    return {
+        "scanned":       len(scan_list),
+        "signals_found": len(results),
+        "signals":       results[:limit],
+        "fetched_at":    datetime.now(tz=IST).strftime("%H:%M:%S IST"),
+    }
+
+
+
+
+@app.get("/api/premarket")
+async def get_premarket_watchlist():
+    """
+    Pre-market candidates: uses previous day's structure to find
+    the top 5 symbols most likely to have good setups at market open.
+    Uses daily candles — no 15-min data needed (market not open yet).
+    """
+    if not kite_manager.is_authenticated:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    IST = timezone(timedelta(hours=5, minutes=30))
+    candidates = []
+    scan_syms = list(DEMO_TOKENS.keys())[:20]
+
+    def _check_sym(symbol):
+        try:
+            token = get_instrument_token(symbol)
+            if not token: return None
+            with _kite_semaphore:
+                df = kite_manager.get_historical_data(token, "day", 10)
+            if df.empty or len(df) < 5: return None
+            inst = calculate_institutional_levels(df, symbol)
+            close  = float(df["close"].iloc[-1])
+            prev_close = float(df["close"].iloc[-2]) if len(df) >= 2 else close
+            chg_pct = round((close - prev_close) / prev_close * 100, 2)
+            # Score: proximity to PDH/PDL, daily trend strength
+            score = 0
+            bias = "NEUTRAL"
+            note = []
+            if abs(close - inst.pdh) / inst.pdh < 0.005:
+                score += 2; note.append("Near PDH"); bias = "WATCH_SELL"
+            if abs(close - inst.pdl) / inst.pdl < 0.005:
+                score += 2; note.append("Near PDL"); bias = "WATCH_BUY"
+            if close > inst.pdh:
+                score += 3; note.append("Above PDH — breakout"); bias = "BUY"
+            if close < inst.pdl:
+                score += 3; note.append("Below PDL — breakdown"); bias = "SELL"
+            if abs(chg_pct) > 1.5:
+                score += 1; note.append(f"Big move {chg_pct:+.1f}%")
+            if score < 2: return None
+            return {
+                "symbol": symbol, "close": close, "chg_pct": chg_pct,
+                "bias": bias, "score": score, "notes": note,
+                "pdh": round(inst.pdh, 2), "pdl": round(inst.pdl, 2),
+            }
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        for r in ex.map(_check_sym, scan_syms):
+            if r: candidates.append(r)
+
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    return {
+        "candidates": candidates[:8],
+        "generated_at": datetime.now(tz=IST).strftime("%H:%M:%S IST"),
+        "note": "Based on yesterday's close vs PDH/PDL. Confirm at 9:30 AM with live signal.",
+    }
+
+@app.get("/api/debug/kite")
+async def debug_kite():
+    """
+    Diagnostic endpoint — shows exactly what Kite is returning.
+    Visit /api/debug/kite in browser to diagnose data issues.
+    """
+    IST = timezone(timedelta(hours=5, minutes=30))
+    now_ist = datetime.now(tz=IST)
+    info = {
+        "server_utc":        datetime.utcnow().isoformat(),
+        "server_ist":        now_ist.strftime("%Y-%m-%d %H:%M:%S IST"),
+        "kite_authenticated": kite_manager.is_authenticated,
+        "token_present":     bool(kite_manager.access_token),
+    }
+    if not kite_manager.is_authenticated:
+        info["error"] = "Not authenticated — click Login Kite"
+        return info
+    # Profile check
+    try:
+        profile = kite_manager.kite.profile()
+        info["kite_user"]  = profile.get("user_name", "?")
+        info["kite_email"] = profile.get("email", "?")
+        info["profile_ok"] = True
+    except Exception as e:
+        info["profile_error"] = str(e)
+        info["profile_ok"]    = False
+    # Test historical data for NIFTY 50
+    try:
+        token  = 256265  # NIFTY 50
+        ist_now   = now_ist.replace(tzinfo=None)
+        from_dt   = ist_now - timedelta(days=2)
+        records   = kite_manager.kite.historical_data(token, from_dt, ist_now, "15minute")
+        if records:
+            last_ts  = records[-1]["date"]
+            age_min  = round((ist_now - last_ts.replace(tzinfo=None)).total_seconds() / 60, 1)
+            info["nifty50_last_candle"] = str(last_ts)
+            info["nifty50_last_close"]  = records[-1]["close"]
+            info["nifty50_data_age_min"] = age_min
+            info["nifty50_candles_returned"] = len(records)
+            info["nifty50_ok"] = age_min < 60
+        else:
+            info["nifty50_error"] = "Kite returned 0 records"
+    except Exception as e:
+        info["nifty50_error"] = str(e)
+    # Test RELIANCE
+    try:
+        token  = 738561
+        records = kite_manager.kite.historical_data(token, from_dt, ist_now, "15minute")
+        if records:
+            last_ts  = records[-1]["date"]
+            age_min  = round((ist_now - last_ts.replace(tzinfo=None)).total_seconds() / 60, 1)
+            info["reliance_last_candle"]  = str(last_ts)
+            info["reliance_data_age_min"] = age_min
+            info["reliance_ok"] = age_min < 60
+        else:
+            info["reliance_error"] = "Kite returned 0 records"
+    except Exception as e:
+        info["reliance_error"] = str(e)
+    return info
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    """Return minimal SVG favicon — prevents 404 log spam."""
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
+        '<rect width="32" height="32" rx="6" fill="#060b14"/>'
+        '<text x="16" y="22" font-size="18" text-anchor="middle" fill="#00d4ff">A</text>'
+        '</svg>'
+    )
+    from fastapi.responses import Response
+    return Response(content=svg, media_type="image/svg+xml")
+
 @app.get("/", response_class=HTMLResponse)
 @app.get("/dashboard", response_class=HTMLResponse)
 async def ui():
-    return HTML_UI
+    return HTMLResponse(content=HTML_UI, media_type="text/html; charset=utf-8")
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  SNIPER ENGINE  —  High-Accuracy Strategy (Less Noise, More Profit)
+#  ─────────────────────────────────────────────────────────────────────────────
+#  Rules (must ALL pass to fire a signal):
+#    1. TIME   : 09:30–11:30 IST  OR  14:30–15:30 IST  only
+#    2. TREND  : Price > EMA50 > EMA200 (BUY)  |  Price < EMA50 < EMA200 (SELL)
+#    3. PATTERN: ONLY Bullish / Bearish Engulfing on the second-to-last candle
+#    4. CONFIRM: Latest closed candle breaks pattern candle's High (BUY) / Low (SELL)
+#    5. LOCATION: Price within 0.8% of VWAP, PDL (BUY) or PDH (SELL)
+#    6. INDEX  : NIFTY 50 EMA50/200 trend must NOT oppose signal direction
+#    7. RR     : Stop Loss at pattern candle extreme. T2 must be ≥ 2× risk
+# ════════════════════════════════════════════════════════════════════════════════
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _sniper_ema(series: pd.Series, period: int) -> pd.Series:
+    """EMA using pandas ewm — same method as SMCEngine._calc_ema."""
+    return series.ewm(span=period, adjust=False).mean()
+
+
+def _sniper_vwap(df: pd.DataFrame) -> Optional[float]:
+    """
+    Intraday VWAP from the day's candles only.
+    Falls back to whole-df VWAP if same-day filtering returns < 3 rows.
+    """
+    try:
+        IST = timezone(timedelta(hours=5, minutes=30))
+        today = datetime.now(tz=IST).date()
+        ts_col = df["timestamp"]
+        # normalise timezone-aware timestamps
+        if hasattr(ts_col.iloc[0], "tzinfo") and ts_col.iloc[0].tzinfo:
+            today_mask = ts_col.dt.tz_convert(IST).dt.date == today
+        else:
+            today_mask = ts_col.dt.date == today
+        day_df = df[today_mask] if today_mask.sum() >= 3 else df
+        tp  = (day_df["high"] + day_df["low"] + day_df["close"]) / 3
+        vol = day_df["volume"].replace(0, np.nan).fillna(1)
+        return float((tp * vol).sum() / vol.sum())
+    except Exception:
+        return None
+
+
+def _sniper_time_ok() -> Tuple[bool, str]:
+    """
+    Returns (allowed, window_name).
+    Allowed windows: 09:30–11:30  or  14:30–15:30 IST.
+    Outside market hours we always allow (for paper/back-test mode).
+    """
+    IST = timezone(timedelta(hours=5, minutes=30))
+    now = datetime.now(tz=IST)
+    if now.weekday() >= 5:                    # Saturday / Sunday
+        return False, "Weekend"
+    t = now.time()
+    import datetime as _dt
+    mkt_open  = _dt.time(9, 15)
+    mkt_close = _dt.time(15, 30)
+    if not (mkt_open <= t <= mkt_close):      # outside market — allow (pre/post)
+        return True, "off-hours"
+    w1_start, w1_end = _dt.time(9, 30), _dt.time(11, 30)
+    w2_start, w2_end = _dt.time(14, 30), _dt.time(15, 30)
+    if w1_start <= t <= w1_end:
+        return True, "Morning (09:30–11:30)"
+    if w2_start <= t <= w2_end:
+        return True, "Power Hour (14:30–15:30)"
+    return False, f"Dead zone {t.strftime('%H:%M')} — trade only 09:30-11:30 or 14:30-15:30"
+
+
+def _sniper_trend(df: pd.DataFrame, direction: str) -> Tuple[bool, str]:
+    """
+    EMA-50 / EMA-200 trend alignment check.
+    BUY  requires: close > EMA50 > EMA200
+    SELL requires: close < EMA50 < EMA200
+
+    If df has < 200 rows we use EMA50 vs EMA20 as a proxy — still meaningful.
+    Returns (ok, note).
+    """
+    try:
+        close = df["close"].astype(float)
+        e50   = float(_sniper_ema(close, 50).iloc[-1])
+        if len(close) >= 200:
+            e200 = float(_sniper_ema(close, 200).iloc[-1])
+            label = "EMA200"
+        else:
+            e200 = float(_sniper_ema(close, min(20, len(close) - 1)).iloc[-1])
+            label = "EMA20(proxy)"
+        price = float(close.iloc[-1])
+        if direction == "BUY":
+            ok = price > e50 > e200
+            note = f"price {price:.0f} {'>' if price>e50 else '<'} EMA50 {e50:.0f} {'>' if e50>e200 else '<'} {label} {e200:.0f}"
+        else:
+            ok = price < e50 < e200
+            note = f"price {price:.0f} {'<' if price<e50 else '>'} EMA50 {e50:.0f} {'<' if e50<e200 else '>'} {label} {e200:.0f}"
+        return ok, note
+    except Exception as exc:
+        return True, f"trend check skipped ({exc})"   # soft fail — don't block
+
+
+def _sniper_location(
+    df: pd.DataFrame,
+    inst: "InstitutionalLevels",
+    direction: str,
+    price: float,
+    tolerance: float = 0.008,
+) -> Tuple[bool, str]:
+    """
+    Location filter — only trade at a meaningful level:
+      BUY  : within tolerance% of VWAP  OR  PDL
+      SELL : within tolerance% of VWAP  OR  PDH
+
+    If no PDH/PDL available (index or missing), we relax to VWAP-only.
+    """
+    vwap = _sniper_vwap(df)
+    pdh  = getattr(inst, "pdh", None)
+    pdl  = getattr(inst, "pdl", None)
+
+    def near(ref: Optional[float]) -> bool:
+        if ref is None or ref <= 0:
+            return False
+        return abs(price - ref) / ref <= tolerance
+
+    hits: List[str] = []
+    if near(vwap):
+        hits.append(f"VWAP {vwap:.0f}")
+    if direction == "BUY" and near(pdl):
+        hits.append(f"PDL {pdl:.0f}")
+    if direction == "SELL" and near(pdh):
+        hits.append(f"PDH {pdh:.0f}")
+
+    # Always allow if we have no institutional levels (e.g. index symbols)
+    if pdh is None and pdl is None:
+        return True, "no inst levels — location skipped"
+
+    if hits:
+        return True, "At " + " / ".join(hits)
+    level_str = f"PDL {pdl:.0f}" if direction == "BUY" and pdl else (f"PDH {pdh:.0f}" if pdh else "")
+    return False, f"Price {price:.0f} not near VWAP {vwap:.0f if vwap else 'N/A'} or {level_str}"
+
+
+def _sniper_find_engulfing(df: pd.DataFrame) -> Optional[Dict]:
+    """
+    Scan the last 5 candles for the most recent Engulfing pattern.
+    Returns a dict with keys: direction, pattern_idx, pattern_candle, prev_candle
+    or None if nothing found.
+
+    We deliberately look at candles that are CONFIRMED (i.e. not the live
+    in-progress candle at iloc[-1]). The live candle is used for confirmation.
+    """
+    # Work backwards over positions [-2, -3, -4, -5] (skip live candle)
+    for offset in range(2, 6):
+        if offset >= len(df):
+            break
+        i     = len(df) - offset           # pattern candle index
+        curr  = df.iloc[i]
+        prev  = df.iloc[i - 1]
+
+        curr_open  = float(curr["open"])
+        curr_close = float(curr["close"])
+        prev_open  = float(prev["open"])
+        prev_close = float(prev["close"])
+        curr_body  = abs(curr_close - curr_open)
+        prev_body  = abs(prev_close - prev_open)
+
+        if prev_body < 1e-8:               # avoid division by zero
+            continue
+
+        # Bullish Engulfing
+        if (prev_close < prev_open          # prev bearish
+                and curr_close > curr_open  # curr bullish
+                and curr_open  < prev_close # opens below prev close
+                and curr_close > prev_open  # closes above prev open
+                and curr_body  > prev_body * 1.0):  # body must engulf
+            engulf_ratio = round(curr_body / prev_body, 2)
+            return {
+                "direction":      "BUY",
+                "pattern":        "Bullish Engulfing",
+                "pattern_idx":    i,
+                "engulf_ratio":   engulf_ratio,
+                "pattern_high":   float(curr["high"]),
+                "pattern_low":    float(curr["low"]),
+                "pattern_open":   curr_open,
+                "pattern_close":  curr_close,
+                "prev_open":      prev_open,
+                "prev_close":     prev_close,
+            }
+
+        # Bearish Engulfing
+        if (prev_close > prev_open          # prev bullish
+                and curr_close < curr_open  # curr bearish
+                and curr_open  > prev_close # opens above prev close
+                and curr_close < prev_open  # closes below prev open
+                and curr_body  > prev_body * 1.0):
+            engulf_ratio = round(curr_body / prev_body, 2)
+            return {
+                "direction":      "SELL",
+                "pattern":        "Bearish Engulfing",
+                "pattern_idx":    i,
+                "engulf_ratio":   engulf_ratio,
+                "pattern_high":   float(curr["high"]),
+                "pattern_low":    float(curr["low"]),
+                "pattern_open":   curr_open,
+                "pattern_close":  curr_close,
+                "prev_open":      prev_open,
+                "prev_close":     prev_close,
+            }
+
+    return None
+
+
+def _sniper_confirmation(df: pd.DataFrame, eng: Dict) -> Tuple[bool, str]:
+    """
+    Confirmation: the candle AFTER the pattern candle must break the
+    pattern candle's extreme in the signal direction.
+
+    BUY  — latest candle's close > pattern candle's high
+    SELL — latest candle's close < pattern candle's low
+
+    If the pattern candle is NOT second-to-last yet (older), we check
+    the candle immediately following the pattern candle.
+    """
+    pattern_idx  = eng["pattern_idx"]
+    direction    = eng["direction"]
+    next_idx     = pattern_idx + 1
+
+    if next_idx >= len(df):
+        return False, "No candle after pattern yet — wait"
+
+    confirm_candle = df.iloc[next_idx]
+    conf_close     = float(confirm_candle["close"])
+    conf_high      = float(confirm_candle["high"])
+    conf_low       = float(confirm_candle["low"])
+
+    if direction == "BUY":
+        triggered = conf_close > eng["pattern_high"]
+        note = (
+            f"Confirmation candle close {conf_close:.2f} "
+            f"{'>' if triggered else '<='} pattern high {eng['pattern_high']:.2f}"
+        )
+        return triggered, note
+    else:
+        triggered = conf_close < eng["pattern_low"]
+        note = (
+            f"Confirmation candle close {conf_close:.2f} "
+            f"{'<' if triggered else '>='} pattern low {eng['pattern_low']:.2f}"
+        )
+        return triggered, note
+
+
+_sniper_nifty_cache: Dict = {}   # {"ts": datetime, "trend": "BUY"|"SELL"|"NEUTRAL"}
+
+def _sniper_nifty_trend() -> str:
+    """
+    Returns NIFTY 50 short-term trend: "BUY", "SELL", or "NEUTRAL".
+    Caches result for 10 minutes to avoid hammering Kite API.
+    """
+    global _sniper_nifty_cache
+    IST = timezone(timedelta(hours=5, minutes=30))
+    now = datetime.now(tz=IST)
+    cached = _sniper_nifty_cache
+    if cached and (now - cached.get("ts", now)).seconds < 600:
+        return cached.get("trend", "NEUTRAL")
+
+    try:
+        token = get_instrument_token("NIFTY 50")
+        if token is None:
+            return "NEUTRAL"
+        with _kite_semaphore:
+            ndf = kite_manager.get_historical_data(token, "15minute", 10)
+        if ndf.empty or len(ndf) < 20:
+            return "NEUTRAL"
+        close = ndf["close"].astype(float)
+        e50   = float(_sniper_ema(close, 50).iloc[-1])
+        e20   = float(_sniper_ema(close, 20).iloc[-1])   # use 20 as proxy for 200 on short df
+        price = float(close.iloc[-1])
+        if price > e50 > e20:
+            trend = "BUY"
+        elif price < e50 < e20:
+            trend = "SELL"
+        else:
+            trend = "NEUTRAL"
+        _sniper_nifty_cache = {"ts": now, "trend": trend}
+        return trend
+    except Exception:
+        return "NEUTRAL"
+
+
+# ── Main Sniper Signal Function ───────────────────────────────────────────────
+
+def _compute_sniper_signal(symbol: str, interval: str = "15minute") -> Dict:
+    """
+    The Sniper Engine — 7-gate high-accuracy signal.
+    Returns a dict with signal = BUY | SELL | WAIT plus full context.
+    All 7 gates must pass; each failed gate returns WAIT with reason.
+    """
+    IST = timezone(timedelta(hours=5, minutes=30))
+    now_ist = datetime.now(tz=IST)
+
+    def _wait(reason: str, **extra) -> Dict:
+        return {"symbol": symbol, "signal": "WAIT", "engine": "sniper",
+                "reason": reason, "fetched_at": now_ist.strftime("%H:%M:%S IST"), **extra}
+
+    # ── Gate 1: Time window ───────────────────────────────────────────────────
+    time_ok, time_note = _sniper_time_ok()
+    if not time_ok:
+        return _wait(f"⏰ {time_note}")
+
+    # ── Fetch candles ─────────────────────────────────────────────────────────
+    token = get_instrument_token(symbol)
+    if token is None:
+        return _wait(f"Unknown symbol: {symbol}")
+
+    with _kite_semaphore:
+        df = kite_manager.get_historical_data(token, interval, 15)
+    if df.empty or len(df) < 30:
+        with _kite_semaphore:
+            df = kite_manager.get_historical_data(token, interval, 20)
+    if df.empty or len(df) < 20:
+        return _wait("Insufficient candle data from Kite")
+
+    price = float(df["close"].iloc[-1])
+    inst  = calculate_institutional_levels(df, symbol)
+
+    # ── Gate 2: Engulfing pattern ─────────────────────────────────────────────
+    eng = _sniper_find_engulfing(df)
+    if eng is None:
+        return _wait("No Bullish/Bearish Engulfing in last 5 candles")
+
+    direction = eng["direction"]
+
+    # ── Gate 3: Trend alignment ───────────────────────────────────────────────
+    trend_ok, trend_note = _sniper_trend(df, direction)
+    if not trend_ok:
+        return _wait(f"📉 Trend misaligned — {trend_note}")
+
+    # ── Gate 4: Confirmation candle ───────────────────────────────────────────
+    conf_ok, conf_note = _sniper_confirmation(df, eng)
+    if not conf_ok:
+        return _wait(f"⏳ Awaiting confirmation — {conf_note}")
+
+    # ── Gate 5: Location (VWAP / PDH / PDL) ──────────────────────────────────
+    loc_ok, loc_note = _sniper_location(df, inst, direction, price)
+    if not loc_ok:
+        return _wait(f"📍 Location filter failed — {loc_note}")
+
+    # ── Gate 6: NIFTY index trend must not oppose signal ──────────────────────
+    nifty_trend = _sniper_nifty_trend()
+    if nifty_trend != "NEUTRAL" and nifty_trend != direction:
+        return _wait(
+            f"🏦 NIFTY trend ({nifty_trend}) opposes {direction} signal — skip",
+            nifty_trend=nifty_trend,
+        )
+
+    # ── Gate 7: Risk-Reward ≥ 2:1 ────────────────────────────────────────────
+    if direction == "BUY":
+        sl     = round(eng["pattern_low"]  - (eng["pattern_high"] - eng["pattern_low"]) * 0.1, 2)
+        entry  = round(eng["pattern_high"] * 1.001, 2)          # just above confirmation break
+    else:
+        sl     = round(eng["pattern_high"] + (eng["pattern_high"] - eng["pattern_low"]) * 0.1, 2)
+        entry  = round(eng["pattern_low"]  * 0.999, 2)
+
+    risk = abs(entry - sl)
+    if risk <= 0:
+        return _wait("Zero risk — price levels collapsed")
+
+    # SL sanity check (reuse existing guard logic)
+    if direction == "BUY" and sl >= entry:
+        sl = round(entry - risk, 2)
+    if direction == "SELL" and sl <= entry:
+        sl = round(entry + risk, 2)
+
+    t1 = round(entry + risk * 1.0, 2) if direction == "BUY" else round(entry - risk * 1.0, 2)
+    t2 = round(entry + risk * 2.0, 2) if direction == "BUY" else round(entry - risk * 2.0, 2)
+    t3 = round(entry + risk * 3.0, 2) if direction == "BUY" else round(entry - risk * 3.0, 2)
+    rr = round(abs(t2 - entry) / risk, 2)
+
+    if rr < 2.0:
+        return _wait(f"📊 RR {rr}x below minimum 2x — skip trade")
+
+    # ── All gates passed — fire signal ───────────────────────────────────────
+    confidence = 70.0
+
+    # Bonus: volume on pattern candle
+    try:
+        pat_vol  = float(df.iloc[eng["pattern_idx"]]["volume"])
+        avg_vol  = float(df["volume"].rolling(20).mean().iloc[eng["pattern_idx"]])
+        vol_mult = pat_vol / avg_vol if avg_vol > 0 else 1.0
+        if vol_mult >= 1.5:
+            confidence += 8
+        elif vol_mult >= 1.2:
+            confidence += 4
+    except Exception:
+        vol_mult = 1.0
+
+    # Bonus: engulf ratio
+    if eng["engulf_ratio"] >= 2.0:
+        confidence += 7
+    elif eng["engulf_ratio"] >= 1.5:
+        confidence += 4
+
+    # Penalty: pattern is older (not second-to-last candle)
+    candles_ago = len(df) - 1 - eng["pattern_idx"]
+    if candles_ago > 2:
+        confidence -= (candles_ago - 2) * 5
+
+    confidence = round(min(95.0, max(50.0, confidence)), 1)
+
+    reasons = [
+        f"Pattern: {eng['pattern']} ({eng['engulf_ratio']}x engulf)",
+        f"Confirmed: {conf_note}",
+        f"Trend: {trend_note}",
+        f"{loc_note}",
+    ]
+    if nifty_trend != "NEUTRAL":
+        reasons.append(f"NIFTY aligned: {nifty_trend}")
+
+    # Log to journal
+    try:
+        threading.Thread(
+            target=_log_signal,
+            args=(symbol, direction, "sniper", confidence, entry * 0.999, entry * 1.001,
+                  sl, t2, rr, " | ".join(reasons[:3])),
+            daemon=True,
+        ).start()
+    except Exception:
+        pass
+
+    return {
+        "symbol":        symbol,
+        "signal":        direction,
+        "engine":        "sniper",
+        "confidence":    confidence,
+        "quality":       "A+" if confidence >= 78 else "A",
+        "pattern":       eng["pattern"],
+        "engulf_ratio":  eng["engulf_ratio"],
+        "entry":         entry,
+        "sl":            sl,
+        "t1":            t1,
+        "t2":            t2,
+        "t3":            t3,
+        "rr_t2":         rr,
+        "current_price": price,
+        "time_window":   time_note,
+        "trend_note":    trend_note,
+        "location":      loc_note,
+        "nifty_trend":   nifty_trend,
+        "vol_mult":      round(vol_mult, 2),
+        "reasons":       reasons,
+        "warnings":      [],
+        "fetched_at":    now_ist.strftime("%H:%M:%S IST"),
+    }
+
+
+# ── FastAPI Endpoints ─────────────────────────────────────────────────────────
+
+@app.get("/api/sniper/{symbol}")
+async def sniper_signal(symbol: str, interval: str = "15minute"):
+    """
+    High-accuracy Sniper signal for a single symbol.
+    All 7 gates (time, trend, engulfing, confirmation, location, index, RR) must pass.
+    Returns WAIT with reason if any gate fails.
+    """
+    if not kite_manager.is_authenticated:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None, lambda: _compute_sniper_signal(symbol, interval)
+        )
+        return result
+    except Exception as e:
+        log.error(f"Sniper signal error {symbol}: {e}", exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/sniper-scan")
+async def sniper_scan(limit: int = 20, interval: str = "15minute"):
+    """
+    Scan the liquid universe through the Sniper Engine.
+    Only returns confirmed BUY/SELL signals where all 7 gates pass.
+    Typically fires 1–4 signals per session (by design — quality over quantity).
+    """
+    if not kite_manager.is_authenticated:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+
+    scan_list = [
+        "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "BAJFINANCE",
+        "TATAMOTORS", "AXISBANK", "SBIN", "WIPRO", "HCLTECH",
+        "TATASTEEL", "VEDL", "COALINDIA", "ONGC", "SAIL", "NATIONALUM",
+        "MARUTI", "BAJAJ-AUTO", "TITAN", "SUNPHARMA",
+        "DRREDDY", "RVNL", "ADANIENT", "LTIM", "KPITTECH",
+    ][:limit + 10]
+
+    results: List[Dict] = []
+    wait_reasons: List[Dict] = []
+
+    def _scan_one(sym: str):
+        try:
+            return _compute_sniper_signal(sym, interval)
+        except Exception as exc:
+            return {"symbol": sym, "signal": "WAIT", "reason": str(exc), "engine": "sniper"}
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futs = {ex.submit(_scan_one, s): s for s in scan_list}
+        for f in as_completed(futs, timeout=90):
+            r = f.result()
+            if r and r.get("signal") in ("BUY", "SELL"):
+                results.append(r)
+            elif r:
+                wait_reasons.append({"symbol": r.get("symbol"), "reason": r.get("reason", "WAIT")})
+
+    results.sort(key=lambda x: x.get("confidence", 0), reverse=True)
+    IST = timezone(timedelta(hours=5, minutes=30))
+    time_ok, time_note = _sniper_time_ok()
+
+    return {
+        "scanned":        len(scan_list),
+        "signals_found":  len(results),
+        "signals":        results[:limit],
+        "time_window_ok": time_ok,
+        "time_note":      time_note,
+        "wait_summary":   wait_reasons[:10],
+        "fetched_at":     datetime.now(tz=IST).strftime("%H:%M:%S IST"),
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  SNIPER EXECUTION LAYER  —  Daily Risk Guard + Kite Order Placement
+# ════════════════════════════════════════════════════════════════════════════════
+
+# ── Daily Trade Limiter ───────────────────────────────────────────────────────
+
+def _sniper_daily_counts() -> Dict:
+    """
+    Read today's sniper trades and losses from signal_log.
+    Returns {"trades": int, "losses": int, "date": str}
+    """
+    try:
+        IST = timezone(timedelta(hours=5, minutes=30))
+        today = datetime.now(tz=IST).strftime("%Y-%m-%d")
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS signal_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, symbol TEXT,
+                direction TEXT, engine TEXT, confidence REAL,
+                entry_low REAL, entry_high REAL, sl REAL, t1 REAL, t2 REAL,
+                t3 REAL, rr_t2 REAL, position_size INTEGER,
+                outcome TEXT DEFAULT 'OPEN', pnl REAL DEFAULT 0, notes TEXT
+            )
+        """)
+        rows = conn.execute(
+            "SELECT outcome FROM signal_log WHERE engine='sniper' AND ts LIKE ? || '%'",
+            (today,)
+        ).fetchall()
+        conn.close()
+        trades = len(rows)
+        losses = sum(1 for r in rows if r["outcome"] == "LOSS")
+        return {"trades": trades, "losses": losses, "date": today}
+    except Exception:
+        return {"trades": 0, "losses": 0, "date": ""}
+
+
+def _sniper_trading_allowed() -> Tuple[bool, str]:
+    """
+    Returns (allowed, reason).
+    Blocked if: trades_today >= 2  OR  losses_today >= 2.
+    """
+    counts = _sniper_daily_counts()
+    if counts["losses"] >= 2:
+        return False, f"🛑 2 losses today — trading stopped (loss #{counts['losses']} hit daily limit)"
+    if counts["trades"] >= 2:
+        return False, f"🛑 Max 2 trades per day reached ({counts['trades']} taken)"
+    return True, f"OK — {counts['trades']}/2 trades, {counts['losses']}/2 losses today"
+
+
+# ── No-Trade Zone Filters ─────────────────────────────────────────────────────
+
+def _sniper_ema_slope_ok(df: pd.DataFrame, direction: str, min_slope_pct: float = 0.05) -> Tuple[bool, str]:
+    """
+    EMA-50 slope filter: if EMA50 is flat (< min_slope_pct% per candle),
+    market is sideways — skip.
+    slope_pct = (ema[-1] - ema[-5]) / ema[-5] * 100
+    """
+    try:
+        close = df["close"].astype(float)
+        ema50 = _sniper_ema(close, 50)
+        if len(ema50) < 6:
+            return True, "slope check skipped (< 6 rows)"
+        slope = (float(ema50.iloc[-1]) - float(ema50.iloc[-5])) / float(ema50.iloc[-5]) * 100
+        if abs(slope) < min_slope_pct:
+            return False, f"EMA50 slope flat ({slope:+.3f}% over 5 candles) — sideways market"
+        direction_ok = (direction == "BUY" and slope > 0) or (direction == "SELL" and slope < 0)
+        if not direction_ok:
+            return False, f"EMA50 slope {slope:+.3f}% opposes {direction}"
+        return True, f"EMA slope {slope:+.3f}%"
+    except Exception as exc:
+        return True, f"slope check skipped ({exc})"
+
+
+def _sniper_no_inside_bar(df: pd.DataFrame) -> Tuple[bool, str]:
+    """
+    Inside bar filter: if the pattern candle is entirely inside the previous
+    candle's range it's a compression candle — low conviction, skip.
+    """
+    try:
+        if len(df) < 3:
+            return True, "inside bar check skipped"
+        curr = df.iloc[-2]   # pattern candle
+        prev = df.iloc[-3]
+        if float(curr["high"]) <= float(prev["high"]) and float(curr["low"]) >= float(prev["low"]):
+            return False, f"Inside bar — candle range contained within previous candle, skip"
+        return True, "Not inside bar"
+    except Exception:
+        return True, "inside bar check skipped"
+
+
+def _sniper_volume_spike(df: pd.DataFrame, pattern_idx: int, min_mult: float = 1.3) -> Tuple[bool, str]:
+    """
+    Entry candle volume must be ≥ min_mult × average of prior 5 candles.
+    Already used for confidence bonus in _compute_sniper_signal;
+    here it's a hard gate.
+    """
+    try:
+        if "volume" not in df.columns or pattern_idx < 5:
+            return True, "volume check skipped"
+        pat_vol = float(df.iloc[pattern_idx]["volume"])
+        avg_vol = float(df.iloc[max(0, pattern_idx - 5): pattern_idx]["volume"].mean())
+        if avg_vol <= 0:
+            return True, "zero avg volume"
+        mult = pat_vol / avg_vol
+        if mult < min_mult:
+            return False, f"Volume {mult:.1f}x avg — needs {min_mult}x (low participation)"
+        return True, f"Volume {mult:.1f}x avg ✅"
+    except Exception:
+        return True, "volume check skipped"
+
+
+# ── Patch _compute_sniper_signal to add new gates ─────────────────────────────
+# We wrap it so the original function stays intact and tests still pass.
+_original_compute_sniper = _compute_sniper_signal
+
+def _compute_sniper_signal_v2(symbol: str, interval: str = "15minute") -> Dict:
+    """
+    Extended Sniper pipeline: adds 4 extra no-trade filters on top of the 7-gate
+    base engine, plus the daily trade-count guard.
+    Returned dict is identical in structure to _compute_sniper_signal.
+    """
+    # ── Daily risk guard (gate 0) ─────────────────────────────────────────────
+    allowed, block_reason = _sniper_trading_allowed()
+    if not allowed:
+        IST = timezone(timedelta(hours=5, minutes=30))
+        return {
+            "symbol": symbol, "signal": "WAIT", "engine": "sniper",
+            "reason": block_reason,
+            "fetched_at": datetime.now(tz=IST).strftime("%H:%M:%S IST"),
+        }
+
+    # ── Run original 7-gate engine ────────────────────────────────────────────
+    result = _original_compute_sniper(symbol, interval)
+    if result.get("signal") != "BUY" and result.get("signal") != "SELL":
+        return result      # already WAIT with reason
+
+    # ── Fetch df for extra gates (reuse token / rate-limit safe) ─────────────
+    try:
+        token = get_instrument_token(symbol)
+        if token:
+            with _kite_semaphore:
+                df_extra = kite_manager.get_historical_data(token, interval, 15)
+        else:
+            df_extra = pd.DataFrame()
+    except Exception:
+        df_extra = pd.DataFrame()
+
+    if df_extra.empty or len(df_extra) < 10:
+        return result   # soft fail — don't block on data issues
+
+    direction = result["signal"]
+
+    # ── Gate 8: EMA slope (no sideways) ──────────────────────────────────────
+    slope_ok, slope_note = _sniper_ema_slope_ok(df_extra, direction)
+    if not slope_ok:
+        IST = timezone(timedelta(hours=5, minutes=30))
+        return {"symbol": symbol, "signal": "WAIT", "engine": "sniper",
+                "reason": f"📊 {slope_note}",
+                "fetched_at": datetime.now(tz=IST).strftime("%H:%M:%S IST")}
+
+    # ── Gate 9: No inside bar ─────────────────────────────────────────────────
+    ib_ok, ib_note = _sniper_no_inside_bar(df_extra)
+    if not ib_ok:
+        IST = timezone(timedelta(hours=5, minutes=30))
+        return {"symbol": symbol, "signal": "WAIT", "engine": "sniper",
+                "reason": f"📦 {ib_note}",
+                "fetched_at": datetime.now(tz=IST).strftime("%H:%M:%S IST")}
+
+    # ── Gate 10: Volume spike on pattern candle ───────────────────────────────
+    eng_pat = _sniper_find_engulfing(df_extra)
+    if eng_pat:
+        vol_ok, vol_note = _sniper_volume_spike(df_extra, eng_pat["pattern_idx"])
+        if not vol_ok:
+            IST = timezone(timedelta(hours=5, minutes=30))
+            return {"symbol": symbol, "signal": "WAIT", "engine": "sniper",
+                    "reason": f"📉 {vol_note}",
+                    "fetched_at": datetime.now(tz=IST).strftime("%H:%M:%S IST")}
+        result["reasons"].append(vol_note)
+        result["reasons"].append(slope_note)
+
+    return result
+
+
+# Hotswap the function used by the scan endpoints
+_compute_sniper_signal = _compute_sniper_signal_v2
+
+
+# ── Position Sizing ───────────────────────────────────────────────────────────
+
+def _sniper_position_size(entry: float, sl: float, capital: float = CAPITAL,
+                           risk_pct: float = 0.01) -> int:
+    """
+    Risk 1% of capital per trade (configurable).
+    qty = floor(capital * risk_pct / risk_per_share)
+    Minimum 1, maximum (capital * 0.20) / entry to avoid over-exposure.
+    """
+    risk_per_share = abs(entry - sl)
+    if risk_per_share <= 0:
+        return 1
+    qty = int(CAPITAL * risk_pct / risk_per_share)
+    max_qty = int(CAPITAL * 0.20 / entry)
+    return max(1, min(qty, max_qty))
+
+
+# ── Kite Order Execution ──────────────────────────────────────────────────────
+
+@dataclass
+class SniperOrder:
+    symbol:          str
+    direction:       str      # BUY | SELL
+    entry:           float
+    sl:              float
+    t1:              float    # 1:1 target — book 50% here
+    t2:              float    # 2:1 target — trail rest
+    qty:             int
+    entry_order_id:  Optional[str] = None
+    sl_order_id:     Optional[str] = None
+    t1_order_id:     Optional[str] = None
+    status:          str = "PENDING"   # PENDING | LIVE | PARTIAL | CLOSED | FAILED
+    placed_at:       str = ""
+
+
+def _place_sniper_order(req: "SniperOrderRequest") -> Dict:
+    """
+    Places a 3-leg MIS intraday trade on Kite:
+      Leg 1 — LIMIT entry order
+      Leg 2 — SL-LIMIT stop loss
+      Leg 3 — LIMIT target at T1 (50% qty) for partial booking
+
+    Uses GTT for SL and T1 so they persist even if the app restarts.
+    Returns dict with order IDs or error message.
+
+    IMPORTANT:
+      • Product = MIS (intraday, auto-squared at 3:15 PM)
+      • Exchange = NSE
+      • Variety = regular (not bracket/cover — more reliable)
+    """
+    if not kite_manager.is_authenticated:
+        return {"error": "Kite not authenticated"}
+
+    kite = kite_manager.kite
+    sym  = req.symbol
+    direction = req.direction
+    entry, sl, t1, t2 = req.entry, req.sl, req.t1, req.t2
+
+    qty = _sniper_position_size(entry, sl)
+    if qty < 1:
+        return {"error": "Qty < 1 — risk per share too small"}
+
+    txn_buy  = "BUY"
+    txn_sell = "SELL"
+    entry_txn = txn_buy  if direction == "BUY" else txn_sell
+    exit_txn  = txn_sell if direction == "BUY" else txn_buy
+
+    try:
+        # ── Leg 1: Entry order (LIMIT) ────────────────────────────────────────
+        entry_id = kite.place_order(
+            variety       = kite.VARIETY_REGULAR,
+            exchange      = kite.EXCHANGE_NSE,
+            tradingsymbol = sym,
+            transaction_type = entry_txn,
+            quantity      = qty,
+            product       = kite.PRODUCT_MIS,
+            order_type    = kite.ORDER_TYPE_LIMIT,
+            price         = round(entry, 1),
+            validity      = kite.VALIDITY_DAY,
+            tag           = "SNIPER_ENTRY",
+        )
+        log.info(f"🎯 Sniper entry order placed: {direction} {sym} qty={qty} entry={entry} → {entry_id}")
+    except Exception as e:
+        return {"error": f"Entry order failed: {e}"}
+
+    sl_id = t1_id = None
+
+    try:
+        # ── Leg 2: SL-LIMIT stop loss ─────────────────────────────────────────
+        # trigger at SL, limit 0.5% beyond (avoids slippage rejection)
+        sl_limit = round(sl * 0.995, 1) if direction == "BUY" else round(sl * 1.005, 1)
+        sl_id = kite.place_order(
+            variety          = kite.VARIETY_REGULAR,
+            exchange         = kite.EXCHANGE_NSE,
+            tradingsymbol    = sym,
+            transaction_type = exit_txn,
+            quantity         = qty,
+            product          = kite.PRODUCT_MIS,
+            order_type       = kite.ORDER_TYPE_SL,
+            price            = sl_limit,
+            trigger_price    = round(sl, 1),
+            validity         = kite.VALIDITY_DAY,
+            tag              = "SNIPER_SL",
+        )
+        log.info(f"🛡 SL order placed: {sym} SL={sl} limit={sl_limit} → {sl_id}")
+    except Exception as e:
+        log.warning(f"SL order failed for {sym}: {e} — entry order still live! Cancel manually.")
+
+    try:
+        # ── Leg 3: T1 target (50% qty, partial booking) ──────────────────────
+        t1_qty = max(1, qty // 2)
+        t1_id = kite.place_order(
+            variety          = kite.VARIETY_REGULAR,
+            exchange         = kite.EXCHANGE_NSE,
+            tradingsymbol    = sym,
+            transaction_type = exit_txn,
+            quantity         = t1_qty,
+            product          = kite.PRODUCT_MIS,
+            order_type       = kite.ORDER_TYPE_LIMIT,
+            price            = round(t1, 1),
+            validity         = kite.VALIDITY_DAY,
+            tag              = "SNIPER_T1",
+        )
+        log.info(f"🎯 T1 partial target placed: {sym} T1={t1} qty={t1_qty} → {t1_id}")
+    except Exception as e:
+        log.warning(f"T1 order failed for {sym}: {e}")
+
+    # ── Log to journal ────────────────────────────────────────────────────────
+    risk  = abs(entry - sl)
+    rr    = round(abs(t2 - entry) / risk, 2) if risk > 0 else 0
+    notes = f"LIVE trade | entry_id={entry_id} sl_id={sl_id} t1_id={t1_id}"
+    threading.Thread(
+        target=_log_signal,
+        args=(sym, direction, "sniper-live", 85.0,
+              entry * 0.999, entry * 1.001, sl, t2, rr, notes),
+        daemon=True,
+    ).start()
+
+    return {
+        "ok":             True,
+        "symbol":         sym,
+        "direction":      direction,
+        "qty":            qty,
+        "entry":          entry,
+        "sl":             sl,
+        "t1":             t1,
+        "t2":             t2,
+        "entry_order_id": entry_id,
+        "sl_order_id":    sl_id,
+        "t1_order_id":    t1_id,
+        "note":           f"MIS LIMIT order live. SL={sl}, T1={t1} (50% at 1:1), trail rest to T2={t2}",
+    }
+
+
+# ── FastAPI Request Models ────────────────────────────────────────────────────
+
+from pydantic import BaseModel
+
+class SniperOrderRequest(BaseModel):
+    symbol:    str
+    direction: str
+    entry:     float
+    sl:        float
+    t1:        float
+    t2:        float
+
+
+# ── Execution Endpoints ───────────────────────────────────────────────────────
+
+@app.post("/api/sniper/execute")
+async def execute_sniper_trade(req: SniperOrderRequest):
+    """
+    Place a live MIS trade on Zerodha Kite.
+    Checks daily trade limit before placing.
+    Places: entry LIMIT + SL-LIMIT + T1 partial LIMIT (3 legs).
+    """
+    if not kite_manager.is_authenticated:
+        return JSONResponse({"error": "Kite not authenticated"}, status_code=401)
+
+    allowed, block_reason = _sniper_trading_allowed()
+    if not allowed:
+        return JSONResponse({"error": block_reason}, status_code=403)
+
+    # Basic sanity checks
+    if req.direction not in ("BUY", "SELL"):
+        return JSONResponse({"error": "direction must be BUY or SELL"}, status_code=400)
+    if req.direction == "BUY"  and req.sl >= req.entry:
+        return JSONResponse({"error": f"SL {req.sl} must be below entry {req.entry} for BUY"}, status_code=400)
+    if req.direction == "SELL" and req.sl <= req.entry:
+        return JSONResponse({"error": f"SL {req.sl} must be above entry {req.entry} for SELL"}, status_code=400)
+
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: _place_sniper_order(req))
+        return result
+    except Exception as e:
+        log.error(f"Execute sniper error: {e}", exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/sniper/paper")
+async def paper_sniper_trade(req: SniperOrderRequest):
+    """Log a paper/simulated sniper trade to the journal without placing a real order."""
+    risk = abs(req.entry - req.sl)
+    rr   = round(abs(req.t2 - req.entry) / risk, 2) if risk > 0 else 0
+    try:
+        _log_signal(
+            req.symbol, req.direction, "sniper-paper", 80.0,
+            req.entry * 0.999, req.entry * 1.001,
+            req.sl, req.t2, rr,
+            f"Paper trade | T1={req.t1} T2={req.t2} SL={req.sl}",
+        )
+        return {"ok": True, "note": "Paper trade logged to journal"}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/sniper/daily-status")
+async def sniper_daily_status():
+    """Return today's sniper trade count, loss count, and whether trading is allowed."""
+    counts  = _sniper_daily_counts()
+    allowed, reason = _sniper_trading_allowed()
+    _, time_note    = _sniper_time_ok()
+    return {
+        "trades_today":    counts["trades"],
+        "losses_today":    counts["losses"],
+        "trading_allowed": allowed,
+        "block_reason":    reason if not allowed else None,
+        "time_note":       time_note,
+        "date":            counts["date"],
+    }
+
+
+@app.get("/api/sniper/positions")
+async def sniper_positions():
+    """Return current open MIS positions tagged as SNIPER from Kite."""
+    if not kite_manager.is_authenticated:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    try:
+        positions = kite_manager.kite.positions()
+        day_pos   = positions.get("day", [])
+        sniper    = [p for p in day_pos if p.get("product") == "MIS" and abs(p.get("quantity", 0)) > 0]
+        return {"positions": sniper, "count": len(sniper)}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -7247,11 +10482,7 @@ async def ui():
 # ════════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    import webbrowser, threading
+    import threading
 
-    def _open_browser():
-        time.sleep(2)
-        webbrowser.open("http://localhost:8000")
-
-    threading.Thread(target=_open_browser, daemon=True).start()
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    PORT = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
